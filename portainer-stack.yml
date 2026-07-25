@@ -1,0 +1,24 @@
+services:
+  nautiljon:
+    image: "${NAUTILJON_IMAGE:-ghcr.io/hitman47/nautiljon-scraper:latest}"
+    container_name: nautiljon-scraper
+    network_mode: "container:${GLUETUN_CONTAINER:-GlueTun-Nord_WG}"
+    command: ["${NAUTILJON_COMMAND:-diff}"]
+    environment:
+      NAUTILJON_OUT_DIR: /data/output
+      NAUTILJON_DELAY: "${NAUTILJON_DELAY:-2.0}"
+      NAUTILJON_DELAY_MIN: "${NAUTILJON_DELAY_MIN:-2.0}"
+      NAUTILJON_DELAY_MAX: "${NAUTILJON_DELAY_MAX:-5.0}"
+      NAUTILJON_RESUME: "${NAUTILJON_RESUME:-true}"
+      NAUTILJON_FLUSH_EVERY: "${NAUTILJON_FLUSH_EVERY:-25}"
+      NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS: "${NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS:-30}"
+      NAUTILJON_FORCE_SCRAPE: "${NAUTILJON_FORCE_SCRAPE:-false}"
+      NAUTILJON_REFRESH_STALE_DAYS: "${NAUTILJON_REFRESH_STALE_DAYS:-180}"
+      NAUTILJON_DROP_MISSING: "${NAUTILJON_DROP_MISSING:-true}"
+      NAUTILJON_LETTERS: "${NAUTILJON_LETTERS:-}"
+    volumes:
+      - "${NAUTILJON_HOST_OUTPUT:-/media/nvme0n1p1/AppData/NautiljonScraper/output}:/data/output"
+    cpus: "${NAUTILJON_CPUS:-1.0}"
+    mem_limit: "${NAUTILJON_MEM_LIMIT:-256m}"
+    memswap_limit: "${NAUTILJON_MEMSWAP_LIMIT:-256m}"
+    restart: "no"
