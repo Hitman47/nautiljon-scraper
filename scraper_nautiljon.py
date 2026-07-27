@@ -376,14 +376,17 @@ class NautiljonScraper:
         raise RuntimeError(f"CSV illisible: {path}")
 
     def import_existing_csv(self) -> List[Dict[str, str]]:
-        _, _, letters_dir, _ = self._ensure_dirs()
-        csv_files = [
-            os.path.join(letters_dir, name)
-            for name in os.listdir(letters_dir)
-            if name.lower().endswith(".csv") and ".partial." not in name.lower()
-        ]
+        exports_dir, _, letters_dir, _ = self._ensure_dirs()
+        csv_files: List[str] = []
+        for directory in (letters_dir, self.out_dir, exports_dir):
+            if not os.path.isdir(directory):
+                continue
+            for name in os.listdir(directory):
+                if name.lower().endswith(".csv") and ".partial." not in name.lower():
+                    csv_files.append(os.path.join(directory, name))
+        csv_files = sorted(dict.fromkeys(csv_files))
         if not csv_files:
-            raise RuntimeError(f"Aucun CSV trouve dans {letters_dir}")
+            raise RuntimeError(f"Aucun CSV trouve dans {letters_dir}, {self.out_dir} ou {exports_dir}")
 
         by_letter: Dict[str, Dict[str, Dict[str, str]]] = {}
         imported = 0
@@ -768,6 +771,8 @@ class NautiljonScraper:
         seen_urls = set()
         page_num = 0
         empty_pages = 0
+        successful_listing_pages = 0
+        listing_failed = False
         since_flush = 0
         counters = {"new": 0, "changed": 0, "stale": 0, "reused": 0, "removed": 0}
 
@@ -781,6 +786,7 @@ class NautiljonScraper:
                 empty_pages += 1
                 print(f"  Page {page_num + 1} indisponible ({empty_pages}/3): {str(exc)[:160]}")
                 if empty_pages >= 3:
+                    listing_failed = True
                     break
                 page_num += 1
                 continue
@@ -790,6 +796,7 @@ class NautiljonScraper:
                 if empty_pages >= 3:
                     break
             else:
+                successful_listing_pages += 1
                 empty_pages = 0
                 for series in page_series:
                     url = _ensure_abs_url(series.get("url_fiche", ""))
@@ -846,10 +853,33 @@ class NautiljonScraper:
             page_num += 1
             self._sleep_delay()
 
+        if successful_listing_pages == 0 and existing_by_url:
+            self.session_stats["errors"] += 1
+            existing_kept = sorted(existing_by_url.values(), key=lambda row: _norm(row.get("titre", "")))
+            self.session_stats["series_by_letter"][label] = len(existing_kept)
+            self.session_stats["total_series"] += len(existing_kept)
+            self.session_stats["diff_by_letter"][label] = {
+                "new": 0,
+                "changed": 0,
+                "stale": 0,
+                "reused": len(existing_kept),
+                "removed": 0,
+                "listing_failed": True,
+            }
+            print(
+                f"  Listing {label} inaccessible: conservation de {len(existing_kept)} series existantes, "
+                "aucune suppression appliquee."
+            )
+            return existing_kept
+
         if not drop_missing and existing_by_url:
             updated_rows.extend(existing_by_url.values())
         else:
-            counters["removed"] = len(existing_by_url)
+            if listing_failed:
+                print("  Fin de listing incertaine: les entrees absentes sont conservees.")
+                updated_rows.extend(existing_by_url.values())
+            else:
+                counters["removed"] = len(existing_by_url)
 
         updated_rows = sorted(updated_rows, key=lambda row: _norm(row.get("titre", "")))
         self.save_letter_files(tag, updated_rows, partial=False)
