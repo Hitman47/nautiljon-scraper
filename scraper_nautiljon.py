@@ -369,8 +369,7 @@ class NautiljonScraper:
         for encoding in ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin-1"):
             try:
                 rows = self._read_csv_rows_with_encoding(path, encoding, errors="strict")
-                if rows or os.path.getsize(path) == 0:
-                    return rows
+                return rows
             except Exception as exc:
                 errors.append(f"{encoding}: {exc}")
                 continue
@@ -378,8 +377,7 @@ class NautiljonScraper:
         for encoding in ("utf-8-sig", "cp1252", "latin-1"):
             try:
                 rows = self._read_csv_rows_with_encoding(path, encoding, errors="replace")
-                if rows or os.path.getsize(path) == 0:
-                    return rows
+                return rows
             except Exception as exc:
                 errors.append(f"{encoding}/replace: {exc}")
                 continue
@@ -437,8 +435,13 @@ class NautiljonScraper:
 
         by_letter: Dict[str, Dict[str, Dict[str, str]]] = {}
         imported = 0
+        empty_csv_files = 0
         for path in sorted(csv_files):
             rows = self._read_csv_rows(path)
+            if not rows:
+                empty_csv_files += 1
+                print(f"  CSV vide ignore: {path}")
+                continue
             inferred_tag = self._letter_tag_from_filename(path)
             for row in rows:
                 row = self._normalize_row(row)
@@ -459,7 +462,10 @@ class NautiljonScraper:
         self.session_stats["total_series"] = len(all_rows)
         export_paths = self.export_all_data(all_rows, base_filename=f"nautiljon_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         self.mark_success("import", len(all_rows), export_paths)
-        print(f"OK import CSV termine: {imported} lignes lues, {len(all_rows)} URLs uniques")
+        print(
+            f"OK import CSV termine: {imported} lignes lues, "
+            f"{len(all_rows)} URLs uniques, {empty_csv_files} CSV vides ignores"
+        )
         return all_rows
 
     def _letter_tag_from_filename(self, path: str) -> Optional[str]:
