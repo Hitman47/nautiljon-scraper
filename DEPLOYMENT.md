@@ -37,6 +37,7 @@ Use:
 ```text
 NAUTILJON_COMMAND=diff
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
+NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
 NAUTILJON_REFRESH_STALE_DAYS=180
 ```
 
@@ -52,6 +53,8 @@ The diff:
 - writes `output/state/last_diff_success.json`.
 
 Set `NAUTILJON_FORCE_SCRAPE=true` to ignore the 30-day protection once.
+Set `NAUTILJON_ABORT_AFTER_LISTING_FAILURES=0` only if you want the diff to
+continue through all letters even when listings are blocked.
 
 ## Same Gluetun as Bedetheque
 

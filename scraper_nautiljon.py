@@ -906,7 +906,7 @@ class NautiljonScraper:
             page_num += 1
             self._sleep_delay()
 
-        if successful_listing_pages == 0 and existing_by_url:
+        if successful_listing_pages == 0:
             self.session_stats["errors"] += 1
             existing_kept = sorted(existing_by_url.values(), key=lambda row: _norm(row.get("titre", "")))
             self.session_stats["series_by_letter"][label] = len(existing_kept)
@@ -919,10 +919,13 @@ class NautiljonScraper:
                 "removed": 0,
                 "listing_failed": True,
             }
-            print(
-                f"  Listing {label} inaccessible: conservation de {len(existing_kept)} series existantes, "
-                "aucune suppression appliquee."
-            )
+            if existing_kept:
+                print(
+                    f"  Listing {label} inaccessible: conservation de {len(existing_kept)} series existantes, "
+                    "aucune suppression appliquee."
+                )
+            else:
+                print(f"  Listing {label} inaccessible: aucune donnee locale a mettre a jour.")
             return existing_kept
 
         if not drop_missing and existing_by_url:
@@ -957,6 +960,7 @@ class NautiljonScraper:
         refresh_stale_days: Optional[int] = None,
         drop_missing: bool = True,
         min_days_between_diff_exports: int = 30,
+        abort_after_listing_failures: int = 1,
         force: bool = False,
     ) -> List[Dict[str, str]]:
         should_skip, last_success, age = self.should_skip_recent_success("diff", min_days_between_diff_exports)
@@ -971,6 +975,8 @@ class NautiljonScraper:
         letters_to_scrape = letters or self.get_all_letters()
         all_rows: List[Dict[str, str]] = []
         fatal_error = False
+        aborted_listing_failures = False
+        consecutive_listing_failures = 0
         try:
             for index, letter in enumerate(letters_to_scrape, start=1):
                 print(f"\nProgression: {index}/{len(letters_to_scrape)}")
@@ -982,6 +988,20 @@ class NautiljonScraper:
                     drop_missing=drop_missing,
                 )
                 all_rows.extend(rows)
+                label = self._letter_label(letter)
+                diff_stats = self.session_stats["diff_by_letter"].get(label, {})
+                if diff_stats.get("listing_failed"):
+                    consecutive_listing_failures += 1
+                    if abort_after_listing_failures > 0 and consecutive_listing_failures >= abort_after_listing_failures:
+                        aborted_listing_failures = True
+                        print(
+                            "Diff interrompu: "
+                            f"{consecutive_listing_failures} listing(s) consecutif(s) inaccessible(s). "
+                            "Les donnees existantes sont conservees."
+                        )
+                        break
+                else:
+                    consecutive_listing_failures = 0
                 if index < len(letters_to_scrape):
                     pause = self._compute_delay(multiplier=3)
                     print(f"Pause {pause:.1f}s avant la lettre suivante")
@@ -995,7 +1015,7 @@ class NautiljonScraper:
                 self.session_stats["duration"] = str(self.session_stats["end_time"] - self.session_stats["start_time"])
             combined = self.concat_letters()
             export_paths: Dict[str, str] = {}
-            if combined:
+            if combined and not aborted_listing_failures:
                 export_paths = self.export_all_data(combined, base_filename=f"nautiljon_diff_concat_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
             if combined and not fatal_error and self.session_stats.get("errors", 0) == 0:
                 self.mark_success("diff", len(combined), export_paths)
@@ -1053,6 +1073,7 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--refresh-stale-days", type=int, default=_env_optional_int("NAUTILJON_REFRESH_STALE_DAYS"))
     diff.add_argument("--keep-missing", action="store_true", default=not _env_bool("NAUTILJON_DROP_MISSING", True))
     diff.add_argument("--min-days-between-diff-exports", type=int, default=_env_int("NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS", 30))
+    diff.add_argument("--abort-after-listing-failures", type=int, default=_env_int("NAUTILJON_ABORT_AFTER_LISTING_FAILURES", 1))
     diff.add_argument("--force", action="store_true", default=_env_bool("NAUTILJON_FORCE_SCRAPE", False))
 
     probe = sub.add_parser("probe-discovery", help="Teste la decouverte HTTP des listings sans Selenium.")
@@ -1125,6 +1146,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             refresh_stale_days=args.refresh_stale_days,
             drop_missing=not args.keep_missing,
             min_days_between_diff_exports=args.min_days_between_diff_exports,
+            abort_after_listing_failures=args.abort_after_listing_failures,
             force=args.force,
         )
     elif command == "probe-discovery":

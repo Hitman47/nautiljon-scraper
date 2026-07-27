@@ -63,6 +63,7 @@ NAUTILJON_COMMAND=diff
 NAUTILJON_DELAY_MIN=2.0
 NAUTILJON_DELAY_MAX=5.0
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
+NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
 NAUTILJON_REFRESH_STALE_DAYS=180
 NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=256m
@@ -96,3 +97,5 @@ NAUTILJON_LETTERS=a
 - Only `yaoi` and `yuri` are filtered.
 - If Nautiljon blocks direct HTTP listings, `probe-discovery` will fail cleanly;
   the existing CSV import and concat still work.
+- During `diff`, `NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1` stops the run after
+  the first fully inaccessible letter. Set it to `0` to disable this guard.
