@@ -20,6 +20,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
+try:
+    csv.field_size_limit(sys.maxsize)
+except OverflowError:
+    csv.field_size_limit(2**31 - 1)
+
+
 BASE_URL = "https://www.nautiljon.com"
 DEFAULT_TIMEOUT = 45
 DEFAULT_HEADERS = {
@@ -359,21 +365,62 @@ class NautiljonScraper:
         return "HASH"
 
     def _read_csv_rows(self, path: str) -> List[Dict[str, str]]:
-        for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        errors: List[str] = []
+        for encoding in ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin-1"):
             try:
-                with open(path, "r", newline="", encoding=encoding) as handle:
-                    sample = handle.read(4096)
-                    handle.seek(0)
-                    dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-                    reader = csv.DictReader(handle, dialect=dialect)
-                    return [
-                        {str(k): _clean_spaces(v or "N/A") for k, v in row.items() if k}
-                        for row in reader
-                        if row
-                    ]
-            except Exception:
+                rows = self._read_csv_rows_with_encoding(path, encoding, errors="strict")
+                if rows or os.path.getsize(path) == 0:
+                    return rows
+            except Exception as exc:
+                errors.append(f"{encoding}: {exc}")
                 continue
-        raise RuntimeError(f"CSV illisible: {path}")
+
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                rows = self._read_csv_rows_with_encoding(path, encoding, errors="replace")
+                if rows or os.path.getsize(path) == 0:
+                    return rows
+            except Exception as exc:
+                errors.append(f"{encoding}/replace: {exc}")
+                continue
+
+        details = " | ".join(errors[-5:])
+        raise RuntimeError(f"CSV illisible: {path}" + (f" ({details})" if details else ""))
+
+    def _read_csv_rows_with_encoding(self, path: str, encoding: str, errors: str = "strict") -> List[Dict[str, str]]:
+        with open(path, "r", newline="", encoding=encoding, errors=errors) as handle:
+            sample = handle.read(8192)
+            handle.seek(0)
+            if not sample.strip("\ufeff\r\n\t ;,"):
+                return []
+
+            delimiter = ";"
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+                delimiter = dialect.delimiter or ";"
+            except csv.Error:
+                if sample.count(",") > sample.count(";") and "url_fiche;" not in sample[:2000]:
+                    delimiter = ","
+
+            reader = csv.DictReader(handle, delimiter=delimiter)
+            if not reader.fieldnames:
+                return []
+
+            reader.fieldnames = [
+                _clean_spaces((field or "").lstrip("\ufeff"))
+                for field in reader.fieldnames
+            ]
+            if not any(field in PREFERRED_FIELDS for field in reader.fieldnames):
+                raise ValueError(f"en-tetes CSV inattendus: {reader.fieldnames[:5]}")
+            return [
+                {
+                    _clean_spaces(str(key).lstrip("\ufeff")): _clean_spaces(value or "N/A")
+                    for key, value in row.items()
+                    if key
+                }
+                for row in reader
+                if row
+            ]
 
     def import_existing_csv(self) -> List[Dict[str, str]]:
         exports_dir, _, letters_dir, _ = self._ensure_dirs()
