@@ -355,7 +355,12 @@ class DiffStateTests(unittest.TestCase):
                 raise RuntimeError("listing blocked")
 
             first.fetch_listing_page = types.MethodType(first_fetch, first)
-            first.scrape_letter_diff("a", drop_missing=False, resume=True)
+            first.scrape_letter_diff(
+                "a",
+                refresh_stale_days=180,
+                drop_missing=False,
+                resume=True,
+            )
             checkpoint = first._load_json_dict(first._letter_checkpoint_path("A"))
             self.assertEqual(attempts, [0, 1, 1, 1])
             self.assertEqual(checkpoint["page_num"], 1)
@@ -368,7 +373,12 @@ class DiffStateTests(unittest.TestCase):
                 return f"https://example.test/a?page={page_num}", []
 
             second.fetch_listing_page = types.MethodType(second_fetch, second)
-            second.scrape_letter_diff("a", drop_missing=False, resume=True)
+            second.scrape_letter_diff(
+                "a",
+                refresh_stale_days=30,
+                drop_missing=False,
+                resume=True,
+            )
 
             self.assertEqual(resumed_pages[0], 1)
             self.assertFalse(os.path.exists(second._letter_checkpoint_path("A")))

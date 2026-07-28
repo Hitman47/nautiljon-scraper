@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -447,6 +448,31 @@ class NautiljonScraper:
     def _letter_checkpoint_path(self, letter_tag: str) -> str:
         _, checkpoints_dir, _, _ = self._ensure_dirs()
         return os.path.join(checkpoints_dir, f"nautiljon_lettre_{letter_tag}.json")
+
+    def _archive_letter_progress(self, letter_tag: str, checkpoint_path: str, reason: str) -> Optional[str]:
+        paths = [checkpoint_path, *self._letter_paths(letter_tag)[2:]]
+        existing_paths = [path for path in paths if os.path.isfile(path)]
+        if not existing_paths:
+            return None
+        _, checkpoints_dir, _, _ = self._ensure_dirs()
+        safe_reason = re.sub(r"[^a-z0-9_-]+", "_", _norm(reason)).strip("_") or "incompatible"
+        archive_dir = os.path.join(
+            checkpoints_dir,
+            "archive",
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{letter_tag}_{safe_reason}",
+        )
+        os.makedirs(archive_dir, exist_ok=True)
+        for path in existing_paths:
+            shutil.copy2(path, os.path.join(archive_dir, os.path.basename(path)))
+        print(f"  Progression precedente archivee avant remplacement: {archive_dir}")
+        return archive_dir
+
+    def _letter_checkpoint_is_compatible(self, letter_tag: str, checkpoint: Dict[str, object]) -> bool:
+        settings = checkpoint.get("settings")
+        if not isinstance(settings, dict):
+            return False
+        saved_letter = str(settings.get("letter", "") or "")
+        return bool(saved_letter) and self._letter_tag(saved_letter) == letter_tag
 
     def _remove_checkpoint(self, path: str) -> None:
         try:
@@ -2228,7 +2254,7 @@ class NautiljonScraper:
         counters = {"new": 0, "changed": 0, "parutions": 0, "reused": 0, "removed": 0}
         errors_before_letter = self.session_stats["errors"]
         checkpoint_path = self._letter_checkpoint_path(tag)
-        resume_needs_release_backfill = False
+        resumed_from_checkpoint = False
         letter_settings = {
             "letter": letter,
             "max_pages": max_pages,
@@ -2238,10 +2264,10 @@ class NautiljonScraper:
             "max_missing_ratio": max_missing_ratio,
         }
 
+        checkpoint = self._load_json_dict(checkpoint_path)
+        partial_rows = self._load_json_list(self._letter_paths(tag)[2])
         if resume:
-            checkpoint = self._load_json_dict(checkpoint_path)
-            partial_rows = self._load_json_list(self._letter_paths(tag)[2])
-            if checkpoint and checkpoint.get("settings") == letter_settings and partial_rows:
+            if checkpoint and self._letter_checkpoint_is_compatible(tag, checkpoint) and partial_rows:
                 updated_rows = [self._normalize_row(row) for row in partial_rows]
                 seen_urls = {
                     _ensure_abs_url(row.get("url_fiche", ""))
@@ -2259,11 +2285,15 @@ class NautiljonScraper:
                 saved_counters = checkpoint.get("counters")
                 if isinstance(saved_counters, dict):
                     counters.update({key: int(saved_counters.get(key, value) or 0) for key, value in counters.items()})
-                resume_needs_release_backfill = checkpoint.get("data_schema_version") != DATA_SCHEMA_VERSION
+                resumed_from_checkpoint = True
                 print(
                     f"  Reprise lettre {label}: page {page_num + 1}, "
                     f"{len(updated_rows)} serie(s) deja traitee(s)."
                 )
+            elif checkpoint:
+                self._archive_letter_progress(tag, checkpoint_path, "checkpoint_non_reutilisable")
+        elif checkpoint:
+            self._archive_letter_progress(tag, checkpoint_path, "reprise_desactivee")
 
         def save_checkpoint(next_page: int) -> None:
             self.save_letter_files(tag, updated_rows, partial=True)
@@ -2280,7 +2310,7 @@ class NautiljonScraper:
                 payload["next_listing_url"] = self._flaresolverr_listing_urls.get((tag, next_page), "")
             self._write_json_atomic(checkpoint_path, payload)
 
-        if resume_needs_release_backfill:
+        if resumed_from_checkpoint:
             candidates = [
                 (index, row)
                 for index, row in enumerate(updated_rows)
@@ -2288,8 +2318,8 @@ class NautiljonScraper:
             ]
             if candidates:
                 print(
-                    f"  Migration du checkpoint: {len(candidates)} serie(s) VF en cours "
-                    "a completer pour les parutions."
+                    f"  Reprise: {len(candidates)} serie(s) VF en cours "
+                    "a completer ou rafraichir pour les parutions."
                 )
             for index, row in candidates:
                 try:

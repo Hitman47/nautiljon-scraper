@@ -91,6 +91,9 @@ NAUTILJON_SHM_SIZE=512m
 - Les ecritures finales utilisent des fichiers temporaires puis un remplacement.
 - Une erreur de listing ou de detail ne remplace pas le fichier final de la lettre.
 - Le lien de pagination exact est suivi et conserve dans le checkpoint.
+- Une progression reste reprenable si le delai de rafraichissement, le seuil de
+  couverture ou le mode controle/final change. Un checkpoint inutilisable est
+  archive dans `output/checkpoints/archive/` avant tout remplacement.
 - Une disparition superieure a 15 % de la base bloque la finalisation.
 - Un controle avec `NAUTILJON_DROP_MISSING=false` ecrit dans `output/control/`.
 - `NAUTILJON_REFRESH_STALE_DAYS` ne recharge que les fiches dont `Nb volumes VF`

@@ -147,6 +147,9 @@ est automatiquement rescrapee. `NAUTILJON_FORCE_SCRAPE=true` ignore ce cache.
 Apres l'ajout des colonnes de parutions VF, les caches crees par une ancienne
 version sont volontairement ignores une fois. Un checkpoint de lettre en cours
 reste reprenable et ne complete que les fiches VF `En cours` deja parcourues.
+Les reglages de delai, de couverture et de conservation des fiches absentes ne
+rendent plus un checkpoint incompatible. Tout checkpoint réellement inutilisable
+est copie dans `output/checkpoints/archive/` avant son remplacement.
 
 ## Import initial
 
