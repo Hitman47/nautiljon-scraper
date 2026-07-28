@@ -960,7 +960,7 @@ class NautiljonScraper:
             self.close_flaresolverr()
 
     def _flaresolverr_api_url(self) -> str:
-        url = os.environ.get("NAUTILJON_FLARESOLVERR_URL", "http://192.168.1.30:8191/v1").strip().rstrip("/")
+        url = os.environ.get("NAUTILJON_FLARESOLVERR_URL", "http://127.0.0.1:8191/v1").strip().rstrip("/")
         if not url:
             raise RuntimeError("NAUTILJON_FLARESOLVERR_URL est vide")
         return url if url.endswith("/v1") else url + "/v1"
@@ -971,7 +971,7 @@ class NautiljonScraper:
             response = requests.post(
                 self._flaresolverr_api_url(),
                 json=payload,
-                timeout=max(30, timeout_ms / 1000 + 15),
+                timeout=(5, max(30, timeout_ms / 1000 + 15)),
             )
             response.raise_for_status()
             data = response.json()
@@ -986,7 +986,19 @@ class NautiljonScraper:
         if self.flaresolverr_session_id:
             return self.flaresolverr_session_id
         session_id = f"nautiljon-{os.getpid()}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        self._flaresolverr_post({"cmd": "sessions.create", "session": session_id})
+        attempts = max(1, _env_int("NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS", 30))
+        retry_delay = max(0, _env_float("NAUTILJON_FLARESOLVERR_STARTUP_DELAY", 2.0))
+        for attempt in range(1, attempts + 1):
+            try:
+                self._flaresolverr_post({"cmd": "sessions.create", "session": session_id})
+                break
+            except RuntimeError as exc:
+                if attempt == attempts:
+                    raise RuntimeError(
+                        f"FlareSolverr non pret apres {attempts} tentative(s): {exc}"
+                    ) from exc
+                print(f"FlareSolverr pas encore pret ({attempt}/{attempts}); nouvel essai dans {retry_delay:g}s")
+                time.sleep(retry_delay)
         self.flaresolverr_session_id = session_id
         print(f"Session FlareSolverr active: {session_id}")
         return session_id

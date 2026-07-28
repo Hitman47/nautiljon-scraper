@@ -1,8 +1,26 @@
 services:
+  flaresolverr-nautiljon:
+    image: "${NAUTILJON_FLARESOLVERR_IMAGE:-ghcr.io/flaresolverr/flaresolverr:v3.5.0}"
+    container_name: flaresolverr-nautiljon
+    network_mode: "container:${GLUETUN_CONTAINER:-GlueTun-Nord_WG}"
+    environment:
+      LOG_LEVEL: "${NAUTILJON_FLARESOLVERR_LOG_LEVEL:-info}"
+      LOG_HTML: "${NAUTILJON_FLARESOLVERR_LOG_HTML:-false}"
+      CAPTCHA_SOLVER: none
+      TZ: "${TZ:-Europe/Paris}"
+    cpus: "${NAUTILJON_FLARESOLVERR_CPUS:-1.0}"
+    mem_limit: "${NAUTILJON_FLARESOLVERR_MEM_LIMIT:-1g}"
+    memswap_limit: "${NAUTILJON_FLARESOLVERR_MEMSWAP_LIMIT:-1g}"
+    shm_size: "${NAUTILJON_FLARESOLVERR_SHM_SIZE:-512m}"
+    restart: unless-stopped
+
   nautiljon:
     image: "${NAUTILJON_IMAGE:-ghcr.io/hitman47/nautiljon-scraper:latest}"
     container_name: nautiljon-scraper
     network_mode: "container:${GLUETUN_CONTAINER:-GlueTun-Nord_WG}"
+    depends_on:
+      flaresolverr-nautiljon:
+        condition: service_started
     command: ["${NAUTILJON_COMMAND:-flaresolverr-test}"]
     environment:
       NAUTILJON_OUT_DIR: /data/output
@@ -13,8 +31,10 @@ services:
       NAUTILJON_CHROME_BINARY: /usr/bin/chromium
       NAUTILJON_CHROMEDRIVER: /usr/bin/chromedriver
       NAUTILJON_CLOUDFLARE_WAIT_SECONDS: "${NAUTILJON_CLOUDFLARE_WAIT_SECONDS:-120}"
-      NAUTILJON_FLARESOLVERR_URL: "${NAUTILJON_FLARESOLVERR_URL:-http://192.168.1.30:8191/v1}"
+      NAUTILJON_FLARESOLVERR_URL: "${NAUTILJON_FLARESOLVERR_URL:-http://127.0.0.1:8191/v1}"
       NAUTILJON_FLARESOLVERR_TIMEOUT_MS: "${NAUTILJON_FLARESOLVERR_TIMEOUT_MS:-120000}"
+      NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS: "${NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS:-30}"
+      NAUTILJON_FLARESOLVERR_STARTUP_DELAY: "${NAUTILJON_FLARESOLVERR_STARTUP_DELAY:-2}"
       NAUTILJON_DELAY: "${NAUTILJON_DELAY:-2.0}"
       NAUTILJON_DELAY_MIN: "${NAUTILJON_DELAY_MIN:-2.0}"
       NAUTILJON_DELAY_MAX: "${NAUTILJON_DELAY_MAX:-5.0}"

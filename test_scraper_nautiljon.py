@@ -260,6 +260,28 @@ class DiffStateTests(unittest.TestCase):
         self.assertEqual(calls[1]["session"], calls[2]["session"])
         self.assertIn("cookies", calls[1])
 
+    def test_flaresolverr_session_waits_for_service_startup(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+        calls = []
+
+        def fake_post(this, payload):
+            calls.append(payload)
+            if len(calls) < 3:
+                raise RuntimeError("connexion refusee")
+            return {"status": "ok"}
+
+        scraper._flaresolverr_post = types.MethodType(fake_post, scraper)
+        env = {
+            "NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS": "3",
+            "NAUTILJON_FLARESOLVERR_STARTUP_DELAY": "0",
+        }
+        with mock.patch.dict(os.environ, env), mock.patch("scraper_nautiljon.time.sleep") as sleep:
+            session_id = scraper.setup_flaresolverr()
+
+        self.assertTrue(session_id.startswith("nautiljon-"))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_flaresolverr_rejects_unsolved_challenge(self):
         scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
 

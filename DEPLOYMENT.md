@@ -4,6 +4,11 @@ Le conteneur execute une commande puis s'arrete. Les listings et les fiches sont
 charges dans une session FlareSolverr unique, sans fenetre ni intervention
 manuelle sur le NAS.
 
+Le compose cree un second conteneur nomme `flaresolverr-nautiljon`. Il est dedie
+a ce scraper et n'affecte pas le conteneur `flaresolverr` deja utilise par
+Prowlarr dans `search-stack`. Les deux nouveaux conteneurs partagent directement
+le namespace reseau de `GlueTun-Nord_WG`.
+
 ## Variables communes
 
 ```text
@@ -11,11 +16,16 @@ NAUTILJON_IMAGE=ghcr.io/hitman47/nautiljon-scraper:test
 GLUETUN_CONTAINER=GlueTun-Nord_WG
 NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
 NAUTILJON_BACKEND=flaresolverr
-NAUTILJON_FLARESOLVERR_URL=http://192.168.1.30:8191/v1
+NAUTILJON_FLARESOLVERR_URL=http://127.0.0.1:8191/v1
 NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
+NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS=30
+NAUTILJON_FLARESOLVERR_STARTUP_DELAY=2
 NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=1g
 NAUTILJON_MEMSWAP_LIMIT=1g
+NAUTILJON_FLARESOLVERR_CPUS=1.0
+NAUTILJON_FLARESOLVERR_MEM_LIMIT=1g
+NAUTILJON_FLARESOLVERR_MEMSWAP_LIMIT=1g
 ```
 
 ## 1. Test FlareSolverr
@@ -38,22 +48,23 @@ Le seul resultat autorisant la suite est :
 VERDICT FLARESOLVERR: PRET POUR DIFF CONTROLE
 ```
 
-Si les IP different, placez FlareSolverr derriere le meme Gluetun :
+Le compose fournit deja la topologie attendue pour les deux services :
 
 ```yaml
 network_mode: "container:GlueTun-Nord_WG"
 ```
 
-Dans cette configuration, utilisez dans le stack Nautiljon :
+Ils communiquent donc par l'adresse locale commune :
 
 ```text
 NAUTILJON_FLARESOLVERR_URL=http://127.0.0.1:8191/v1
 ```
 
-FlareSolverr et Nautiljon partagent alors l'espace reseau de Gluetun. Un service
-qui utilise `network_mode: container:...` ne doit pas declarer sa propre section
-`ports`. Si le port 8191 doit rester accessible depuis le LAN, publiez-le dans le
-stack Gluetun.
+Ne remplacez pas cette adresse par l'IP LAN du NAS. Le pare-feu de Gluetun peut
+bloquer ce retour vers le LAN, ce qui produit un timeout. Aucun port ne doit etre
+publie pour `flaresolverr-nautiljon` : seul le scraper y accede sur
+`127.0.0.1:8191`. La boucle de demarrage attend jusqu'a 60 secondes par defaut
+que son API soit prete.
 
 ## 2. Diff controle sur A
 
