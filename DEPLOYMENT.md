@@ -13,6 +13,8 @@ NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
 NAUTILJON_HOST_BROWSER_PROFILE=/media/nvme0n1p1/AppData/NautiljonScraper/browser-profile
 NAUTILJON_BACKEND=selenium
 NAUTILJON_BROWSER_HEADLESS=false
+NAUTILJON_BROWSER_ATTACH=true
+NAUTILJON_CLOUDFLARE_WAIT_SECONDS=120
 NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=1g
 NAUTILJON_MEMSWAP_LIMIT=1g
@@ -21,6 +23,8 @@ NAUTILJON_SHM_SIZE=512m
 
 Le profil persistant conserve les cookies et la session. Le bouton de consentement
 est clique automatiquement lors de la premiere ouverture.
+Chromium est lance comme un navigateur autonome, puis Selenium s'y attache. Cette
+configuration reprend le mode d'attachement deja prevu par le scraper PC.
 
 ## 1. Verification du navigateur
 

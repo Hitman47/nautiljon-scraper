@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 import unicodedata
@@ -196,6 +197,8 @@ class NautiljonScraper:
         self.backend = backend.strip().lower()
         self.browser_headless = browser_headless
         self.driver: Optional[webdriver.Chrome] = None
+        self.browser_process: Optional[subprocess.Popen] = None
+        self._browser_log_handle = None
         self._browser_letter_urls: Dict[str, str] = {}
         self.session = self._build_session()
         self.session_stats = {
@@ -803,37 +806,52 @@ class NautiljonScraper:
         )
         os.makedirs(profile_dir, exist_ok=True)
 
-        options = webdriver.ChromeOptions()
         browser_binary = os.environ.get("NAUTILJON_CHROME_BINARY", "/usr/bin/chromium")
-        if os.path.isfile(browser_binary):
-            options.binary_location = browser_binary
-        if self.browser_headless:
-            options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--window-size=1365,900")
-        options.add_argument("--lang=fr-FR")
-        options.add_argument("--no-first-run")
-        options.add_argument("--no-default-browser-check")
-        options.add_argument("--disable-session-crashed-bubble")
-        options.add_argument("--disable-features=Translate,MediaRouter")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--disable-sync")
-        options.add_argument("--remote-allow-origins=*")
-        options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")
-        options.add_experimental_option("prefs", {
-            "intl.accept_languages": "fr-FR,fr,en-US,en",
-            "profile.default_content_setting_values.notifications": 2,
-            "profile.exit_type": "Normal",
-            "profile.exited_cleanly": True,
-        })
+        attach_browser = _env_bool("NAUTILJON_BROWSER_ATTACH", True)
+        options = webdriver.ChromeOptions()
+
+        common_args = [
+            "--no-sandbox",
+            "--window-size=1365,900",
+            "--lang=fr-FR",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--disable-features=Translate,MediaRouter",
+            "--disable-extensions",
+            "--disable-gpu",
+            "--disable-sync",
+            "--remote-allow-origins=*",
+        ]
+
+        if attach_browser:
+            if not os.path.isfile(browser_binary):
+                raise RuntimeError(f"Binaire Chromium introuvable: {browser_binary}")
+            debugger_address = os.environ.get("NAUTILJON_DEBUGGER_ADDRESS", "127.0.0.1:9222").strip()
+            self._start_browser_process(browser_binary, profile_dir, debugger_address, common_args)
+            options.debugger_address = debugger_address
+        else:
+            if os.path.isfile(browser_binary):
+                options.binary_location = browser_binary
+            if self.browser_headless:
+                options.add_argument("--headless=new")
+            for argument in common_args:
+                options.add_argument(argument)
+            options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")
+            options.add_experimental_option("prefs", {
+                "intl.accept_languages": "fr-FR,fr,en-US,en",
+                "profile.default_content_setting_values.notifications": 2,
+                "profile.exit_type": "Normal",
+                "profile.exited_cleanly": True,
+            })
 
         driver_binary = os.environ.get("NAUTILJON_CHROMEDRIVER", "/usr/bin/chromedriver")
         service = ChromeService(
             executable_path=driver_binary if os.path.isfile(driver_binary) else None,
             log_output=log_path,
         )
-        print(f"Navigateur Selenium: chromium ({'headless' if self.browser_headless else 'Xvfb visible'})")
+        browser_mode = "attache au Chromium autonome" if attach_browser else "lance par ChromeDriver"
+        print(f"Navigateur Selenium: chromium ({'headless' if self.browser_headless else 'Xvfb visible'}, {browser_mode})")
         print(f"Profil persistant: {profile_dir}")
         print(f"Log ChromeDriver: {log_path}")
         try:
@@ -845,16 +863,97 @@ class NautiljonScraper:
             print(f"Session Selenium active, Chromium {version}")
             return self.driver
         except WebDriverException as exc:
+            self._stop_browser_process()
             raise RuntimeError(f"Impossible de demarrer Chromium/Selenium: {str(exc)[:500]}") from exc
 
-    def close_browser(self) -> None:
-        if not self.driver:
+    def _start_browser_process(
+        self,
+        browser_binary: str,
+        profile_dir: str,
+        debugger_address: str,
+        common_args: List[str],
+    ) -> None:
+        if self.browser_process and self.browser_process.poll() is None:
             return
+
+        host, separator, port_text = debugger_address.rpartition(":")
+        if not separator or not port_text.isdigit():
+            raise RuntimeError(f"NAUTILJON_DEBUGGER_ADDRESS invalide: {debugger_address}")
+        host = host or "127.0.0.1"
+        port = int(port_text)
+
+        for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            path = os.path.join(profile_dir, name)
+            try:
+                if os.path.lexists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+        debug_dir = os.path.join(self.out_dir, "debug")
+        browser_log_path = os.path.join(
+            debug_dir,
+            f"chromium_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+        )
+        self._browser_log_handle = open(browser_log_path, "a", encoding="utf-8")
+        command = [
+            browser_binary,
+            f"--remote-debugging-address={host}",
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={os.path.abspath(profile_dir)}",
+            *common_args,
+        ]
+        if self.browser_headless:
+            command.append("--headless=new")
+        command.append("about:blank")
+
+        print(f"Demarrage autonome de Chromium: {debugger_address}")
+        print(f"Log Chromium: {browser_log_path}")
+        self.browser_process = subprocess.Popen(
+            command,
+            stdout=self._browser_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+        endpoint = f"http://{debugger_address}/json/version"
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if self.browser_process.poll() is not None:
+                self._stop_browser_process()
+                raise RuntimeError(f"Chromium autonome s'est arrete avant son attachement. Log: {browser_log_path}")
+            try:
+                response = requests.get(endpoint, timeout=0.5)
+                if response.ok:
+                    return
+            except requests.RequestException:
+                pass
+            time.sleep(0.2)
+
+        self._stop_browser_process()
+        raise RuntimeError(f"Port de debogage Chromium indisponible apres 20 secondes: {endpoint}")
+
+    def _stop_browser_process(self) -> None:
+        process = self.browser_process
+        self.browser_process = None
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if self._browser_log_handle:
+            self._browser_log_handle.close()
+            self._browser_log_handle = None
+
+    def close_browser(self) -> None:
         try:
-            self.driver.quit()
+            if self.driver:
+                self.driver.quit()
         finally:
             self.driver = None
             self._browser_letter_urls.clear()
+            self._stop_browser_process()
 
     def _save_browser_debug(self, context: str) -> Dict[str, str]:
         if not self.driver:
@@ -935,14 +1034,29 @@ class NautiljonScraper:
             debug = self._save_browser_debug(context)
             raise RuntimeError(f"Page Selenium vide ou trop lente ({context}). Debug: {debug}") from exc
 
-        challenge_deadline = time.time() + _env_int("NAUTILJON_CLOUDFLARE_WAIT_SECONDS", 30)
-        while self._blocked_by_waf(self.driver.page_source):
-            text = _norm(self.driver.page_source)
-            challenge = "just a moment" in text or "performing security verification" in text
-            if not challenge or time.time() >= challenge_deadline:
+        wait_seconds = _env_int("NAUTILJON_CLOUDFLARE_WAIT_SECONDS", 120)
+        challenge_deadline = time.time() + wait_seconds
+        announced = False
+        while True:
+            html = self.driver.page_source
+            if self._cloudflare_challenge(html):
+                if not announced:
+                    print(f"Verification Cloudflare detectee; attente automatique jusqu'a {wait_seconds}s.")
+                    announced = True
+                if time.time() >= challenge_deadline:
+                    debug = self._save_browser_debug(context)
+                    raise RuntimeError(
+                        f"La verification Cloudflare ne s'est pas terminee apres {wait_seconds}s "
+                        f"({context}). Debug: {debug}"
+                    )
+                time.sleep(1)
+                continue
+            if self._blocked_by_waf(html):
                 debug = self._save_browser_debug(context)
                 raise RuntimeError(f"Cloudflare bloque le navigateur Selenium ({context}). Debug: {debug}")
-            time.sleep(1)
+            break
+        if announced:
+            print("Verification Cloudflare terminee.")
         self._dismiss_cookie_consent()
 
     def _browser_get(self, url: str, context: str) -> str:
@@ -1072,6 +1186,9 @@ class NautiljonScraper:
                 report["sample_title"] = rows[0].get("titre", "N/A")
         except Exception as exc:
             report["error"] = str(exc)
+            if self.driver:
+                report["current_url"] = self.driver.current_url
+                report["page_title"] = self.driver.title
             report["debug"] = self._save_browser_debug("browser_test_failed")
         finally:
             self.close_browser()
@@ -1113,6 +1230,20 @@ class NautiljonScraper:
             or "just a moment" in text
             or "performing security verification" in text
             or "access denied" in text
+            or self._cloudflare_challenge(html)
+        )
+
+    def _cloudflare_challenge(self, html: str) -> bool:
+        text = _norm(html)
+        raw = (html or "").lower()
+        return (
+            "verification de securite en cours" in text
+            or "verification en cours" in text
+            or "checking your browser" in text
+            or "just a moment" in text
+            or "performing security verification" in text
+            or "cf-chl-" in raw
+            or "challenges.cloudflare.com" in raw
         )
 
     def _search_session_expired(self, html: str) -> bool:

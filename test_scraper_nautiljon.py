@@ -220,6 +220,18 @@ class DiffStateTests(unittest.TestCase):
         self.assertEqual(url, "https://example.test/a")
         self.assertEqual(len(rows), 1)
 
+    def test_detects_french_cloudflare_challenge(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="selenium")
+        html = """
+        <html><title>Un instant...</title><body>
+        <h1>Vérification de sécurité en cours</h1>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>
+        </body></html>
+        """
+
+        self.assertTrue(scraper._cloudflare_challenge(html))
+        self.assertTrue(scraper._blocked_by_waf(html))
+
     def test_browser_test_checks_listing_and_detail_without_export(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = os.path.join(temp_dir, "output")
