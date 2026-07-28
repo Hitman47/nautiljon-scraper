@@ -24,8 +24,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY scraper_nautiljon.py .
+COPY docker-entrypoint.sh /usr/local/bin/nautiljon-entrypoint
+RUN chmod +x /usr/local/bin/nautiljon-entrypoint
 
 VOLUME ["/data/output", "/data/browser-profile"]
 
-ENTRYPOINT ["xvfb-run", "-a", "--server-args=-screen 0 1365x900x24 -nolisten tcp", "python", "scraper_nautiljon.py"]
+ENTRYPOINT ["/usr/local/bin/nautiljon-entrypoint"]
 CMD ["diff"]
