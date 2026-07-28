@@ -34,13 +34,14 @@ ghcr.io/hitman47/nautiljon-scraper:test    # validation, branches codex/*
 output/
 |-- letters/       CSV et JSON finalises par lettre
 |-- checkpoints/   reprise de la page et de la lettre en cours
+|-- control/       resultats des tests sans remplacement des lettres finales
 |-- exports/       exports consolides finalises
 |-- discovery/     candidats RSS non exhaustifs
 `-- state/         dernier run et dernier succes complet
 ```
 
 Le scraper reutilise le conteneur `flaresolverr` du stack de recherche. Gluetun
-et FlareSolverr sont joignables sur le reseau Docker externe `media_net`. La
+et FlareSolverr sont joignables sur le reseau externe `torrent_vpn_share`. La
 session reservee a Nautiljon utilise le proxy HTTP de Gluetun, sans modifier le
 comportement des autres clients de FlareSolverr. Elle est reutilisee pendant
 toute une execution puis fermee proprement.
@@ -58,7 +59,7 @@ NAUTILJON_HOST_BROWSER_PROFILE=/media/nvme0n1p1/AppData/NautiljonScraper/browser
 NAUTILJON_COMMAND=flaresolverr-test
 NAUTILJON_BACKEND=flaresolverr
 NAUTILJON_FLARESOLVERR_URL=http://flaresolverr:8191/v1
-NAUTILJON_FLARESOLVERR_PROXY_URL=http://gluetun-nord-wg:8888
+NAUTILJON_FLARESOLVERR_PROXY_URL=http://gluetun-nord:8888
 NAUTILJON_FLARESOLVERR_PROXY_USERNAME=
 NAUTILJON_FLARESOLVERR_PROXY_PASSWORD=
 NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
@@ -69,6 +70,7 @@ NAUTILJON_DELAY_MAX=5.0
 NAUTILJON_RESUME=true
 NAUTILJON_FLUSH_EVERY=25
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
+NAUTILJON_MAX_MISSING_RATIO=0.15
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
 NAUTILJON_REFRESH_STALE_DAYS=180
 NAUTILJON_CPUS=1.0
@@ -86,5 +88,8 @@ NAUTILJON_SHM_SIZE=512m
 - Seuls `yaoi` et `yuri` sont exclus.
 - Les ecritures finales utilisent des fichiers temporaires puis un remplacement.
 - Une erreur de listing ou de detail ne remplace pas le fichier final de la lettre.
+- Le lien de pagination exact est suivi et conserve dans le checkpoint.
+- Une disparition superieure a 15 % de la base bloque la finalisation.
+- Un controle avec `NAUTILJON_DROP_MISSING=false` ecrit dans `output/control/`.
 - Le RSS reste separe du diff et ne peut pas valider un export mensuel.
 - Le conteneur est limite par le compose a 1 CPU et 1 Gio de RAM.

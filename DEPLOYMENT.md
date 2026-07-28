@@ -8,32 +8,28 @@ Le scraper reutilise le conteneur `flaresolverr` existant dans `search-stack`.
 Il ne lance aucune seconde instance. Sa session FlareSolverr recoit un proxy
 dedie vers Gluetun, sans changer les sessions de Prowlarr ou des autres clients.
 
-## 1. Relier Gluetun a media_net
+## 1. Reseau partage existant
 
-Dans le stack qui definit `GlueTun-Nord_WG`, ajoutez au service Gluetun :
+Gluetun est deja rattache au reseau externe avec l'alias suivant :
 
 ```yaml
 services:
   gluetun:
-    environment:
-      - HTTPPROXY=on
-      - HTTPPROXY_STEALTH=on
     networks:
-      media_net:
+      torrent_vpn_share:
         aliases:
-          - gluetun-nord-wg
+          - gluetun-nord
 
 networks:
-  media_net:
+  torrent_vpn_share:
     external: true
 ```
 
-Conservez toutes les autres variables, volumes, ports et options deja presents
-dans ce stack. Le port `8888` n'a pas besoin d'etre publie sur le LAN :
-FlareSolverr atteint le proxy directement par `media_net`.
+Le proxy et le mode stealth sont deja actifs dans Gluetun. Le port `8888` n'a
+pas besoin d'etre publie sur le LAN.
 
-Le stack `search-stack` fourni n'a besoin d'aucune modification : son service
-`flaresolverr` est deja attache a `media_net`.
+Le service `flaresolverr` de `search-stack` doit conserver `media_net` et etre
+egalement rattache a `torrent_vpn_share`.
 
 ## Variables communes
 
@@ -43,7 +39,7 @@ GLUETUN_CONTAINER=GlueTun-Nord_WG
 NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
 NAUTILJON_BACKEND=flaresolverr
 NAUTILJON_FLARESOLVERR_URL=http://flaresolverr:8191/v1
-NAUTILJON_FLARESOLVERR_PROXY_URL=http://gluetun-nord-wg:8888
+NAUTILJON_FLARESOLVERR_PROXY_URL=http://gluetun-nord:8888
 NAUTILJON_FLARESOLVERR_PROXY_USERNAME=
 NAUTILJON_FLARESOLVERR_PROXY_PASSWORD=
 NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
@@ -52,6 +48,7 @@ NAUTILJON_FLARESOLVERR_STARTUP_DELAY=2
 NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=1g
 NAUTILJON_MEMSWAP_LIMIT=1g
+NAUTILJON_MAX_MISSING_RATIO=0.15
 ```
 
 Si le proxy Gluetun est protege par `HTTPPROXY_USER` et
@@ -84,7 +81,7 @@ Le scraper partage le namespace reseau de Gluetun :
 network_mode: "container:GlueTun-Nord_WG"
 ```
 
-Ce namespace est rattache a `media_net`, ce qui rend l'API existante accessible
+Ce namespace est rattache a `torrent_vpn_share`, ce qui rend l'API existante accessible
 par son nom Docker :
 
 ```text
@@ -92,7 +89,7 @@ NAUTILJON_FLARESOLVERR_URL=http://flaresolverr:8191/v1
 ```
 
 La session Chromium creee dans FlareSolverr utilise quant a elle
-`http://gluetun-nord-wg:8888`. Son trafic Nautiljon ressort donc par le VPN. Le
+`http://gluetun-nord:8888`. Son trafic Nautiljon ressort donc par le VPN. Le
 test refuse le diff si son IP publique differe de celle du scraper derriere
 Gluetun.
 
@@ -109,7 +106,8 @@ NAUTILJON_RESUME=true
 ```
 
 Un sous-ensemble termine avec l'etat `PARTIAL` et ne produit jamais de marqueur
-mensuel complet.
+mensuel complet. Son resultat est ecrit dans `output/control/`; les fichiers
+finaux de `output/letters/` restent inchanges.
 
 ## 4. Diff mensuel complet
 
@@ -125,11 +123,16 @@ NAUTILJON_DELAY_MIN=2.0
 NAUTILJON_DELAY_MAX=5.0
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
+NAUTILJON_MAX_MISSING_RATIO=0.15
 ```
 
 Le succes exige les 27 lettres, aucune erreur de listing ou de fiche et des
 exports finaux valides. Une interruption conserve la page courante et les lettres
 deja terminees dans `output/checkpoints/`.
+
+Le scraper suit le lien de pagination exact fourni par Nautiljon et enregistre
+ce lien dans le checkpoint. Si plus de 15 % des fiches historiques d'une lettre
+disparaissent du listing, la lettre n'est pas remplacee et le diff s'arrete.
 
 ## Import initial
 

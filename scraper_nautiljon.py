@@ -203,6 +203,8 @@ class NautiljonScraper:
         self.flaresolverr_session_id: Optional[str] = None
         self._last_flaresolverr_url = ""
         self._flaresolverr_letter_urls: Dict[str, str] = {}
+        self._flaresolverr_listing_urls: Dict[Tuple[str, int], str] = {}
+        self._flaresolverr_page_has_next: Dict[Tuple[str, int], bool] = {}
         self.session = self._build_session()
         self.session_stats = {
             "total_series": 0,
@@ -386,6 +388,7 @@ class NautiljonScraper:
         max_series_per_letter: Optional[int],
         refresh_stale_days: Optional[int],
         drop_missing: bool,
+        max_missing_ratio: float = 0.15,
     ) -> Dict[str, object]:
         return {
             "letters": letters,
@@ -393,6 +396,7 @@ class NautiljonScraper:
             "max_series_per_letter": max_series_per_letter,
             "refresh_stale_days": refresh_stale_days,
             "drop_missing": drop_missing,
+            "max_missing_ratio": max_missing_ratio,
         }
 
     def _load_diff_run_checkpoint(self, config: Dict[str, object], resume: bool) -> List[str]:
@@ -459,6 +463,20 @@ class NautiljonScraper:
         self._write_csv(csv_path, rows)
         if not partial:
             print(f"  Lettre sauvegardee: {os.path.basename(final_json)} / {os.path.basename(final_csv)}")
+
+    def save_controlled_letter_files(self, letter_tag: str, rows: List[Dict[str, str]]) -> Dict[str, str]:
+        control_dir = os.path.join(self.out_dir, "control")
+        os.makedirs(control_dir, exist_ok=True)
+        base = os.path.join(control_dir, f"nautiljon_lettre_{letter_tag}.control")
+        json_path = base + ".json"
+        csv_path = base + ".csv"
+        tmp_json = json_path + ".tmp"
+        with open(tmp_json, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp_json, json_path)
+        self._write_csv(csv_path, rows)
+        print(f"  Controle sauvegarde sans modifier la lettre finale: {json_path} / {csv_path}")
+        return {"json_path": json_path, "csv_path": csv_path}
 
     def _remove_partial_files(self, letter_tag: str) -> None:
         _, _, partial_json, partial_csv = self._letter_paths(letter_tag)
@@ -1025,6 +1043,8 @@ class NautiljonScraper:
         session_id = self.flaresolverr_session_id
         self.flaresolverr_session_id = None
         self._flaresolverr_letter_urls.clear()
+        self._flaresolverr_listing_urls.clear()
+        self._flaresolverr_page_has_next.clear()
         if not session_id:
             return
         try:
@@ -1293,16 +1313,45 @@ class NautiljonScraper:
             raise RuntimeError(f"FlareSolverr: liens alphabetiques introuvables: {', '.join(missing)}")
         print(f"Index Nautiljon initialise via FlareSolverr: {len(self._flaresolverr_letter_urls)} lettres")
 
+    @staticmethod
+    def _extract_next_listing_url(html: str, current_url: str, page_num: int) -> Optional[str]:
+        target_offset = (page_num + 1) * 50
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            href = urljoin(current_url, str(anchor.get("href", "")))
+            parsed = urlsplit(href)
+            if "/mangas/" not in parsed.path:
+                continue
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            try:
+                offset = int(query.get("dbt", "-1"))
+            except ValueError:
+                continue
+            if offset == target_offset:
+                return href
+        return None
+
+    def _set_flaresolverr_listing_url(self, letter: str, page_num: int, url: str) -> None:
+        if url:
+            self._flaresolverr_listing_urls[(self._letter_tag(letter), page_num)] = _ensure_abs_url(url)
+
+    def _flaresolverr_listing_has_next(self, letter: str, page_num: int) -> bool:
+        return self._flaresolverr_page_has_next.get((self._letter_tag(letter), page_num), False)
+
     def _fetch_listing_page_flaresolverr(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
         self._load_flaresolverr_letter_urls()
         label = self._letter_label(letter)
-        page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
+        key = (self._letter_tag(letter), page_num)
+        page_url = self._flaresolverr_listing_urls.get(key)
+        if not page_url:
+            page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
         html = self._fetch_html_flaresolverr(page_url)
         if self._search_session_expired(html):
             self._flaresolverr_letter_urls.clear()
             self._load_flaresolverr_letter_urls()
             page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
             html = self._fetch_html_flaresolverr(page_url)
+        final_url = self._last_flaresolverr_url or page_url
         rows = self.extract_series_list_from_html(html)
         expected_tag = self._letter_tag(letter)
         matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
@@ -1311,7 +1360,11 @@ class NautiljonScraper:
                 f"Listing FlareSolverr incoherent pour {label}: "
                 f"{len(matching_rows)}/{len(rows)} titres correspondent"
             )
-        return self._last_flaresolverr_url or page_url, matching_rows
+        next_url = self._extract_next_listing_url(html, final_url, page_num)
+        self._flaresolverr_page_has_next[key] = bool(next_url)
+        if next_url:
+            self._set_flaresolverr_listing_url(letter, page_num + 1, next_url)
+        return final_url, matching_rows
 
     def browser_test(self, letter: str = "a") -> Dict[str, object]:
         print("=" * 60)
@@ -1902,6 +1955,7 @@ class NautiljonScraper:
         max_series: Optional[int] = None,
         refresh_stale_days: Optional[int] = None,
         drop_missing: bool = True,
+        max_missing_ratio: float = 0.15,
         flush_every: int = 25,
         resume: bool = True,
     ) -> List[Dict[str, str]]:
@@ -1917,6 +1971,7 @@ class NautiljonScraper:
             for row in existing_rows
             if row.get("url_fiche")
         }
+        initial_existing_count = len(existing_by_url)
         print(f"  Base existante: {len(existing_by_url)} series")
 
         updated_rows: List[Dict[str, str]] = []
@@ -1936,6 +1991,7 @@ class NautiljonScraper:
             "max_series": max_series,
             "refresh_stale_days": refresh_stale_days,
             "drop_missing": drop_missing,
+            "max_missing_ratio": max_missing_ratio,
         }
 
         if resume:
@@ -1953,6 +2009,9 @@ class NautiljonScraper:
                 page_num = int(checkpoint.get("page_num", 0) or 0)
                 accessible_listing_pages = int(checkpoint.get("accessible_listing_pages", 0) or 0)
                 successful_listing_pages = int(checkpoint.get("successful_listing_pages", 0) or 0)
+                next_listing_url = str(checkpoint.get("next_listing_url", "") or "")
+                if self.backend == "flaresolverr" and next_listing_url:
+                    self._set_flaresolverr_listing_url(letter, page_num, next_listing_url)
                 saved_counters = checkpoint.get("counters")
                 if isinstance(saved_counters, dict):
                     counters.update({key: int(saved_counters.get(key, value) or 0) for key, value in counters.items()})
@@ -1963,14 +2022,17 @@ class NautiljonScraper:
 
         def save_checkpoint(next_page: int) -> None:
             self.save_letter_files(tag, updated_rows, partial=True)
-            self._write_json_atomic(checkpoint_path, {
+            payload = {
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
                 "settings": letter_settings,
                 "page_num": next_page,
                 "accessible_listing_pages": accessible_listing_pages,
                 "successful_listing_pages": successful_listing_pages,
                 "counters": counters,
-            })
+            }
+            if self.backend == "flaresolverr":
+                payload["next_listing_url"] = self._flaresolverr_listing_urls.get((tag, next_page), "")
+            self._write_json_atomic(checkpoint_path, payload)
 
         while True:
             if max_pages is not None and page_num >= max_pages:
@@ -1990,6 +2052,11 @@ class NautiljonScraper:
                 continue
 
             if not page_series:
+                if self.backend == "flaresolverr":
+                    listing_failed = True
+                    print("  Page vide inattendue via FlareSolverr: fin de listing non validee.")
+                    save_checkpoint(page_num)
+                    break
                 empty_pages += 1
                 if empty_pages >= 3:
                     break
@@ -2055,6 +2122,17 @@ class NautiljonScraper:
                     empty_pages = 0
                 if max_series is not None and len(updated_rows) >= max_series:
                     break
+                if self.backend == "flaresolverr" and not self._flaresolverr_listing_has_next(letter, page_num):
+                    if len(page_series) >= 50:
+                        listing_failed = True
+                        print(
+                            f"  Pagination incoherente: page {page_num + 1} pleine "
+                            "mais aucun lien vers la page suivante."
+                        )
+                        save_checkpoint(page_num)
+                    else:
+                        print(f"  Fin de pagination explicite apres la page {page_num + 1}.")
+                    break
 
             if not page_series:
                 save_checkpoint(page_num + 1)
@@ -2077,6 +2155,9 @@ class NautiljonScraper:
                 "reused": len(existing_kept),
                 "removed": 0,
                 "listing_failed": True,
+                "coverage_failed": False,
+                "detail_failed": False,
+                "limited": False,
             }
             if existing_kept:
                 print(
@@ -2089,12 +2170,28 @@ class NautiljonScraper:
 
         detail_failed = self.session_stats["errors"] > errors_before_letter
         limited = max_pages is not None or max_series is not None
-        if listing_failed or detail_failed or limited:
+        missing_count = len(existing_by_url)
+        missing_ratio = (missing_count / initial_existing_count) if initial_existing_count else 0.0
+        coverage_failed = bool(
+            not limited
+            and initial_existing_count >= 20
+            and max_missing_ratio >= 0
+            and missing_ratio > max_missing_ratio
+        )
+        if coverage_failed:
+            print(
+                f"  Couverture invalide: {missing_count}/{initial_existing_count} fiches historiques absentes "
+                f"({missing_ratio:.1%}), seuil autorise {max_missing_ratio:.1%}."
+            )
+        if listing_failed or coverage_failed or detail_failed or limited:
             safe_rows = sorted(
                 updated_rows + list(existing_by_url.values()),
                 key=lambda row: _norm(row.get("titre", "")),
             )
             counters["listing_failed"] = listing_failed
+            counters["coverage_failed"] = coverage_failed
+            counters["missing_count"] = missing_count
+            counters["missing_ratio"] = round(missing_ratio, 6)
             counters["detail_failed"] = detail_failed
             counters["limited"] = limited
             self.session_stats["series_by_letter"][label] = len(safe_rows)
@@ -2102,28 +2199,37 @@ class NautiljonScraper:
             self.session_stats["diff_by_letter"][label] = counters
             if listing_failed:
                 print("  Fin de listing incertaine: fichier final inchange, checkpoint conserve.")
+            elif coverage_failed:
+                print("  Couverture anormale: fichier final inchange, checkpoint conserve.")
             elif detail_failed:
                 print("  Detail(s) inaccessible(s): fichier final inchange, checkpoint conserve.")
             else:
                 print("  Execution limitee: fichier final inchange, checkpoint conserve.")
             return safe_rows
 
-        if not drop_missing and existing_by_url:
+        if not drop_missing:
             updated_rows.extend(existing_by_url.values())
         else:
-            counters["removed"] = len(existing_by_url)
+            counters["removed"] = missing_count
 
         updated_rows = sorted(updated_rows, key=lambda row: _norm(row.get("titre", "")))
-        self.save_letter_files(tag, updated_rows, partial=False)
+        if drop_missing:
+            self.save_letter_files(tag, updated_rows, partial=False)
+        else:
+            self.save_controlled_letter_files(tag, updated_rows)
         self._remove_partial_files(tag)
         self._remove_checkpoint(checkpoint_path)
         counters["listing_failed"] = False
+        counters["coverage_failed"] = False
+        counters["missing_count"] = missing_count
+        counters["missing_ratio"] = round(missing_ratio, 6)
         counters["detail_failed"] = False
         counters["limited"] = False
         self.session_stats["series_by_letter"][label] = len(updated_rows)
         self.session_stats["total_series"] += len(updated_rows)
         self.session_stats["diff_by_letter"][label] = counters
-        print(f"  Lettre {label}: {len(updated_rows)} series ({counters})")
+        suffix = "controle uniquement" if not drop_missing else "fichier final mis a jour"
+        print(f"  Lettre {label}: {len(updated_rows)} series, {suffix} ({counters})")
         return updated_rows
 
     def _read_existing_csv_for_letter(self, tag: str) -> List[Dict[str, str]]:
@@ -2139,6 +2245,7 @@ class NautiljonScraper:
         max_series_per_letter: Optional[int] = None,
         refresh_stale_days: Optional[int] = None,
         drop_missing: bool = True,
+        max_missing_ratio: float = 0.15,
         min_days_between_diff_exports: int = 30,
         abort_after_listing_failures: int = 1,
         flush_every: int = 25,
@@ -2153,6 +2260,7 @@ class NautiljonScraper:
             and len(letters_to_scrape) == len(all_catalog_letters)
             and max_pages_per_letter is None
             and max_series_per_letter is None
+            and drop_missing
         )
         should_skip, last_success, age = self.should_skip_recent_success("diff", min_days_between_diff_exports)
         if full_catalog_requested and should_skip and not force and last_success and age is not None:
@@ -2195,6 +2303,7 @@ class NautiljonScraper:
             max_series_per_letter,
             refresh_stale_days,
             drop_missing,
+            max_missing_ratio,
         )
         completed_letters = self._load_diff_run_checkpoint(config, resume)
         fatal_error = False
@@ -2216,12 +2325,14 @@ class NautiljonScraper:
                     max_series=max_series_per_letter,
                     refresh_stale_days=refresh_stale_days,
                     drop_missing=drop_missing,
+                    max_missing_ratio=max_missing_ratio,
                     flush_every=flush_every,
                     resume=resume,
                 )
                 diff_stats = self.session_stats["diff_by_letter"].get(label, {})
                 letter_incomplete = bool(
                     diff_stats.get("listing_failed")
+                    or diff_stats.get("coverage_failed")
                     or diff_stats.get("detail_failed")
                     or diff_stats.get("limited")
                 )
@@ -2242,6 +2353,10 @@ class NautiljonScraper:
                         break
                 else:
                     consecutive_listing_failures = 0
+                if diff_stats.get("coverage_failed"):
+                    incomplete_reason = "coverage_incomplete"
+                    print("Diff interrompu: couverture du listing incoherente avec la base existante.")
+                    break
                 if diff_stats.get("detail_failed"):
                     incomplete_reason = "detail_inaccessible"
                     print("Diff interrompu: au moins une fiche detail est inaccessible.")
@@ -2381,6 +2496,12 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--max-series-per-letter", type=int, default=_env_optional_int("NAUTILJON_MAX_SERIES_PER_LETTER"))
     diff.add_argument("--refresh-stale-days", type=int, default=_env_optional_int("NAUTILJON_REFRESH_STALE_DAYS"))
     diff.add_argument("--keep-missing", action="store_true", default=not _env_bool("NAUTILJON_DROP_MISSING", True))
+    diff.add_argument(
+        "--max-missing-ratio",
+        type=float,
+        default=_env_float("NAUTILJON_MAX_MISSING_RATIO", 0.15),
+        help="Refuse la finalisation si la part de fiches historiques absentes depasse ce seuil.",
+    )
     diff.add_argument("--min-days-between-diff-exports", type=int, default=_env_int("NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS", 30))
     diff.add_argument("--abort-after-listing-failures", type=int, default=_env_int("NAUTILJON_ABORT_AFTER_LISTING_FAILURES", 1))
     diff.add_argument("--flush-every", type=int, default=_env_int("NAUTILJON_FLUSH_EVERY", 25))
@@ -2485,6 +2606,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             max_series_per_letter=args.max_series_per_letter,
             refresh_stale_days=args.refresh_stale_days,
             drop_missing=not args.keep_missing,
+            max_missing_ratio=args.max_missing_ratio,
             min_days_between_diff_exports=args.min_days_between_diff_exports,
             abort_after_listing_failures=args.abort_after_listing_failures,
             flush_every=args.flush_every,

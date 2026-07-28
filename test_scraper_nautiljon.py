@@ -161,6 +161,115 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(resumed_pages[0], 1)
             self.assertFalse(os.path.exists(second._letter_checkpoint_path("A")))
 
+    def test_flaresolverr_resume_reuses_checkpointed_next_url(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            first = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            self.seed_letter(first, "a")
+            row = make_row("A")
+            exact_next_url = "https://www.nautiljon.com/mangas/?q=a&st=next-token&dbt=50"
+
+            def first_fetch(this, letter, page_num):
+                if page_num == 0:
+                    this._set_flaresolverr_listing_url(letter, 1, exact_next_url)
+                    this._flaresolverr_page_has_next[(this._letter_tag(letter), 0)] = True
+                    return "https://www.nautiljon.com/mangas/?q=a&st=first-token", [row]
+                raise RuntimeError("listing blocked")
+
+            first.fetch_listing_page = types.MethodType(first_fetch, first)
+            first.scrape_letter_diff("a", drop_missing=False, resume=True)
+
+            checkpoint = first._load_json_dict(first._letter_checkpoint_path("A"))
+            self.assertEqual(checkpoint["page_num"], 1)
+            self.assertEqual(checkpoint["next_listing_url"], exact_next_url)
+
+            second = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            resumed_urls = []
+
+            def second_fetch(this, letter, page_num):
+                resumed_urls.append(this._flaresolverr_listing_urls.get((this._letter_tag(letter), page_num)))
+                return exact_next_url, [row]
+
+            second.fetch_listing_page = types.MethodType(second_fetch, second)
+            second.scrape_letter_diff("a", drop_missing=False, resume=True)
+
+            self.assertEqual(resumed_urls, [exact_next_url])
+            self.assertFalse(os.path.exists(second._letter_checkpoint_path("A")))
+
+    def test_controlled_diff_does_not_replace_final_letter(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            self.seed_letter(scraper, "a")
+            final_json = scraper._letter_paths("A")[0]
+            baseline = scraper._load_json_list(final_json)
+            new_row = make_row("A")
+            new_row["url_fiche"] = "https://www.nautiljon.com/mangas/new-a.html"
+            pages = {0: [new_row], 1: [], 2: [], 3: []}
+
+            def fake_fetch(this, letter, page_num):
+                return f"https://example.test/a?page={page_num}", pages[page_num]
+
+            scraper.fetch_listing_page = types.MethodType(fake_fetch, scraper)
+            scraper._fetch_full_series_data = types.MethodType(
+                lambda this, series: this._normalize_row(series),
+                scraper,
+            )
+
+            rows = scraper.scrape_letter_diff("a", drop_missing=False, resume=False)
+
+            self.assertEqual(scraper._load_json_list(final_json), baseline)
+            self.assertEqual(len(rows), 2)
+            control_json = os.path.join(out_dir, "control", "nautiljon_lettre_A.control.json")
+            self.assertEqual(len(scraper._load_json_list(control_json)), 2)
+
+    def test_large_missing_ratio_preserves_final_letter(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            old_rows = []
+            for index in range(20):
+                row = make_row("A")
+                row["url_fiche"] = f"https://www.nautiljon.com/mangas/old-a-{index}.html"
+                row["titre"] = f"A Old {index}"
+                old_rows.append(scraper._normalize_row(row))
+            scraper.save_letter_files("A", old_rows, partial=False)
+            final_json = scraper._letter_paths("A")[0]
+            pages = {0: [old_rows[0]], 1: [], 2: [], 3: []}
+
+            def fake_fetch(this, letter, page_num):
+                return f"https://example.test/a?page={page_num}", pages[page_num]
+
+            scraper.fetch_listing_page = types.MethodType(fake_fetch, scraper)
+            scraper.scrape_letter_diff(
+                "a",
+                drop_missing=True,
+                max_missing_ratio=0.15,
+                resume=False,
+            )
+
+            self.assertEqual(len(scraper._load_json_list(final_json)), 20)
+            self.assertTrue(scraper.session_stats["diff_by_letter"]["A"]["coverage_failed"])
+            self.assertTrue(os.path.exists(scraper._letter_checkpoint_path("A")))
+
+    def test_full_flaresolverr_page_without_next_link_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            rows = []
+            for index in range(50):
+                row = make_row("A")
+                row["url_fiche"] = f"https://www.nautiljon.com/mangas/a-{index}.html"
+                row["titre"] = f"A {index:02d}"
+                rows.append(scraper._normalize_row(row))
+            scraper.save_letter_files("A", rows, partial=False)
+            scraper.fetch_listing_page = types.MethodType(
+                lambda this, letter, page_num: ("https://example.test/a", rows),
+                scraper,
+            )
+
+            scraper.scrape_letter_diff("a", drop_missing=True, resume=False)
+
+            stats = scraper.session_stats["diff_by_letter"]["A"]
+            self.assertTrue(stats["listing_failed"])
+            self.assertEqual(len(scraper._load_json_list(scraper._letter_paths("A")[0])), 50)
+
     def test_diagnose_does_not_create_output_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = os.path.join(temp_dir, "must-not-exist")
@@ -292,7 +401,7 @@ class DiffStateTests(unittest.TestCase):
 
         scraper._flaresolverr_post = types.MethodType(fake_post, scraper)
         env = {
-            "NAUTILJON_FLARESOLVERR_PROXY_URL": "http://gluetun-nord-wg:8888",
+            "NAUTILJON_FLARESOLVERR_PROXY_URL": "http://gluetun-nord:8888",
             "NAUTILJON_FLARESOLVERR_PROXY_USERNAME": "nautiljon",
             "NAUTILJON_FLARESOLVERR_PROXY_PASSWORD": "secret",
         }
@@ -300,7 +409,7 @@ class DiffStateTests(unittest.TestCase):
             scraper.setup_flaresolverr()
 
         self.assertEqual(calls[0]["proxy"], {
-            "url": "http://gluetun-nord-wg:8888",
+            "url": "http://gluetun-nord:8888",
             "username": "nautiljon",
             "password": "secret",
         })
@@ -356,6 +465,42 @@ class DiffStateTests(unittest.TestCase):
         self.assertEqual(calls.count("https://www.nautiljon.com/mangas/"), 1)
         self.assertIn("q=a&st=token", calls[1])
         self.assertIn("q=b&st=token", calls[2])
+
+    def test_flaresolverr_listing_follows_exact_next_token(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+        labels = ["#"] + [chr(code) for code in range(ord("A"), ord("Z") + 1)]
+        root_html = "".join(
+            f'<a href="/mangas/?q={label.lower()}&st=token-1">{label}</a>'
+            for label in labels
+        )
+        first_page = """
+        <table><tr><td><a href="/mangas/alpha.html">Alpha</a></td></tr></table>
+        <a href="/mangas/?q=a&amp;st=token-2&amp;dbt=50">Suivante</a>
+        """
+        second_page = """
+        <table><tr><td><a href="/mangas/aster.html">Aster</a></td></tr></table>
+        """
+        calls = []
+
+        def fake_fetch(this, url):
+            calls.append(url)
+            this._last_flaresolverr_url = url
+            if url.endswith("/mangas/"):
+                return root_html
+            if "st=token-2" in url:
+                return second_page
+            return first_page
+
+        scraper._fetch_html_flaresolverr = types.MethodType(fake_fetch, scraper)
+
+        _, first_rows = scraper.fetch_listing_page("a", 0)
+        _, second_rows = scraper.fetch_listing_page("a", 1)
+
+        self.assertEqual(first_rows[0]["titre"], "Alpha")
+        self.assertEqual(second_rows[0]["titre"], "Aster")
+        self.assertIn("st=token-2", calls[-1])
+        self.assertTrue(scraper._flaresolverr_listing_has_next("a", 0))
+        self.assertFalse(scraper._flaresolverr_listing_has_next("a", 1))
 
     def test_diff_rejects_flaresolverr_ip_mismatch(self):
         with tempfile.TemporaryDirectory() as out_dir:
