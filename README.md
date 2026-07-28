@@ -39,10 +39,11 @@ output/
 `-- state/         dernier run et dernier succes complet
 ```
 
-Le stack lance son propre `flaresolverr-nautiljon`. Il partage directement le
-namespace reseau de Gluetun avec le scraper et reste distinct du FlareSolverr du
-stack de recherche. Une seule session est reutilisee pendant toute une execution
-puis fermee proprement.
+Le scraper reutilise le conteneur `flaresolverr` du stack de recherche. Gluetun
+et FlareSolverr sont joignables sur le reseau Docker externe `media_net`. La
+session reservee a Nautiljon utilise le proxy HTTP de Gluetun, sans modifier le
+comportement des autres clients de FlareSolverr. Elle est reutilisee pendant
+toute une execution puis fermee proprement.
 
 Le fichier `state/last_diff_success.json` n'est ecrit qu'apres un passage sans
 erreur sur les 27 lettres et apres validation des exports. Un essai limite ou
@@ -56,7 +57,10 @@ NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
 NAUTILJON_HOST_BROWSER_PROFILE=/media/nvme0n1p1/AppData/NautiljonScraper/browser-profile
 NAUTILJON_COMMAND=flaresolverr-test
 NAUTILJON_BACKEND=flaresolverr
-NAUTILJON_FLARESOLVERR_URL=http://127.0.0.1:8191/v1
+NAUTILJON_FLARESOLVERR_URL=http://flaresolverr:8191/v1
+NAUTILJON_FLARESOLVERR_PROXY_URL=http://gluetun-nord-wg:8888
+NAUTILJON_FLARESOLVERR_PROXY_USERNAME=
+NAUTILJON_FLARESOLVERR_PROXY_PASSWORD=
 NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
 NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS=30
 NAUTILJON_FLARESOLVERR_STARTUP_DELAY=2
@@ -71,10 +75,6 @@ NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=1g
 NAUTILJON_MEMSWAP_LIMIT=1g
 NAUTILJON_SHM_SIZE=512m
-NAUTILJON_FLARESOLVERR_CPUS=1.0
-NAUTILJON_FLARESOLVERR_MEM_LIMIT=1g
-NAUTILJON_FLARESOLVERR_MEMSWAP_LIMIT=1g
-NAUTILJON_FLARESOLVERR_SHM_SIZE=512m
 ```
 
 ## Garanties

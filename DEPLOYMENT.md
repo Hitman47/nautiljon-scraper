@@ -4,10 +4,36 @@ Le conteneur execute une commande puis s'arrete. Les listings et les fiches sont
 charges dans une session FlareSolverr unique, sans fenetre ni intervention
 manuelle sur le NAS.
 
-Le compose cree un second conteneur nomme `flaresolverr-nautiljon`. Il est dedie
-a ce scraper et n'affecte pas le conteneur `flaresolverr` deja utilise par
-Prowlarr dans `search-stack`. Les deux nouveaux conteneurs partagent directement
-le namespace reseau de `GlueTun-Nord_WG`.
+Le scraper reutilise le conteneur `flaresolverr` existant dans `search-stack`.
+Il ne lance aucune seconde instance. Sa session FlareSolverr recoit un proxy
+dedie vers Gluetun, sans changer les sessions de Prowlarr ou des autres clients.
+
+## 1. Relier Gluetun a media_net
+
+Dans le stack qui definit `GlueTun-Nord_WG`, ajoutez au service Gluetun :
+
+```yaml
+services:
+  gluetun:
+    environment:
+      - HTTPPROXY=on
+      - HTTPPROXY_STEALTH=on
+    networks:
+      media_net:
+        aliases:
+          - gluetun-nord-wg
+
+networks:
+  media_net:
+    external: true
+```
+
+Conservez toutes les autres variables, volumes, ports et options deja presents
+dans ce stack. Le port `8888` n'a pas besoin d'etre publie sur le LAN :
+FlareSolverr atteint le proxy directement par `media_net`.
+
+Le stack `search-stack` fourni n'a besoin d'aucune modification : son service
+`flaresolverr` est deja attache a `media_net`.
 
 ## Variables communes
 
@@ -16,19 +42,23 @@ NAUTILJON_IMAGE=ghcr.io/hitman47/nautiljon-scraper:test
 GLUETUN_CONTAINER=GlueTun-Nord_WG
 NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
 NAUTILJON_BACKEND=flaresolverr
-NAUTILJON_FLARESOLVERR_URL=http://127.0.0.1:8191/v1
+NAUTILJON_FLARESOLVERR_URL=http://flaresolverr:8191/v1
+NAUTILJON_FLARESOLVERR_PROXY_URL=http://gluetun-nord-wg:8888
+NAUTILJON_FLARESOLVERR_PROXY_USERNAME=
+NAUTILJON_FLARESOLVERR_PROXY_PASSWORD=
 NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
 NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS=30
 NAUTILJON_FLARESOLVERR_STARTUP_DELAY=2
 NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=1g
 NAUTILJON_MEMSWAP_LIMIT=1g
-NAUTILJON_FLARESOLVERR_CPUS=1.0
-NAUTILJON_FLARESOLVERR_MEM_LIMIT=1g
-NAUTILJON_FLARESOLVERR_MEMSWAP_LIMIT=1g
 ```
 
-## 1. Test FlareSolverr
+Si le proxy Gluetun est protege par `HTTPPROXY_USER` et
+`HTTPPROXY_PASSWORD`, recopiez les memes valeurs dans les deux variables
+`NAUTILJON_FLARESOLVERR_PROXY_*` correspondantes.
+
+## 2. Test FlareSolverr
 
 ```text
 NAUTILJON_COMMAND=flaresolverr-test
@@ -48,25 +78,25 @@ Le seul resultat autorisant la suite est :
 VERDICT FLARESOLVERR: PRET POUR DIFF CONTROLE
 ```
 
-Le compose fournit deja la topologie attendue pour les deux services :
+Le scraper partage le namespace reseau de Gluetun :
 
 ```yaml
 network_mode: "container:GlueTun-Nord_WG"
 ```
 
-Ils communiquent donc par l'adresse locale commune :
+Ce namespace est rattache a `media_net`, ce qui rend l'API existante accessible
+par son nom Docker :
 
 ```text
-NAUTILJON_FLARESOLVERR_URL=http://127.0.0.1:8191/v1
+NAUTILJON_FLARESOLVERR_URL=http://flaresolverr:8191/v1
 ```
 
-Ne remplacez pas cette adresse par l'IP LAN du NAS. Le pare-feu de Gluetun peut
-bloquer ce retour vers le LAN, ce qui produit un timeout. Aucun port ne doit etre
-publie pour `flaresolverr-nautiljon` : seul le scraper y accede sur
-`127.0.0.1:8191`. La boucle de demarrage attend jusqu'a 60 secondes par defaut
-que son API soit prete.
+La session Chromium creee dans FlareSolverr utilise quant a elle
+`http://gluetun-nord-wg:8888`. Son trafic Nautiljon ressort donc par le VPN. Le
+test refuse le diff si son IP publique differe de celle du scraper derriere
+Gluetun.
 
-## 2. Diff controle sur A
+## 3. Diff controle sur A
 
 Cette etape n'est autorisee qu'apres un `flaresolverr-test` reussi :
 
@@ -81,7 +111,7 @@ NAUTILJON_RESUME=true
 Un sous-ensemble termine avec l'etat `PARTIAL` et ne produit jamais de marqueur
 mensuel complet.
 
-## 3. Diff mensuel complet
+## 4. Diff mensuel complet
 
 Retirez `NAUTILJON_LETTERS` ou laissez cette variable vide :
 

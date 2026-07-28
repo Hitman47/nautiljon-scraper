@@ -282,6 +282,29 @@ class DiffStateTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual(sleep.call_count, 2)
 
+    def test_flaresolverr_session_uses_configured_vpn_proxy(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+        calls = []
+
+        def fake_post(this, payload):
+            calls.append(payload)
+            return {"status": "ok"}
+
+        scraper._flaresolverr_post = types.MethodType(fake_post, scraper)
+        env = {
+            "NAUTILJON_FLARESOLVERR_PROXY_URL": "http://gluetun-nord-wg:8888",
+            "NAUTILJON_FLARESOLVERR_PROXY_USERNAME": "nautiljon",
+            "NAUTILJON_FLARESOLVERR_PROXY_PASSWORD": "secret",
+        }
+        with mock.patch.dict(os.environ, env):
+            scraper.setup_flaresolverr()
+
+        self.assertEqual(calls[0]["proxy"], {
+            "url": "http://gluetun-nord-wg:8888",
+            "username": "nautiljon",
+            "password": "secret",
+        })
+
     def test_flaresolverr_rejects_unsolved_challenge(self):
         scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
 

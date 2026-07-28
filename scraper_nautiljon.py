@@ -960,10 +960,24 @@ class NautiljonScraper:
             self.close_flaresolverr()
 
     def _flaresolverr_api_url(self) -> str:
-        url = os.environ.get("NAUTILJON_FLARESOLVERR_URL", "http://127.0.0.1:8191/v1").strip().rstrip("/")
+        url = os.environ.get("NAUTILJON_FLARESOLVERR_URL", "http://flaresolverr:8191/v1").strip().rstrip("/")
         if not url:
             raise RuntimeError("NAUTILJON_FLARESOLVERR_URL est vide")
         return url if url.endswith("/v1") else url + "/v1"
+
+    @staticmethod
+    def _flaresolverr_proxy() -> Optional[Dict[str, str]]:
+        url = os.environ.get("NAUTILJON_FLARESOLVERR_PROXY_URL", "").strip()
+        if not url:
+            return None
+        proxy = {"url": url}
+        username = os.environ.get("NAUTILJON_FLARESOLVERR_PROXY_USERNAME", "").strip()
+        password = os.environ.get("NAUTILJON_FLARESOLVERR_PROXY_PASSWORD", "").strip()
+        if username:
+            proxy["username"] = username
+        if password:
+            proxy["password"] = password
+        return proxy
 
     def _flaresolverr_post(self, payload: Dict[str, object]) -> Dict[str, object]:
         timeout_ms = max(1000, _env_int("NAUTILJON_FLARESOLVERR_TIMEOUT_MS", 120000))
@@ -988,9 +1002,13 @@ class NautiljonScraper:
         session_id = f"nautiljon-{os.getpid()}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         attempts = max(1, _env_int("NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS", 30))
         retry_delay = max(0, _env_float("NAUTILJON_FLARESOLVERR_STARTUP_DELAY", 2.0))
+        payload: Dict[str, object] = {"cmd": "sessions.create", "session": session_id}
+        proxy = self._flaresolverr_proxy()
+        if proxy:
+            payload["proxy"] = proxy
         for attempt in range(1, attempts + 1):
             try:
-                self._flaresolverr_post({"cmd": "sessions.create", "session": session_id})
+                self._flaresolverr_post(payload)
                 break
             except RuntimeError as exc:
                 if attempt == attempts:
