@@ -482,6 +482,157 @@ class NautiljonScraper:
         print(f"  Controle sauvegarde sans modifier la lettre finale: {json_path} / {csv_path}")
         return {"json_path": json_path, "csv_path": csv_path}
 
+    def _letter_cache_paths(self, letter_tag: str) -> Tuple[str, str, str]:
+        cache_dir = os.path.join(self.out_dir, "letter-cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        base = os.path.join(cache_dir, f"nautiljon_lettre_{letter_tag}.validated")
+        marker_path = self._state_path(f"letter_{letter_tag}_success")
+        return base + ".json", base + ".csv", marker_path
+
+    def _save_letter_cache(
+        self,
+        letter_tag: str,
+        rows: List[Dict[str, str]],
+        counters: Dict[str, object],
+        source_mode: str,
+        completed_at: Optional[str] = None,
+    ) -> Dict[str, object]:
+        json_path, csv_path, marker_path = self._letter_cache_paths(letter_tag)
+        normalized_rows = [self._normalize_row(row) for row in rows]
+        self._write_json_atomic(json_path, normalized_rows)
+        self._write_csv(csv_path, normalized_rows)
+        payload: Dict[str, object] = {
+            "status": "success",
+            "version": 1,
+            "letter": letter_tag,
+            "completed_at": completed_at or datetime.now().isoformat(timespec="seconds"),
+            "rows_count": len(normalized_rows),
+            "json_path": json_path,
+            "csv_path": csv_path,
+            "source_mode": source_mode,
+            "backend": self.backend,
+            "excluded_types": list(BANNED_TYPE_KEYWORDS),
+            "stats": dict(counters),
+        }
+        self._write_json_atomic(marker_path, payload)
+        print(f"  Cache valide {letter_tag}: {len(normalized_rows)} series ({marker_path})")
+        return payload
+
+    def _validate_letter_cache(
+        self,
+        letter_tag: str,
+        marker: Dict[str, object],
+        min_days: int,
+        max_missing_ratio: float,
+    ) -> Optional[Tuple[List[Dict[str, str]], timedelta]]:
+        if min_days <= 0 or marker.get("status") != "success" or marker.get("letter") != letter_tag:
+            return None
+        if marker.get("excluded_types") != list(BANNED_TYPE_KEYWORDS):
+            return None
+        try:
+            age = datetime.now() - datetime.fromisoformat(str(marker.get("completed_at", "")))
+        except ValueError:
+            return None
+        if age < timedelta(0) or age >= timedelta(days=min_days):
+            return None
+        stats = marker.get("stats")
+        if not isinstance(stats, dict):
+            return None
+        if any(stats.get(key) for key in ("listing_failed", "access_blocked", "coverage_failed", "detail_failed", "limited")):
+            return None
+        try:
+            missing_ratio = float(stats.get("missing_ratio", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if max_missing_ratio >= 0 and missing_ratio > max_missing_ratio:
+            return None
+        json_path = marker.get("json_path")
+        csv_path = marker.get("csv_path")
+        if not isinstance(json_path, str) or not isinstance(csv_path, str):
+            return None
+        if not os.path.isfile(csv_path) or os.path.getsize(csv_path) == 0:
+            return None
+        rows = [self._normalize_row(row) for row in self._load_json_list(json_path)]
+        if not rows or len(rows) != int(marker.get("rows_count", 0) or 0):
+            return None
+        urls = [_ensure_abs_url(row.get("url_fiche", "")) for row in rows]
+        if any(not url for url in urls) or len(set(urls)) != len(rows):
+            return None
+        if any(self._letter_tag_for_row(row) != letter_tag for row in rows):
+            return None
+        return rows, age
+
+    def _adopt_recent_control_cache(
+        self,
+        letter_tag: str,
+        min_days: int,
+        max_missing_ratio: float,
+    ) -> Optional[Dict[str, object]]:
+        report = self._load_json_dict(self._state_path("last_diff_run"))
+        if not report or report.get("status") != "partial" or report.get("reason") != "controlled_subset_complete":
+            return None
+        completed = report.get("completed_letters")
+        if not isinstance(completed, list) or letter_tag not in completed:
+            return None
+        completed_at = str(report.get("completed_at", ""))
+        try:
+            age = datetime.now() - datetime.fromisoformat(completed_at)
+        except ValueError:
+            return None
+        if min_days <= 0 or age < timedelta(0) or age >= timedelta(days=min_days):
+            return None
+        session_stats = report.get("session_stats")
+        diff_by_letter = session_stats.get("diff_by_letter") if isinstance(session_stats, dict) else None
+        counters = diff_by_letter.get(letter_tag) if isinstance(diff_by_letter, dict) else None
+        if not isinstance(counters, dict):
+            return None
+        if any(counters.get(key) for key in ("listing_failed", "access_blocked", "coverage_failed", "detail_failed", "limited")):
+            return None
+        try:
+            missing_ratio = float(counters.get("missing_ratio", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if max_missing_ratio >= 0 and missing_ratio > max_missing_ratio:
+            return None
+        if int(counters.get("missing_count", 0) or 0) != 0:
+            print(
+                f"  Controle recent {letter_tag} non adopte: il contient des fiches historiques "
+                "conservees mais non observees."
+            )
+            return None
+        base = os.path.join(self.out_dir, "control", f"nautiljon_lettre_{letter_tag}.control")
+        control_json = base + ".json"
+        control_csv = base + ".csv"
+        rows = [self._normalize_row(row) for row in self._load_json_list(control_json)]
+        if not rows or not os.path.isfile(control_csv) or os.path.getsize(control_csv) == 0:
+            return None
+        print(f"  Adoption du controle recent de la lettre {letter_tag} dans le cache valide.")
+        return self._save_letter_cache(
+            letter_tag,
+            rows,
+            counters,
+            source_mode="controlled_legacy",
+            completed_at=completed_at,
+        )
+
+    def _load_reusable_letter_cache(
+        self,
+        letter_tag: str,
+        min_days: int,
+        max_missing_ratio: float,
+    ) -> Optional[Tuple[List[Dict[str, str]], Dict[str, object], timedelta]]:
+        _, _, marker_path = self._letter_cache_paths(letter_tag)
+        marker = self._load_json_dict(marker_path)
+        if not marker:
+            marker = self._adopt_recent_control_cache(letter_tag, min_days, max_missing_ratio)
+        if not marker:
+            return None
+        validated = self._validate_letter_cache(letter_tag, marker, min_days, max_missing_ratio)
+        if not validated:
+            return None
+        rows, age = validated
+        return rows, marker, age
+
     def _remove_partial_files(self, letter_tag: str) -> None:
         _, _, partial_json, partial_csv = self._letter_paths(letter_tag)
         for path in (partial_json, partial_csv):
@@ -2240,12 +2391,14 @@ class NautiljonScraper:
                 print("  Execution limitee: fichier final inchange, checkpoint conserve.")
             return safe_rows
 
+        cache_rows = list(updated_rows)
         if not drop_missing:
             updated_rows.extend(existing_by_url.values())
         else:
             counters["removed"] = missing_count
 
         updated_rows = sorted(updated_rows, key=lambda row: _norm(row.get("titre", "")))
+        cache_rows = updated_rows if drop_missing else sorted(cache_rows, key=lambda row: _norm(row.get("titre", "")))
         if drop_missing:
             self.save_letter_files(tag, updated_rows, partial=False)
         else:
@@ -2262,6 +2415,17 @@ class NautiljonScraper:
         self.session_stats["series_by_letter"][label] = len(updated_rows)
         self.session_stats["total_series"] += len(updated_rows)
         self.session_stats["diff_by_letter"][label] = counters
+        try:
+            self._save_letter_cache(
+                tag,
+                cache_rows,
+                counters,
+                source_mode="final" if drop_missing else "controlled",
+            )
+            counters["cache_saved"] = True
+        except Exception as exc:
+            counters["cache_saved"] = False
+            print(f"  Avertissement: cache de la lettre {label} non sauvegarde ({str(exc)[:180]}).")
         suffix = "controle uniquement" if not drop_missing else "fichier final mis a jour"
         print(f"  Lettre {label}: {len(updated_rows)} series, {suffix} ({counters})")
         return updated_rows
@@ -2349,10 +2513,37 @@ class NautiljonScraper:
                 self.setup_browser()
             for index, letter in enumerate(letters_to_scrape, start=1):
                 label = self._letter_label(letter)
+                tag = self._letter_tag(letter)
                 if label in completed_letters:
                     print(f"\nProgression: {index}/{len(letters_to_scrape)} - lettre {label} deja finalisee, ignoree")
                     continue
                 print(f"\nProgression: {index}/{len(letters_to_scrape)}")
+                if full_catalog_requested and not force:
+                    cached = self._load_reusable_letter_cache(
+                        tag,
+                        min_days_between_diff_exports,
+                        max_missing_ratio,
+                    )
+                    if cached:
+                        cached_rows, marker, cache_age = cached
+                        self.save_letter_files(tag, cached_rows, partial=False)
+                        cached_stats = marker.get("stats")
+                        stats = dict(cached_stats) if isinstance(cached_stats, dict) else {}
+                        stats.update({
+                            "cache_reused": True,
+                            "cache_age_days": cache_age.total_seconds() / 86400,
+                            "cache_source_mode": marker.get("source_mode", "unknown"),
+                        })
+                        self.session_stats["series_by_letter"][label] = len(cached_rows)
+                        self.session_stats["total_series"] += len(cached_rows)
+                        self.session_stats["diff_by_letter"][label] = stats
+                        completed_letters.append(label)
+                        self._save_diff_run_checkpoint(config, completed_letters)
+                        print(
+                            f"  Lettre {label} reutilisee depuis son cache valide "
+                            f"({cache_age.total_seconds() / 86400:.1f} jour, {len(cached_rows)} series)."
+                        )
+                        continue
                 self.scrape_letter_diff(
                     letter,
                     max_pages=max_pages_per_letter,

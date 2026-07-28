@@ -35,6 +35,7 @@ output/
 |-- letters/       CSV et JSON finalises par lettre
 |-- checkpoints/   reprise de la page et de la lettre en cours
 |-- control/       resultats des tests sans remplacement des lettres finales
+|-- letter-cache/  lettres validees reutilisables pendant 30 jours
 |-- exports/       exports consolides finalises
 |-- discovery/     candidats RSS non exhaustifs
 `-- state/         dernier run et dernier succes complet
@@ -92,5 +93,6 @@ NAUTILJON_SHM_SIZE=512m
 - Le lien de pagination exact est suivi et conserve dans le checkpoint.
 - Une disparition superieure a 15 % de la base bloque la finalisation.
 - Un controle avec `NAUTILJON_DROP_MISSING=false` ecrit dans `output/control/`.
+- Un diff complet reutilise les lettres validees depuis moins de 30 jours si `FORCE=false`.
 - Le RSS reste separe du diff et ne peut pas valider un export mensuel.
 - Le conteneur est limite par le compose a 1 CPU et 1 Gio de RAM.

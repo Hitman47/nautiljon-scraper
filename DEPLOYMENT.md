@@ -107,7 +107,8 @@ NAUTILJON_RESUME=true
 
 Un sous-ensemble termine avec l'etat `PARTIAL` et ne produit jamais de marqueur
 mensuel complet. Son resultat est ecrit dans `output/control/`; les fichiers
-finaux de `output/letters/` restent inchanges.
+finaux de `output/letters/` restent inchanges. La lettre validee est aussi copiee
+dans `output/letter-cache/` avec un marqueur date.
 
 ## 4. Diff mensuel complet
 
@@ -135,6 +136,11 @@ ce lien dans le checkpoint. Si plus de 15 % des fiches historiques d'une lettre
 disparaissent du listing, la lettre n'est pas remplacee et le diff s'arrete.
 Une page indiquant que l'IP est interdite pour abus provoque egalement un arret
 immediat, sans trois nouvelles tentatives, avec conservation du checkpoint.
+
+Avec `NAUTILJON_FORCE_SCRAPE=false`, une lettre validee depuis moins de
+`NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS` jours est reutilisee sans requete et
+promue dans `output/letters/`. Une lettre expiree ou dont le cache est invalide
+est automatiquement rescrapee. `NAUTILJON_FORCE_SCRAPE=true` ignore ce cache.
 
 ## Import initial
 

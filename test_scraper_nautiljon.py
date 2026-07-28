@@ -3,6 +3,7 @@ import os
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta
 from unittest import mock
 
 from scraper_nautiljon import NautiljonAccessBlockedError, NautiljonScraper
@@ -161,6 +162,103 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(result.completed_letters, ["A", "B"])
             self.assertEqual(result.status, "partial")
 
+    def test_full_diff_adopts_recent_controlled_letter_without_scraping_it(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            scraper.get_all_letters = types.MethodType(lambda this: ["a", "b"], scraper)
+            self.seed_letter(scraper, "a")
+            self.seed_letter(scraper, "b")
+            controlled_rows = [make_row("A")]
+            controlled_rows[0]["titre"] = "A Test"
+            extra = make_row("A")
+            extra["url_fiche"] = "https://www.nautiljon.com/mangas/another-a.html"
+            extra["titre"] = "Another A"
+            controlled_rows.append(extra)
+            scraper.save_controlled_letter_files("A", controlled_rows)
+            scraper._write_json_atomic(scraper._state_path("last_diff_run"), {
+                "mode": "diff",
+                "status": "partial",
+                "reason": "controlled_subset_complete",
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "completed_letters": ["A"],
+                "session_stats": {
+                    "diff_by_letter": {
+                        "A": {
+                            "listing_failed": False,
+                            "access_blocked": False,
+                            "coverage_failed": False,
+                            "detail_failed": False,
+                            "limited": False,
+                            "missing_count": 0,
+                            "missing_ratio": 0.0,
+                        }
+                    }
+                },
+            })
+            calls = []
+            self.install_fake_letter_scrape(scraper, {}, calls=calls)
+
+            result = scraper.scrape_all_letters_diff(
+                min_days_between_diff_exports=30,
+                force=False,
+            )
+
+            self.assertEqual(result.status, "success")
+            self.assertEqual(calls, ["B"])
+            self.assertEqual(len(scraper._load_json_list(scraper._letter_paths("A")[0])), 2)
+            self.assertTrue(scraper.session_stats["diff_by_letter"]["A"]["cache_reused"])
+
+            forced = self.make_scraper(out_dir)
+            forced.get_all_letters = types.MethodType(lambda this: ["a", "b"], forced)
+            forced_calls = []
+            self.install_fake_letter_scrape(forced, {}, calls=forced_calls)
+
+            forced_result = forced.scrape_all_letters_diff(
+                min_days_between_diff_exports=30,
+                force=True,
+            )
+
+            self.assertEqual(forced_result.status, "success")
+            self.assertEqual(forced_calls, ["A", "B"])
+
+    def test_expired_controlled_letter_is_scraped_again(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            scraper.get_all_letters = types.MethodType(lambda this: ["a", "b"], scraper)
+            self.seed_letter(scraper, "a")
+            self.seed_letter(scraper, "b")
+            scraper.save_controlled_letter_files("A", [make_row("A")])
+            scraper._write_json_atomic(scraper._state_path("last_diff_run"), {
+                "mode": "diff",
+                "status": "partial",
+                "reason": "controlled_subset_complete",
+                "completed_at": (datetime.now() - timedelta(days=31)).isoformat(timespec="seconds"),
+                "completed_letters": ["A"],
+                "session_stats": {
+                    "diff_by_letter": {
+                        "A": {
+                            "listing_failed": False,
+                            "access_blocked": False,
+                            "coverage_failed": False,
+                            "detail_failed": False,
+                            "limited": False,
+                            "missing_count": 0,
+                            "missing_ratio": 0.0,
+                        }
+                    }
+                },
+            })
+            calls = []
+            self.install_fake_letter_scrape(scraper, {}, calls=calls)
+
+            result = scraper.scrape_all_letters_diff(
+                min_days_between_diff_exports=30,
+                force=False,
+            )
+
+            self.assertEqual(result.status, "success")
+            self.assertEqual(calls, ["A", "B"])
+
     def test_letter_resume_retries_exact_failed_page(self):
         with tempfile.TemporaryDirectory() as out_dir:
             first = self.make_scraper(out_dir)
@@ -252,6 +350,10 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             control_json = os.path.join(out_dir, "control", "nautiljon_lettre_A.control.json")
             self.assertEqual(len(scraper._load_json_list(control_json)), 2)
+            marker = scraper._load_json_dict(scraper._state_path("letter_A_success"))
+            self.assertEqual(marker["status"], "success")
+            self.assertEqual(marker["source_mode"], "controlled")
+            self.assertEqual(marker["rows_count"], 1)
 
     def test_large_missing_ratio_preserves_final_letter(self):
         with tempfile.TemporaryDirectory() as out_dir:
