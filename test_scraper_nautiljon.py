@@ -232,6 +232,104 @@ class DiffStateTests(unittest.TestCase):
         self.assertTrue(scraper._cloudflare_challenge(html))
         self.assertTrue(scraper._blocked_by_waf(html))
 
+    def test_flaresolverr_fetch_reuses_one_session(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+        calls = []
+
+        def fake_post(this, payload):
+            calls.append(payload)
+            if payload["cmd"] == "request.get":
+                return {
+                    "status": "ok",
+                    "solution": {
+                        "status": 200,
+                        "url": payload["url"],
+                        "response": "<html><body>OK</body></html>",
+                    },
+                }
+            return {"status": "ok"}
+
+        scraper._flaresolverr_post = types.MethodType(fake_post, scraper)
+        first = scraper._fetch_html_flaresolverr("https://www.nautiljon.com/mangas/a.html")
+        second = scraper._fetch_html_flaresolverr("https://www.nautiljon.com/mangas/b.html")
+        scraper.close_flaresolverr()
+
+        self.assertIn("OK", first)
+        self.assertIn("OK", second)
+        self.assertEqual([call["cmd"] for call in calls], ["sessions.create", "request.get", "request.get", "sessions.destroy"])
+        self.assertEqual(calls[1]["session"], calls[2]["session"])
+        self.assertIn("cookies", calls[1])
+
+    def test_flaresolverr_rejects_unsolved_challenge(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+
+        def fake_post(this, payload):
+            if payload["cmd"] == "request.get":
+                return {
+                    "status": "ok",
+                    "solution": {
+                        "status": 200,
+                        "url": payload["url"],
+                        "response": "<title>Un instant…</title><h1>Vérification de sécurité en cours</h1>",
+                    },
+                }
+            return {"status": "ok"}
+
+        scraper._flaresolverr_post = types.MethodType(fake_post, scraper)
+        with self.assertRaisesRegex(RuntimeError, "n'a pas resolu Cloudflare"):
+            scraper._fetch_html_flaresolverr("https://www.nautiljon.com/mangas/a.html")
+        scraper.close_flaresolverr()
+
+    def test_flaresolverr_listing_uses_dynamic_letter_links(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+        labels = ["#"] + [chr(code) for code in range(ord("A"), ord("Z") + 1)]
+        root_html = "".join(
+            f'<a href="/mangas/?q={label.lower()}&st=token">{label}</a>'
+            for label in labels
+        )
+        calls = []
+
+        def fake_fetch(this, url):
+            calls.append(url)
+            this._last_flaresolverr_url = url
+            return root_html if url.endswith("/mangas/") else "<html>listing</html>"
+
+        def fake_parse(this, html):
+            query = calls[-1].split("q=", 1)[1].split("&", 1)[0]
+            row = make_row(query.upper())
+            row["titre"] = f"{query.upper()} Test"
+            return [row]
+
+        scraper._fetch_html_flaresolverr = types.MethodType(fake_fetch, scraper)
+        scraper.extract_series_list_from_html = types.MethodType(fake_parse, scraper)
+
+        _, a_rows = scraper.fetch_listing_page("a", 0)
+        _, b_rows = scraper.fetch_listing_page("b", 0)
+
+        self.assertEqual(a_rows[0]["titre"], "A Test")
+        self.assertEqual(b_rows[0]["titre"], "B Test")
+        self.assertEqual(calls.count("https://www.nautiljon.com/mangas/"), 1)
+        self.assertIn("q=a&st=token", calls[1])
+        self.assertIn("q=b&st=token", calls[2])
+
+    def test_diff_rejects_flaresolverr_ip_mismatch(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            scraper._flaresolverr_public_ips = types.MethodType(
+                lambda this: ("198.51.100.10", "203.0.113.20"),
+                scraper,
+            )
+
+            result = scraper.scrape_all_letters_diff(
+                letters=["a"],
+                min_days_between_diff_exports=0,
+                force=True,
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.reason, "flaresolverr_preflight_failed")
+            self.assertFalse(os.path.exists(scraper._last_success_path("diff")))
+
     def test_browser_test_checks_listing_and_detail_without_export(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             out_dir = os.path.join(temp_dir, "output")

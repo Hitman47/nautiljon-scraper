@@ -1,9 +1,9 @@
 # Nautiljon Scraper
 
-Scraper Selenium des fiches manga Nautiljon. Il reprend le parcours du script PC :
-Chromium ouvre l'index manga, accepte les cookies, clique sur une lettre puis
-parcourt les pages. Il importe aussi les CSV existants et produit un diff mensuel
-avec reprise apres interruption.
+Scraper des fiches manga Nautiljon utilisant FlareSolverr pour franchir la
+verification Cloudflare sans intervention manuelle. Selenium reste disponible
+comme outil de diagnostic. Le scraper importe les CSV existants et produit un
+diff mensuel avec reprise apres interruption.
 
 ## Commandes
 
@@ -12,6 +12,7 @@ python scraper_nautiljon.py selftest
 python scraper_nautiljon.py import-csv
 python scraper_nautiljon.py browser-smoke
 python scraper_nautiljon.py browser-test
+python scraper_nautiljon.py flaresolverr-test
 python scraper_nautiljon.py diagnose
 python scraper_nautiljon.py diff
 python scraper_nautiljon.py discover-rss
@@ -38,8 +39,8 @@ output/
 `-- state/         dernier run et dernier succes complet
 ```
 
-Le profil Chromium persistant est monte separement dans `/data/browser-profile`.
-Il conserve le consentement cookies et la session entre deux executions.
+Une seule session FlareSolverr est reutilisee pendant toute une execution puis
+fermee proprement.
 
 Le fichier `state/last_diff_success.json` n'est ecrit qu'apres un passage sans
 erreur sur les 27 lettres et apres validation des exports. Un essai limite ou
@@ -51,11 +52,10 @@ interrompu ecrit `state/last_diff_run.json` avec l'etat `PARTIAL` ou `FAILED`.
 GLUETUN_CONTAINER=GlueTun-Nord_WG
 NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
 NAUTILJON_HOST_BROWSER_PROFILE=/media/nvme0n1p1/AppData/NautiljonScraper/browser-profile
-NAUTILJON_COMMAND=browser-test
-NAUTILJON_BACKEND=selenium
-NAUTILJON_BROWSER_HEADLESS=false
-NAUTILJON_BROWSER_ATTACH=true
-NAUTILJON_CLOUDFLARE_WAIT_SECONDS=120
+NAUTILJON_COMMAND=flaresolverr-test
+NAUTILJON_BACKEND=flaresolverr
+NAUTILJON_FLARESOLVERR_URL=http://192.168.1.30:8191/v1
+NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
 NAUTILJON_DELAY_MIN=2.0
 NAUTILJON_DELAY_MAX=5.0
 NAUTILJON_RESUME=true
@@ -71,9 +71,9 @@ NAUTILJON_SHM_SIZE=512m
 
 ## Garanties
 
-- `browser-test` ne remplace aucun export et teste un listing puis une fiche.
-- Chromium fonctionne en mode graphique dans Xvfb, sans intervention manuelle.
-- Le consentement cookies est clique automatiquement et le profil est persistant.
+- `flaresolverr-test` compare les IP puis teste un listing et une fiche sans exporter.
+- Un diff est refuse si FlareSolverr et Gluetun n'utilisent pas la meme IP publique.
+- Selenium reste disponible avec `browser-test` pour le diagnostic.
 - Les CSV utilisent `;` et `utf-8-sig`.
 - Seuls `yaoi` et `yuri` sont exclus.
 - Les ecritures finales utilisent des fichiers temporaires puis un remplacement.

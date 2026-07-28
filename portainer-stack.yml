@@ -3,16 +3,18 @@ services:
     image: "${NAUTILJON_IMAGE:-ghcr.io/hitman47/nautiljon-scraper:latest}"
     container_name: nautiljon-scraper
     network_mode: "container:${GLUETUN_CONTAINER:-GlueTun-Nord_WG}"
-    command: ["${NAUTILJON_COMMAND:-browser-test}"]
+    command: ["${NAUTILJON_COMMAND:-flaresolverr-test}"]
     environment:
       NAUTILJON_OUT_DIR: /data/output
-      NAUTILJON_BACKEND: "${NAUTILJON_BACKEND:-selenium}"
+      NAUTILJON_BACKEND: "${NAUTILJON_BACKEND:-flaresolverr}"
       NAUTILJON_BROWSER_HEADLESS: "${NAUTILJON_BROWSER_HEADLESS:-false}"
-      NAUTILJON_BROWSER_ATTACH: "${NAUTILJON_BROWSER_ATTACH:-true}"
+      NAUTILJON_BROWSER_ATTACH: "${NAUTILJON_BROWSER_ATTACH:-false}"
       NAUTILJON_BROWSER_PROFILE: /data/browser-profile
       NAUTILJON_CHROME_BINARY: /usr/bin/chromium
       NAUTILJON_CHROMEDRIVER: /usr/bin/chromedriver
       NAUTILJON_CLOUDFLARE_WAIT_SECONDS: "${NAUTILJON_CLOUDFLARE_WAIT_SECONDS:-120}"
+      NAUTILJON_FLARESOLVERR_URL: "${NAUTILJON_FLARESOLVERR_URL:-http://192.168.1.30:8191/v1}"
+      NAUTILJON_FLARESOLVERR_TIMEOUT_MS: "${NAUTILJON_FLARESOLVERR_TIMEOUT_MS:-120000}"
       NAUTILJON_DELAY: "${NAUTILJON_DELAY:-2.0}"
       NAUTILJON_DELAY_MIN: "${NAUTILJON_DELAY_MIN:-2.0}"
       NAUTILJON_DELAY_MAX: "${NAUTILJON_DELAY_MAX:-5.0}"

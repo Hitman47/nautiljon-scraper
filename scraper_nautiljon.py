@@ -200,6 +200,9 @@ class NautiljonScraper:
         self.browser_process: Optional[subprocess.Popen] = None
         self._browser_log_handle = None
         self._browser_letter_urls: Dict[str, str] = {}
+        self.flaresolverr_session_id: Optional[str] = None
+        self._last_flaresolverr_url = ""
+        self._flaresolverr_letter_urls: Dict[str, str] = {}
         self.session = self._build_session()
         self.session_stats = {
             "total_series": 0,
@@ -807,7 +810,7 @@ class NautiljonScraper:
         os.makedirs(profile_dir, exist_ok=True)
 
         browser_binary = os.environ.get("NAUTILJON_CHROME_BINARY", "/usr/bin/chromium")
-        attach_browser = _env_bool("NAUTILJON_BROWSER_ATTACH", True)
+        attach_browser = _env_bool("NAUTILJON_BROWSER_ATTACH", False)
         options = webdriver.ChromeOptions()
 
         common_args = [
@@ -954,6 +957,82 @@ class NautiljonScraper:
             self.driver = None
             self._browser_letter_urls.clear()
             self._stop_browser_process()
+            self.close_flaresolverr()
+
+    def _flaresolverr_api_url(self) -> str:
+        url = os.environ.get("NAUTILJON_FLARESOLVERR_URL", "http://192.168.1.30:8191/v1").strip().rstrip("/")
+        if not url:
+            raise RuntimeError("NAUTILJON_FLARESOLVERR_URL est vide")
+        return url if url.endswith("/v1") else url + "/v1"
+
+    def _flaresolverr_post(self, payload: Dict[str, object]) -> Dict[str, object]:
+        timeout_ms = max(1000, _env_int("NAUTILJON_FLARESOLVERR_TIMEOUT_MS", 120000))
+        try:
+            response = requests.post(
+                self._flaresolverr_api_url(),
+                json=payload,
+                timeout=max(30, timeout_ms / 1000 + 15),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise RuntimeError(f"FlareSolverr inaccessible: {str(exc)[:300]}") from exc
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            message = data.get("message", "reponse API invalide") if isinstance(data, dict) else "reponse API invalide"
+            raise RuntimeError(f"FlareSolverr a refuse la requete: {message}")
+        return data
+
+    def setup_flaresolverr(self) -> str:
+        if self.flaresolverr_session_id:
+            return self.flaresolverr_session_id
+        session_id = f"nautiljon-{os.getpid()}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        self._flaresolverr_post({"cmd": "sessions.create", "session": session_id})
+        self.flaresolverr_session_id = session_id
+        print(f"Session FlareSolverr active: {session_id}")
+        return session_id
+
+    def close_flaresolverr(self) -> None:
+        session_id = self.flaresolverr_session_id
+        self.flaresolverr_session_id = None
+        self._flaresolverr_letter_urls.clear()
+        if not session_id:
+            return
+        try:
+            self._flaresolverr_post({"cmd": "sessions.destroy", "session": session_id})
+            print(f"Session FlareSolverr fermee: {session_id}")
+        except Exception as exc:
+            print(f"Avertissement: fermeture FlareSolverr impossible: {str(exc)[:180]}")
+
+    def _fetch_html_flaresolverr(self, url: str) -> str:
+        timeout_ms = max(1000, _env_int("NAUTILJON_FLARESOLVERR_TIMEOUT_MS", 120000))
+        target_url = _ensure_abs_url(url)
+        payload: Dict[str, object] = {
+            "cmd": "request.get",
+            "url": target_url,
+            "session": self.setup_flaresolverr(),
+            "maxTimeout": timeout_ms,
+        }
+        if (urlsplit(target_url).hostname or "").endswith("nautiljon.com"):
+            payload["cookies"] = [{
+                "name": "cookieconsent_status",
+                "value": "dismiss",
+                "domain": ".nautiljon.com",
+                "path": "/",
+            }]
+        data = self._flaresolverr_post(payload)
+        solution = data.get("solution")
+        if not isinstance(solution, dict):
+            raise RuntimeError("FlareSolverr: solution absente")
+        status_code = int(solution.get("status", 0) or 0)
+        html = solution.get("response", "")
+        self._last_flaresolverr_url = str(solution.get("url", url))
+        if status_code >= 400:
+            raise RuntimeError(f"FlareSolverr: HTTP {status_code} pour {url}")
+        if not isinstance(html, str) or not html:
+            raise RuntimeError(f"FlareSolverr: reponse vide pour {url}")
+        if self._blocked_by_waf(html):
+            raise RuntimeError(f"FlareSolverr n'a pas resolu Cloudflare pour {url}")
+        return html
 
     def _save_browser_debug(self, context: str) -> Dict[str, str]:
         if not self.driver:
@@ -1168,6 +1247,42 @@ class NautiljonScraper:
             )
         return driver.current_url, matching_rows
 
+    def _load_flaresolverr_letter_urls(self) -> None:
+        if self._flaresolverr_letter_urls:
+            return
+        html = self._fetch_html_flaresolverr(f"{BASE_URL}/mangas/")
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            label = _clean_spaces(anchor.get_text(" ", strip=True)).upper()
+            if label == "#" or re.fullmatch(r"[A-Z]", label):
+                href = str(anchor.get("href", ""))
+                if "/mangas/" in href and "q=" in href and "st=" in href:
+                    self._flaresolverr_letter_urls[label] = _ensure_abs_url(href)
+        missing = [self._letter_label(letter) for letter in self.get_all_letters() if self._letter_label(letter) not in self._flaresolverr_letter_urls]
+        if missing:
+            raise RuntimeError(f"FlareSolverr: liens alphabetiques introuvables: {', '.join(missing)}")
+        print(f"Index Nautiljon initialise via FlareSolverr: {len(self._flaresolverr_letter_urls)} lettres")
+
+    def _fetch_listing_page_flaresolverr(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
+        self._load_flaresolverr_letter_urls()
+        label = self._letter_label(letter)
+        page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
+        html = self._fetch_html_flaresolverr(page_url)
+        if self._search_session_expired(html):
+            self._flaresolverr_letter_urls.clear()
+            self._load_flaresolverr_letter_urls()
+            page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
+            html = self._fetch_html_flaresolverr(page_url)
+        rows = self.extract_series_list_from_html(html)
+        expected_tag = self._letter_tag(letter)
+        matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
+        if rows and len(matching_rows) < max(1, int(len(rows) * 0.8)):
+            raise RuntimeError(
+                f"Listing FlareSolverr incoherent pour {label}: "
+                f"{len(matching_rows)}/{len(rows)} titres correspondent"
+            )
+        return self._last_flaresolverr_url or page_url, matching_rows
+
     def browser_test(self, letter: str = "a") -> Dict[str, object]:
         print("=" * 60)
         print("TEST SELENIUM NAUTILJON - AUCUN EXPORT MODIFIE")
@@ -1210,9 +1325,63 @@ class NautiljonScraper:
         finally:
             self.close_browser()
 
+    def _flaresolverr_public_ips(self) -> Tuple[str, str]:
+        direct_response = requests.get("http://api.ipify.org?format=json", timeout=15)
+        direct_response.raise_for_status()
+        direct_ip = str(ipaddress.ip_address(direct_response.json().get("ip", "")))
+        flaresolverr_ip_html = self._fetch_html_flaresolverr("http://api.ipify.org?format=json")
+        ip_match = re.search(r'"ip"\s*:\s*"([^"]+)"', flaresolverr_ip_html)
+        if not ip_match:
+            raise RuntimeError("IP de sortie FlareSolverr introuvable dans la reponse ipify")
+        return direct_ip, str(ipaddress.ip_address(ip_match.group(1)))
+
+    def flaresolverr_test(self, letter: str = "a") -> Dict[str, object]:
+        print("=" * 60)
+        print("TEST FLARESOLVERR NAUTILJON - AUCUN EXPORT MODIFIE")
+        print("=" * 60)
+        report: Dict[str, object] = {
+            "letter": self._letter_label(letter),
+            "api_ok": False,
+            "same_public_ip": False,
+            "listing_ok": False,
+            "detail_ok": False,
+        }
+        try:
+            direct_ip, flaresolverr_ip = self._flaresolverr_public_ips()
+            report["api_ok"] = True
+            report["gluetun_public_ip"] = direct_ip
+            report["flaresolverr_public_ip"] = flaresolverr_ip
+            report["same_public_ip"] = direct_ip == flaresolverr_ip
+
+            _, rows = self.fetch_listing_page(letter, 0)
+            report["listing_rows"] = len(rows)
+            report["listing_ok"] = len(rows) > 0
+            if rows:
+                html = self.fetch_html(rows[0]["url_fiche"])
+                detail = self.extract_series_detail_from_html(html)
+                useful = [value for key, value in detail.items() if key != "_titre_fr_fallback" and not _is_na(value)]
+                report["detail_fields"] = len(useful)
+                report["detail_ok"] = len(useful) > 0
+                report["sample_title"] = rows[0].get("titre", "N/A")
+        except Exception as exc:
+            report["error"] = str(exc)
+        finally:
+            self.close_flaresolverr()
+        report["ready_for_diff"] = bool(
+            report["api_ok"]
+            and report["same_public_ip"]
+            and report["listing_ok"]
+            and report["detail_ok"]
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print("VERDICT FLARESOLVERR: " + ("PRET POUR DIFF CONTROLE" if report["ready_for_diff"] else "BLOQUE"))
+        return report
+
     def fetch_html(self, url: str) -> str:
         if self.backend == "selenium":
             return self._browser_get(url, "fiche_detail")
+        if self.backend == "flaresolverr":
+            return self._fetch_html_flaresolverr(url)
         response = self.session.get(_ensure_abs_url(url), timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         response.encoding = response.encoding or "utf-8"
@@ -1374,6 +1543,8 @@ class NautiljonScraper:
     def fetch_listing_page(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
         if self.backend == "selenium":
             return self._fetch_listing_page_selenium(letter, page_num)
+        if self.backend == "flaresolverr":
+            return self._fetch_listing_page_flaresolverr(letter, page_num)
         last_error = ""
         accessible_empty_url = ""
         for url in self._listing_candidate_urls(letter, page_num):
@@ -1970,6 +2141,23 @@ class NautiljonScraper:
             self.mark_run_state("diff", result)
             return result
 
+        if self.backend == "flaresolverr":
+            try:
+                gluetun_ip, flaresolverr_ip = self._flaresolverr_public_ips()
+                print(f"IP Gluetun: {gluetun_ip} | IP FlareSolverr: {flaresolverr_ip}")
+                if gluetun_ip != flaresolverr_ip:
+                    raise RuntimeError("les IP publiques de Gluetun et FlareSolverr sont differentes")
+            except Exception as exc:
+                self.close_flaresolverr()
+                result = RunResult(
+                    status="failed",
+                    reason="flaresolverr_preflight_failed",
+                    requested_letters=requested_labels,
+                )
+                print(f"Diff refuse: preflight FlareSolverr en echec ({str(exc)[:300]}).")
+                self.mark_run_state("diff", result)
+                return result
+
         self.session_stats["start_time"] = datetime.now()
         config = self._diff_run_config(
             letters_to_scrape,
@@ -2134,8 +2322,8 @@ def _new_scraper(args: argparse.Namespace) -> NautiljonScraper:
     if (delay_min is None) != (delay_max is None):
         raise ValueError("NAUTILJON_DELAY_MIN et NAUTILJON_DELAY_MAX doivent etre definis ensemble.")
     backend = os.environ.get("NAUTILJON_BACKEND", "selenium").strip().lower()
-    if backend not in {"selenium", "http"}:
-        raise ValueError("NAUTILJON_BACKEND doit valoir selenium ou http.")
+    if backend not in {"selenium", "flaresolverr", "http"}:
+        raise ValueError("NAUTILJON_BACKEND doit valoir selenium, flaresolverr ou http.")
     return NautiljonScraper(
         out_dir=out_dir,
         delay=delay,
@@ -2188,6 +2376,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     browser_test = sub.add_parser("browser-test", help="Teste un listing et une fiche via Selenium sans exporter.")
     browser_test.add_argument("--letter", default=os.environ.get("NAUTILJON_DIAGNOSE_LETTER", "a"))
+
+    flaresolverr_test = sub.add_parser(
+        "flaresolverr-test",
+        help="Teste IP, listing et fiche via FlareSolverr sans exporter.",
+    )
+    flaresolverr_test.add_argument("--letter", default=os.environ.get("NAUTILJON_DIAGNOSE_LETTER", "a"))
 
     sub.add_parser("browser-smoke", help="Verifie uniquement le demarrage de Chromium et ChromeDriver.")
 
@@ -2284,6 +2478,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise SystemExit(0 if report["ready_for_diff"] else 1)
     elif command == "browser-test":
         report = scraper.browser_test(letter="%23" if args.letter == "#" else args.letter.lower())
+        raise SystemExit(0 if report["ready_for_diff"] else 1)
+    elif command == "flaresolverr-test":
+        report = scraper.flaresolverr_test(letter="%23" if args.letter == "#" else args.letter.lower())
         raise SystemExit(0 if report["ready_for_diff"] else 1)
     elif command == "browser-smoke":
         raise SystemExit(0 if scraper.browser_smoke() else 1)

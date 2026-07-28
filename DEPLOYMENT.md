@@ -1,8 +1,8 @@
-# Protocole Portainer Selenium
+# Protocole Portainer FlareSolverr
 
-Le conteneur execute une commande puis s'arrete. Il partage le reseau du Gluetun
-existant et utilise Chromium dans un ecran virtuel Xvfb. Aucune fenetre ni action
-manuelle n'est necessaire sur le NAS.
+Le conteneur execute une commande puis s'arrete. Les listings et les fiches sont
+charges dans une session FlareSolverr unique, sans fenetre ni intervention
+manuelle sur le NAS.
 
 ## Variables communes
 
@@ -10,58 +10,54 @@ manuelle n'est necessaire sur le NAS.
 NAUTILJON_IMAGE=ghcr.io/hitman47/nautiljon-scraper:test
 GLUETUN_CONTAINER=GlueTun-Nord_WG
 NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
-NAUTILJON_HOST_BROWSER_PROFILE=/media/nvme0n1p1/AppData/NautiljonScraper/browser-profile
-NAUTILJON_BACKEND=selenium
-NAUTILJON_BROWSER_HEADLESS=false
-NAUTILJON_BROWSER_ATTACH=true
-NAUTILJON_CLOUDFLARE_WAIT_SECONDS=120
+NAUTILJON_BACKEND=flaresolverr
+NAUTILJON_FLARESOLVERR_URL=http://192.168.1.30:8191/v1
+NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
 NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=1g
 NAUTILJON_MEMSWAP_LIMIT=1g
-NAUTILJON_SHM_SIZE=512m
 ```
 
-Le profil persistant conserve les cookies et la session. Le bouton de consentement
-est clique automatiquement lors de la premiere ouverture.
-Chromium est lance comme un navigateur autonome, puis Selenium s'y attache. Cette
-configuration reprend le mode d'attachement deja prevu par le scraper PC.
-
-## 1. Verification du navigateur
+## 1. Test FlareSolverr
 
 ```text
-NAUTILJON_COMMAND=browser-smoke
-```
-
-Resultat obligatoire :
-
-```text
-VERDICT NAVIGATEUR: OK
-```
-
-Ce test ouvre seulement `about:blank` et ne contacte pas Nautiljon.
-
-## 2. Test Nautiljon Selenium
-
-```text
-NAUTILJON_COMMAND=browser-test
+NAUTILJON_COMMAND=flaresolverr-test
 NAUTILJON_DIAGNOSE_LETTER=a
 ```
 
-Le navigateur ouvre `/mangas/`, accepte les cookies, clique sur A, analyse la
-premiere page puis ouvre une fiche. Il ne remplace aucun export.
+Ce test ne modifie aucun export. Il verifie :
+
+1. l'acces a l'API FlareSolverr ;
+2. l'IP publique de Gluetun et celle de FlareSolverr ;
+3. la premiere page du listing A ;
+4. une fiche manga.
 
 Le seul resultat autorisant la suite est :
 
 ```text
-VERDICT SELENIUM: PRET POUR DIFF CONTROLE
+VERDICT FLARESOLVERR: PRET POUR DIFF CONTROLE
 ```
 
-En cas d'echec, les fichiers HTML, PNG et le journal ChromeDriver sont ecrits
-dans `output/debug/`.
+Si les IP different, placez FlareSolverr derriere le meme Gluetun :
 
-## 3. Diff controle sur A
+```yaml
+network_mode: "container:GlueTun-Nord_WG"
+```
 
-Cette etape n'est autorisee qu'apres un `browser-test` reussi :
+Dans cette configuration, utilisez dans le stack Nautiljon :
+
+```text
+NAUTILJON_FLARESOLVERR_URL=http://127.0.0.1:8191/v1
+```
+
+FlareSolverr et Nautiljon partagent alors l'espace reseau de Gluetun. Un service
+qui utilise `network_mode: container:...` ne doit pas declarer sa propre section
+`ports`. Si le port 8191 doit rester accessible depuis le LAN, publiez-le dans le
+stack Gluetun.
+
+## 2. Diff controle sur A
+
+Cette etape n'est autorisee qu'apres un `flaresolverr-test` reussi :
 
 ```text
 NAUTILJON_COMMAND=diff
@@ -74,7 +70,7 @@ NAUTILJON_RESUME=true
 Un sous-ensemble termine avec l'etat `PARTIAL` et ne produit jamais de marqueur
 mensuel complet.
 
-## 4. Diff mensuel complet
+## 3. Diff mensuel complet
 
 Retirez `NAUTILJON_LETTERS` ou laissez cette variable vide :
 
@@ -102,11 +98,7 @@ Les CSV par lettre restent dans `output/letters/`. Pour regenerer les JSON :
 NAUTILJON_COMMAND=import-csv
 ```
 
-## RSS
+## Selenium
 
-Le RSS reste une commande separee et non exhaustive :
-
-```text
-NAUTILJON_COMMAND=discover-rss
-NAUTILJON_MERGE_RSS_CANDIDATES=false
-```
+`browser-smoke` et `browser-test` restent disponibles pour le diagnostic, mais
+ne sont plus le transport recommande pour le diff.
