@@ -133,6 +133,8 @@ deja terminees dans `output/checkpoints/`.
 Le scraper suit le lien de pagination exact fourni par Nautiljon et enregistre
 ce lien dans le checkpoint. Si plus de 15 % des fiches historiques d'une lettre
 disparaissent du listing, la lettre n'est pas remplacee et le diff s'arrete.
+Une page indiquant que l'IP est interdite pour abus provoque egalement un arret
+immediat, sans trois nouvelles tentatives, avec conservation du checkpoint.
 
 ## Import initial
 

@@ -5,7 +5,7 @@ import types
 import unittest
 from unittest import mock
 
-from scraper_nautiljon import NautiljonScraper
+from scraper_nautiljon import NautiljonAccessBlockedError, NautiljonScraper
 
 
 def make_row(label: str):
@@ -33,10 +33,11 @@ class DiffStateTests(unittest.TestCase):
             outcome = outcomes.get(label, "success")
             flags = {
                 "listing_failed": outcome == "listing_failed",
+                "access_blocked": outcome == "access_blocked",
                 "detail_failed": outcome == "detail_failed",
                 "limited": outcome == "limited",
             }
-            if outcome in {"listing_failed", "detail_failed"}:
+            if outcome in {"listing_failed", "access_blocked", "detail_failed"}:
                 this.session_stats["errors"] += 1
             this.session_stats["diff_by_letter"][label] = flags
             rows = [make_row(label)]
@@ -62,6 +63,37 @@ class DiffStateTests(unittest.TestCase):
             self.assertFalse(os.path.exists(scraper._last_success_path("diff")))
             state = scraper._load_json_dict(scraper._state_path("last_diff_run"))
             self.assertEqual(state["status"], "failed")
+
+    def test_nautiljon_access_block_stops_without_retry(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            self.seed_letter(scraper, "a")
+            attempts = []
+
+            def blocked_fetch(this, letter, page_num):
+                attempts.append(page_num)
+                raise NautiljonAccessBlockedError("IP interdite pour abus")
+
+            scraper.fetch_listing_page = types.MethodType(blocked_fetch, scraper)
+            scraper.scrape_letter_diff("a", drop_missing=False, resume=True)
+
+            self.assertEqual(attempts, [0])
+            self.assertTrue(scraper.session_stats["diff_by_letter"]["A"]["access_blocked"])
+            self.assertTrue(os.path.exists(scraper._letter_checkpoint_path("A")))
+
+    def test_access_block_has_dedicated_run_reason(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            self.seed_letter(scraper, "a")
+            self.install_fake_letter_scrape(scraper, {"A": "access_blocked"})
+
+            result = scraper.scrape_all_letters_diff(
+                letters=["a"],
+                min_days_between_diff_exports=0,
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.reason, "access_blocked")
 
     def test_subset_is_partial_and_never_monthly_success(self):
         with tempfile.TemporaryDirectory() as out_dir:
@@ -339,6 +371,17 @@ class DiffStateTests(unittest.TestCase):
         """
 
         self.assertTrue(scraper._cloudflare_challenge(html))
+        self.assertTrue(scraper._blocked_by_waf(html))
+
+    def test_detects_nautiljon_ip_abuse_block(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+        html = """
+        <html><body>IP (193.43.69.227) interdite pour abus.
+        Ce probleme peut etre du a de la recuperation de donnees sur le site (interdit)
+        ou a l'utilisation d'un VPN. Pour debloquer votre acces, contactez-nous.</body></html>
+        """
+
+        self.assertTrue(scraper._nautiljon_access_blocked(html))
         self.assertTrue(scraper._blocked_by_waf(html))
 
     def test_flaresolverr_fetch_reuses_one_session(self):

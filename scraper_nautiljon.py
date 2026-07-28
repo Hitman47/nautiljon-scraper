@@ -180,6 +180,10 @@ class RunResult:
         return 0 if self.status in {"success", "skipped"} else 1
 
 
+class NautiljonAccessBlockedError(RuntimeError):
+    pass
+
+
 class NautiljonScraper:
     def __init__(
         self,
@@ -1080,6 +1084,10 @@ class NautiljonScraper:
             raise RuntimeError(f"FlareSolverr: HTTP {status_code} pour {url}")
         if not isinstance(html, str) or not html:
             raise RuntimeError(f"FlareSolverr: reponse vide pour {url}")
+        if self._nautiljon_access_blocked(html):
+            raise NautiljonAccessBlockedError(
+                "Nautiljon a interdit l'IP de sortie pour abus; arret immediat sans nouvelle tentative"
+            )
         if self._blocked_by_waf(html):
             raise RuntimeError(f"FlareSolverr n'a pas resolu Cloudflare pour {url}")
         return html
@@ -1469,14 +1477,30 @@ class NautiljonScraper:
         response.raise_for_status()
         response.encoding = response.encoding or "utf-8"
         html = response.text
+        if self._nautiljon_access_blocked(html):
+            raise NautiljonAccessBlockedError(
+                "Nautiljon a interdit l'IP de sortie pour abus; arret immediat sans nouvelle tentative"
+            )
         if self._blocked_by_waf(html):
             raise RuntimeError("Nautiljon a renvoye une page de blocage/WAF.")
         return html
 
+    def _nautiljon_access_blocked(self, html: str) -> bool:
+        text = _norm(html)
+        return (
+            "interdite pour abus" in text
+            and (
+                "recuperation de donnees" in text
+                or "pour debloquer votre acces" in text
+                or "utilisation d'un vpn" in text
+            )
+        )
+
     def _blocked_by_waf(self, html: str) -> bool:
         text = _norm(html)
         return (
-            "sorry you have been blocked" in text
+            self._nautiljon_access_blocked(html)
+            or "sorry you have been blocked" in text
             or "you are unable to access nautiljon.com" in text
             or "unable to access nautiljon.com" in text
             or "just a moment" in text
@@ -1981,6 +2005,7 @@ class NautiljonScraper:
         accessible_listing_pages = 0
         successful_listing_pages = 0
         listing_failed = False
+        access_blocked = False
         since_flush = 0
         counters = {"new": 0, "changed": 0, "stale": 0, "reused": 0, "removed": 0}
         errors_before_letter = self.session_stats["errors"]
@@ -2041,6 +2066,12 @@ class NautiljonScraper:
                 page_url, page_series = self.fetch_listing_page(letter, page_num)
                 accessible_listing_pages += 1
                 print(f"  Page {page_num + 1}: {len(page_series)} entrees ({page_url})")
+            except NautiljonAccessBlockedError as exc:
+                access_blocked = True
+                listing_failed = True
+                print(f"  ACCES BLOQUE: {str(exc)[:240]}")
+                save_checkpoint(page_num)
+                break
             except Exception as exc:
                 empty_pages += 1
                 print(f"  Page {page_num + 1} indisponible, tentative {empty_pages}/3: {str(exc)[:160]}")
@@ -2155,6 +2186,7 @@ class NautiljonScraper:
                 "reused": len(existing_kept),
                 "removed": 0,
                 "listing_failed": True,
+                "access_blocked": access_blocked,
                 "coverage_failed": False,
                 "detail_failed": False,
                 "limited": False,
@@ -2189,6 +2221,7 @@ class NautiljonScraper:
                 key=lambda row: _norm(row.get("titre", "")),
             )
             counters["listing_failed"] = listing_failed
+            counters["access_blocked"] = access_blocked
             counters["coverage_failed"] = coverage_failed
             counters["missing_count"] = missing_count
             counters["missing_ratio"] = round(missing_ratio, 6)
@@ -2220,6 +2253,7 @@ class NautiljonScraper:
         self._remove_partial_files(tag)
         self._remove_checkpoint(checkpoint_path)
         counters["listing_failed"] = False
+        counters["access_blocked"] = False
         counters["coverage_failed"] = False
         counters["missing_count"] = missing_count
         counters["missing_ratio"] = round(missing_ratio, 6)
@@ -2332,6 +2366,7 @@ class NautiljonScraper:
                 diff_stats = self.session_stats["diff_by_letter"].get(label, {})
                 letter_incomplete = bool(
                     diff_stats.get("listing_failed")
+                    or diff_stats.get("access_blocked")
                     or diff_stats.get("coverage_failed")
                     or diff_stats.get("detail_failed")
                     or diff_stats.get("limited")
@@ -2339,6 +2374,14 @@ class NautiljonScraper:
                 if not letter_incomplete:
                     completed_letters.append(label)
                     self._save_diff_run_checkpoint(config, completed_letters)
+                if diff_stats.get("access_blocked"):
+                    aborted_listing_failures = True
+                    incomplete_reason = "access_blocked"
+                    print(
+                        "Diff interrompu immediatement: IP de sortie bloquee par Nautiljon. "
+                        "Les donnees et le checkpoint sont conserves."
+                    )
+                    break
                 if diff_stats.get("listing_failed"):
                     incomplete_reason = "listing_inaccessible"
                     consecutive_listing_failures += 1
@@ -2407,7 +2450,7 @@ class NautiljonScraper:
             reason = "controlled_subset_complete"
         elif completed_letters:
             status = "partial"
-        elif aborted_listing_failures:
+        elif aborted_listing_failures and reason != "access_blocked":
             reason = "listing_inaccessible"
 
         result = RunResult(
