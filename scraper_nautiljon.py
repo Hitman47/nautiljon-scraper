@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html as html_lib
 import json
 import os
 import random
@@ -11,6 +12,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -27,6 +29,7 @@ except OverflowError:
 
 
 BASE_URL = "https://www.nautiljon.com"
+DEFAULT_RSS_FEEDS = ["http://feeds.feedburner.com/nautiljon/NdFI"]
 DEFAULT_TIMEOUT = 45
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -215,6 +218,11 @@ class NautiljonScraper:
             os.makedirs(path, exist_ok=True)
         return exports_dir, checkpoints_dir, letters_dir, state_dir
 
+    def _discovery_dir(self) -> str:
+        path = os.path.join(self.out_dir, "discovery")
+        os.makedirs(path, exist_ok=True)
+        return path
+
     def _letter_paths(self, letter_tag: str) -> Tuple[str, str, str, str]:
         _, _, letters_dir, _ = self._ensure_dirs()
         base = os.path.join(letters_dir, f"nautiljon_lettre_{letter_tag}")
@@ -323,6 +331,153 @@ class NautiljonScraper:
         for path in sorted(files, key=sort_key):
             rows.extend(self._load_json_list(path))
         return rows
+
+    def _known_urls(self) -> set:
+        urls = set()
+        for row in self.concat_letters():
+            url = _ensure_abs_url(row.get("url_fiche", ""))
+            if url:
+                urls.add(url)
+        return urls
+
+    def _letter_tag_from_title(self, title: str) -> str:
+        normalized = _norm(title)
+        for char in normalized:
+            if "a" <= char <= "z":
+                return char.upper()
+            if char.isdigit():
+                return "HASH"
+        return "HASH"
+
+    def _candidate_url_from_title(self, title: str) -> str:
+        normalized = _norm(title)
+        normalized = normalized.replace("&", " et ")
+        slug = re.sub(r"[^a-z0-9]+", "+", normalized).strip("+")
+        return f"{BASE_URL}/mangas/{slug}.html" if slug else ""
+
+    def _extract_candidate_titles_from_news_title(self, title: str) -> List[str]:
+        cleaned = _clean_spaces(html_lib.unescape(title)).strip(" -")
+        patterns = [
+            r"^(?P<title>.+?),\s+nouveau titre\b",
+            r"^(?P<title>.+?)\s+revient\s+en\s+manga\b",
+            r"^Le manga (?P<title>.+?)\s+(?:a|à)\s+para[iî]tre\b",
+            r"^Le manga (?P<title>.+?)\s+revient\b",
+            r"^Le manga (?P<title>.+?)\s+arrive\b",
+            r"^Le manga (?P<title>.+?)\s+d[eé]barque\b",
+            r"^Le manga (?P<title>.+?)\s+chez\b",
+        ]
+        titles: List[str] = []
+        for pattern in patterns:
+            match = re.search(pattern, cleaned, re.IGNORECASE)
+            if match:
+                titles.append(match.group("title"))
+        if not titles and re.search(r"\bmanga\b", cleaned, re.IGNORECASE):
+            trimmed = re.sub(r"^Le manga\s+", "", cleaned, flags=re.IGNORECASE)
+            trimmed = re.split(
+                r"\s+(?:aux|a|à|revient|arrive|d[eé]barque|est annonc[eé]|sortira)\b",
+                trimmed,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+            titles.append(trimmed)
+
+        result: List[str] = []
+        seen = set()
+        for value in titles:
+            value = _clean_spaces(value).strip(" \"'“”«»")
+            if len(value) < 2:
+                continue
+            key = _norm(value)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(value)
+        return result
+
+    def discover_rss_candidates(
+        self,
+        feed_urls: Optional[List[str]] = None,
+        merge_candidates: bool = False,
+    ) -> List[Dict[str, str]]:
+        feed_urls = feed_urls or DEFAULT_RSS_FEEDS
+        known_urls = self._known_urls()
+        candidates: List[Dict[str, str]] = []
+        seen_urls = set(known_urls)
+
+        for feed_url in feed_urls:
+            print(f"Flux RSS: {feed_url}")
+            response = self.session.get(feed_url, timeout=DEFAULT_TIMEOUT)
+            response.raise_for_status()
+            import xml.etree.ElementTree as ET
+
+            root = ET.fromstring(response.text)
+            for item in root.findall("./channel/item"):
+                news_title = item.findtext("title") or ""
+                news_link = item.findtext("link") or ""
+                if "/actualite/mangas/" not in news_link and "manga" not in _norm(news_title):
+                    continue
+                pub_date = item.findtext("pubDate") or ""
+                parsed_date = ""
+                if pub_date:
+                    try:
+                        parsed_date = parsedate_to_datetime(pub_date).isoformat()
+                    except Exception:
+                        parsed_date = pub_date
+                for title in self._extract_candidate_titles_from_news_title(news_title):
+                    if self.is_banned_type(title):
+                        self.session_stats["skipped_by_type"] += 1
+                        continue
+                    url = self._candidate_url_from_title(title)
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    candidates.append(self._normalize_row({
+                        "titre": title,
+                        "url_fiche": url,
+                        "extraction_time": _now_str(),
+                        "discovery_source": "rss",
+                        "discovery_news_title": news_title,
+                        "discovery_news_url": news_link,
+                        "discovery_pub_date": parsed_date or "N/A",
+                        "discovery_status": "candidate_unverified",
+                    }))
+
+        discovery_dir = self._discovery_dir()
+        json_path = os.path.join(discovery_dir, "nautiljon_rss_candidates.json")
+        csv_path = os.path.join(discovery_dir, "nautiljon_rss_candidates.csv")
+        with open(json_path, "w", encoding="utf-8") as handle:
+            json.dump(candidates, handle, ensure_ascii=False, indent=2)
+        self._write_csv(csv_path, candidates)
+        self.session_stats["rss_candidates"] = len(candidates)
+        print(f"OK candidats RSS: {csv_path} ({len(candidates)} nouveaux candidats)")
+
+        if merge_candidates and candidates:
+            self.merge_candidate_rows(candidates)
+        return candidates
+
+    def merge_candidate_rows(self, candidates: List[Dict[str, str]]) -> int:
+        grouped: Dict[str, List[Dict[str, str]]] = {}
+        for row in candidates:
+            grouped.setdefault(self._letter_tag_from_title(row.get("titre", "")), []).append(row)
+
+        added = 0
+        for tag, rows in sorted(grouped.items()):
+            final_json, _, _, _ = self._letter_paths(tag)
+            existing_rows = self._load_json_list(final_json)
+            if not existing_rows:
+                existing_rows = self._read_existing_csv_for_letter(tag)
+            known = {_ensure_abs_url(row.get("url_fiche", "")) for row in existing_rows if row.get("url_fiche")}
+            for row in rows:
+                url = _ensure_abs_url(row.get("url_fiche", ""))
+                if url and url not in known:
+                    existing_rows.append(row)
+                    known.add(url)
+                    added += 1
+            if rows:
+                existing_rows = sorted([self._normalize_row(row) for row in existing_rows], key=lambda row: _norm(row.get("titre", "")))
+                self.save_letter_files(tag, existing_rows, partial=False)
+        print(f"OK candidats fusionnes dans les lettres: {added}")
+        return added
 
     def export_all_data(self, rows: List[Dict[str, str]], base_filename: Optional[str] = None) -> Dict[str, str]:
         exports_dir, _, _, _ = self._ensure_dirs()
@@ -501,6 +656,8 @@ class NautiljonScraper:
             "sorry you have been blocked" in text
             or "you are unable to access nautiljon.com" in text
             or "unable to access nautiljon.com" in text
+            or "just a moment" in text
+            or "performing security verification" in text
             or "access denied" in text
         )
 
@@ -961,6 +1118,9 @@ class NautiljonScraper:
         drop_missing: bool = True,
         min_days_between_diff_exports: int = 30,
         abort_after_listing_failures: int = 1,
+        rss_fallback: bool = True,
+        rss_feed_urls: Optional[List[str]] = None,
+        merge_rss_candidates: bool = False,
         force: bool = False,
     ) -> List[Dict[str, str]]:
         should_skip, last_success, age = self.should_skip_recent_success("diff", min_days_between_diff_exports)
@@ -1013,6 +1173,13 @@ class NautiljonScraper:
             self.session_stats["end_time"] = datetime.now()
             if self.session_stats["start_time"]:
                 self.session_stats["duration"] = str(self.session_stats["end_time"] - self.session_stats["start_time"])
+            if aborted_listing_failures and rss_fallback:
+                try:
+                    print("Decouverte RSS apres blocage des listings...")
+                    self.discover_rss_candidates(feed_urls=rss_feed_urls, merge_candidates=merge_rss_candidates)
+                except Exception as exc:
+                    self.session_stats["errors"] += 1
+                    print(f"Erreur decouverte RSS: {str(exc)[:160]}")
             combined = self.concat_letters()
             export_paths: Dict[str, str] = {}
             if combined and not aborted_listing_failures:
@@ -1038,6 +1205,14 @@ def _parse_letters(raw: Optional[str]) -> Optional[List[str]]:
             continue
         letters.append("%23" if value == "#" else value)
     return letters
+
+
+def _parse_csv_list(raw: Optional[str]) -> Optional[List[str]]:
+    if not raw:
+        return None
+    values = [_clean_spaces(chunk) for chunk in raw.split(",")]
+    values = [value for value in values if value]
+    return values or None
 
 
 def _new_scraper(args: argparse.Namespace) -> NautiljonScraper:
@@ -1074,7 +1249,15 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--keep-missing", action="store_true", default=not _env_bool("NAUTILJON_DROP_MISSING", True))
     diff.add_argument("--min-days-between-diff-exports", type=int, default=_env_int("NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS", 30))
     diff.add_argument("--abort-after-listing-failures", type=int, default=_env_int("NAUTILJON_ABORT_AFTER_LISTING_FAILURES", 1))
+    diff.add_argument("--rss-fallback", dest="rss_fallback", action="store_true", default=_env_bool("NAUTILJON_RSS_FALLBACK", True))
+    diff.add_argument("--no-rss-fallback", dest="rss_fallback", action="store_false")
+    diff.add_argument("--rss-feeds", default=os.environ.get("NAUTILJON_RSS_FEEDS"))
+    diff.add_argument("--merge-rss-candidates", action="store_true", default=_env_bool("NAUTILJON_MERGE_RSS_CANDIDATES", False))
     diff.add_argument("--force", action="store_true", default=_env_bool("NAUTILJON_FORCE_SCRAPE", False))
+
+    rss = sub.add_parser("discover-rss", help="Decouvre des candidats de nouvelles fiches depuis les flux RSS.")
+    rss.add_argument("--rss-feeds", default=os.environ.get("NAUTILJON_RSS_FEEDS"))
+    rss.add_argument("--merge-candidates", action="store_true", default=_env_bool("NAUTILJON_MERGE_RSS_CANDIDATES", False))
 
     probe = sub.add_parser("probe-discovery", help="Teste la decouverte HTTP des listings sans Selenium.")
     probe.add_argument("--letters", default=os.environ.get("NAUTILJON_LETTERS", "a"))
@@ -1115,6 +1298,11 @@ def _run_selftests() -> None:
     assert detail["genres"] == "Action - Drame"
     assert detail["nb_chapitres_vo"] == "12"
     assert detail["statut_vo"] == "Terminé"
+    titles = scraper._extract_candidate_titles_from_news_title(
+        "Le manga Dungeon Band à paraître le mois prochain aux éditions VEGA"
+    )
+    assert titles == ["Dungeon Band"]
+    assert scraper._candidate_url_from_title(titles[0]) == "https://www.nautiljon.com/mangas/dungeon+band.html"
     print("Self-tests OK")
 
 
@@ -1147,7 +1335,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             drop_missing=not args.keep_missing,
             min_days_between_diff_exports=args.min_days_between_diff_exports,
             abort_after_listing_failures=args.abort_after_listing_failures,
+            rss_fallback=args.rss_fallback,
+            rss_feed_urls=_parse_csv_list(args.rss_feeds),
+            merge_rss_candidates=args.merge_rss_candidates,
             force=args.force,
+        )
+    elif command == "discover-rss":
+        scraper.discover_rss_candidates(
+            feed_urls=_parse_csv_list(args.rss_feeds),
+            merge_candidates=args.merge_candidates,
         )
     elif command == "probe-discovery":
         scraper.probe_discovery(letters=_parse_letters(args.letters), max_pages=args.max_pages)

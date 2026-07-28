@@ -38,6 +38,9 @@ Use:
 NAUTILJON_COMMAND=diff
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
+NAUTILJON_RSS_FALLBACK=true
+NAUTILJON_RSS_FEEDS=http://feeds.feedburner.com/nautiljon/NdFI
+NAUTILJON_MERGE_RSS_CANDIDATES=false
 NAUTILJON_REFRESH_STALE_DAYS=180
 ```
 
@@ -55,6 +58,11 @@ The diff:
 Set `NAUTILJON_FORCE_SCRAPE=true` to ignore the 30-day protection once.
 Set `NAUTILJON_ABORT_AFTER_LISTING_FAILURES=0` only if you want the diff to
 continue through all letters even when listings are blocked.
+
+If listings are blocked, RSS fallback still writes probable new manga fiches to
+`output/discovery/nautiljon_rss_candidates.csv`. Keep
+`NAUTILJON_MERGE_RSS_CANDIDATES=false` unless you accept incomplete, unverified
+rows in the per-letter exports.
 
 ## Same Gluetun as Bedetheque
 

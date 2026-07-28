@@ -64,6 +64,9 @@ NAUTILJON_DELAY_MIN=2.0
 NAUTILJON_DELAY_MAX=5.0
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
+NAUTILJON_RSS_FALLBACK=true
+NAUTILJON_RSS_FEEDS=http://feeds.feedburner.com/nautiljon/NdFI
+NAUTILJON_MERGE_RSS_CANDIDATES=false
 NAUTILJON_REFRESH_STALE_DAYS=180
 NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=256m
@@ -89,6 +92,13 @@ NAUTILJON_COMMAND=probe-discovery
 NAUTILJON_LETTERS=a
 ```
 
+To discover recent manga candidates from Nautiljon RSS without touching the
+letter exports:
+
+```text
+NAUTILJON_COMMAND=discover-rss
+```
+
 ## Notes
 
 - No Selenium or browser is used.
@@ -99,3 +109,6 @@ NAUTILJON_LETTERS=a
   the existing CSV import and concat still work.
 - During `diff`, `NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1` stops the run after
   the first fully inaccessible letter. Set it to `0` to disable this guard.
+- When listings are blocked, `NAUTILJON_RSS_FALLBACK=true` writes probable new
+  manga fiches to `output/discovery/nautiljon_rss_candidates.csv`. They stay out
+  of the main export unless `NAUTILJON_MERGE_RSS_CANDIDATES=true`.
