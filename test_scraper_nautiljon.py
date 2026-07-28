@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta
 from unittest import mock
 
-from scraper_nautiljon import NautiljonAccessBlockedError, NautiljonScraper
+from scraper_nautiljon import DATA_SCHEMA_VERSION, NautiljonAccessBlockedError, NautiljonScraper
 
 
 def make_row(label: str):
@@ -96,6 +96,86 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.reason, "access_blocked")
 
+    def test_extracts_last_and_upcoming_vf_volumes_from_series_page(self):
+        scraper = self.make_scraper("unused")
+        html = """
+        <div id="content"><h1>Smoking Behind The Supermarket With You</h1></div>
+        <li class="nav_vols fright">
+          <div class="acenter inline-block"><strong>Dernier paru</strong><br>
+            <a href="/mangas/smoking/volume-6,1011514.html" title="Vol. 6">
+              <img src="/imagesmin/manga_volumes/volume-6.webp?123" alt="Smoking Vol. 6">
+            </a><br><span class="infos_small">15/05/2026</span>
+          </div>
+          <div class="acenter inline-block"><strong>À paraître</strong><br>
+            <a href="/mangas/smoking/volume-7,1021408.html" title="Vol. 7">
+              <img src="/imagesmin/manga_volumes/volume-7.webp?456" alt="Smoking Vol. 7">
+            </a><br><span class="infos_small">30/10/2026</span>
+          </div>
+        </li>
+        """
+
+        detail = scraper.extract_series_detail_from_html(html)
+
+        self.assertEqual(detail["dernier_tome_vf_numero"], "6")
+        self.assertEqual(detail["dernier_tome_vf_date"], "15/05/2026")
+        self.assertEqual(
+            detail["dernier_tome_vf_url"],
+            "https://www.nautiljon.com/mangas/smoking/volume-6,1011514.html",
+        )
+        self.assertEqual(
+            detail["dernier_tome_vf_couverture"],
+            "https://www.nautiljon.com/imagesmin/manga_volumes/volume-6.webp?123",
+        )
+        self.assertEqual(detail["prochain_tome_vf_numero"], "7")
+        self.assertEqual(detail["prochain_tome_vf_date"], "30/10/2026")
+        self.assertFalse(detail["parutions_vf_verifiees_le"].startswith("N/A"))
+
+    def test_release_refresh_only_targets_ongoing_vf_series(self):
+        scraper = self.make_scraper("unused")
+        ongoing = {
+            "nb_vol_vf_detail": "6 (En cours)",
+            "parutions_vf_verifiees_le": "N/A",
+            "extraction_time": "2020-01-01 00:00:00",
+        }
+        completed = {
+            "nb_vol_vf_detail": "6 (Terminé)",
+            "parutions_vf_verifiees_le": "N/A",
+            "extraction_time": "2020-01-01 00:00:00",
+        }
+
+        self.assertTrue(scraper._series_needs_release_refresh(ongoing, 30))
+        self.assertFalse(scraper._series_needs_release_refresh(completed, 30))
+
+        ongoing["parutions_vf_verifiees_le"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.assertFalse(scraper._series_needs_release_refresh(ongoing, 30))
+
+    def test_completed_vf_series_is_not_refetched_due_to_age(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            row = scraper._normalize_row(make_row("A"))
+            row["nb_vol_vf_detail"] = "12 (Terminé)"
+            row["extraction_time"] = "2020-01-01 00:00:00"
+            scraper.save_letter_files("A", [row], partial=False)
+
+            pages = {0: [dict(row)], 1: [], 2: [], 3: []}
+            scraper.fetch_listing_page = types.MethodType(
+                lambda this, letter, page_num: (f"https://example.test/a?page={page_num}", pages[page_num]),
+                scraper,
+            )
+            scraper._fetch_full_series_data = types.MethodType(
+                lambda this, series: self.fail("Une VF terminee ne doit pas etre rechargee par anciennete."),
+                scraper,
+            )
+
+            scraper.scrape_letter_diff(
+                "a",
+                refresh_stale_days=30,
+                drop_missing=False,
+                resume=False,
+            )
+
+            self.assertEqual(scraper.session_stats["diff_by_letter"]["A"]["reused"], 1)
+
     def test_subset_is_partial_and_never_monthly_success(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = self.make_scraper(out_dir)
@@ -177,6 +257,7 @@ class DiffStateTests(unittest.TestCase):
             scraper.save_controlled_letter_files("A", controlled_rows)
             scraper._write_json_atomic(scraper._state_path("last_diff_run"), {
                 "mode": "diff",
+                "data_schema_version": DATA_SCHEMA_VERSION,
                 "status": "partial",
                 "reason": "controlled_subset_complete",
                 "completed_at": datetime.now().isoformat(timespec="seconds"),
@@ -230,6 +311,7 @@ class DiffStateTests(unittest.TestCase):
             scraper.save_controlled_letter_files("A", [make_row("A")])
             scraper._write_json_atomic(scraper._state_path("last_diff_run"), {
                 "mode": "diff",
+                "data_schema_version": DATA_SCHEMA_VERSION,
                 "status": "partial",
                 "reason": "controlled_subset_complete",
                 "completed_at": (datetime.now() - timedelta(days=31)).isoformat(timespec="seconds"),

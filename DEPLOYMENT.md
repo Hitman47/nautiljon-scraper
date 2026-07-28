@@ -49,6 +49,7 @@ NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=1g
 NAUTILJON_MEMSWAP_LIMIT=1g
 NAUTILJON_MAX_MISSING_RATIO=0.15
+NAUTILJON_REFRESH_STALE_DAYS=30
 ```
 
 Si le proxy Gluetun est protege par `HTTPPROXY_USER` et
@@ -125,6 +126,7 @@ NAUTILJON_DELAY_MAX=5.0
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
 NAUTILJON_MAX_MISSING_RATIO=0.15
+NAUTILJON_REFRESH_STALE_DAYS=30
 ```
 
 Le succes exige les 27 lettres, aucune erreur de listing ou de fiche et des
@@ -141,6 +143,10 @@ Avec `NAUTILJON_FORCE_SCRAPE=false`, une lettre validee depuis moins de
 `NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS` jours est reutilisee sans requete et
 promue dans `output/letters/`. Une lettre expiree ou dont le cache est invalide
 est automatiquement rescrapee. `NAUTILJON_FORCE_SCRAPE=true` ignore ce cache.
+
+Apres l'ajout des colonnes de parutions VF, les caches crees par une ancienne
+version sont volontairement ignores une fois. Un checkpoint de lettre en cours
+reste reprenable et ne complete que les fiches VF `En cours` deja parcourues.
 
 ## Import initial
 

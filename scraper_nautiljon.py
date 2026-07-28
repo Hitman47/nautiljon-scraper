@@ -51,6 +51,13 @@ DEFAULT_HEADERS = {
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
 }
 BANNED_TYPE_KEYWORDS = ["yaoi", "yuri"]
+DATA_SCHEMA_VERSION = 2
+VF_RELEASE_FIELDS = [
+    "dernier_tome_vf_numero", "dernier_tome_vf_date",
+    "dernier_tome_vf_url", "dernier_tome_vf_couverture",
+    "prochain_tome_vf_numero", "prochain_tome_vf_date",
+    "prochain_tome_vf_url", "prochain_tome_vf_couverture",
+]
 PREFERRED_FIELDS = [
     "url_fiche", "titre", "titre_alternatif", "extraction_time",
     "titre_original", "origine", "annee_vo",
@@ -60,6 +67,7 @@ PREFERRED_FIELDS = [
     "editeur_vo", "prepublication",
     "nb_vol_vo_liste", "nb_vol_vf_liste", "nb_vol_vo_detail", "nb_vol_vf_detail",
     "date_vo_liste", "date_vf_liste", "date_vo_detail", "date_vf_detail",
+    *VF_RELEASE_FIELDS, "parutions_vf_verifiees_le",
     "note_liste", "note_detail",
     "nb_chapitres_vo", "statut_vo", "nb_chapitres_vf", "statut_vf",
     "age_liste", "age_detail",
@@ -303,6 +311,9 @@ class NautiljonScraper:
             return False, None, None
         if data.get("status") not in {None, "success"}:
             return False, data, None
+        if mode == "diff" and data.get("data_schema_version") != DATA_SCHEMA_VERSION:
+            print("Ancien marqueur de succes ignore: schema de donnees obsolete.")
+            return False, data, None
         export_paths = data.get("export_paths")
         if not isinstance(export_paths, dict) or not self._validate_final_exports(export_paths):
             print("Ancien marqueur de succes ignore: export final absent ou incomplet.")
@@ -317,6 +328,7 @@ class NautiljonScraper:
     def mark_success(self, mode: str, rows_count: int, export_paths: Dict[str, str]) -> None:
         payload = {
             "status": "success",
+            "data_schema_version": DATA_SCHEMA_VERSION,
             "completed_at": datetime.now().isoformat(timespec="seconds"),
             "rows_count": rows_count,
             "export_paths": export_paths,
@@ -342,6 +354,7 @@ class NautiljonScraper:
     def mark_run_state(self, mode: str, result: RunResult) -> str:
         payload = {
             "mode": mode,
+            "data_schema_version": DATA_SCHEMA_VERSION,
             "status": result.status,
             "reason": result.reason,
             "completed_at": datetime.now().isoformat(timespec="seconds"),
@@ -395,6 +408,7 @@ class NautiljonScraper:
         max_missing_ratio: float = 0.15,
     ) -> Dict[str, object]:
         return {
+            "data_schema_version": DATA_SCHEMA_VERSION,
             "letters": letters,
             "max_pages_per_letter": max_pages_per_letter,
             "max_series_per_letter": max_series_per_letter,
@@ -503,7 +517,7 @@ class NautiljonScraper:
         self._write_csv(csv_path, normalized_rows)
         payload: Dict[str, object] = {
             "status": "success",
-            "version": 1,
+            "version": DATA_SCHEMA_VERSION,
             "letter": letter_tag,
             "completed_at": completed_at or datetime.now().isoformat(timespec="seconds"),
             "rows_count": len(normalized_rows),
@@ -526,6 +540,8 @@ class NautiljonScraper:
         max_missing_ratio: float,
     ) -> Optional[Tuple[List[Dict[str, str]], timedelta]]:
         if min_days <= 0 or marker.get("status") != "success" or marker.get("letter") != letter_tag:
+            return None
+        if marker.get("version") != DATA_SCHEMA_VERSION:
             return None
         if marker.get("excluded_types") != list(BANNED_TYPE_KEYWORDS):
             return None
@@ -570,6 +586,8 @@ class NautiljonScraper:
     ) -> Optional[Dict[str, object]]:
         report = self._load_json_dict(self._state_path("last_diff_run"))
         if not report or report.get("status") != "partial" or report.get("reason") != "controlled_subset_complete":
+            return None
+        if report.get("data_schema_version") != DATA_SCHEMA_VERSION:
             return None
         completed = report.get("completed_letters")
         if not isinstance(completed, list) or letter_tag not in completed:
@@ -2029,10 +2047,50 @@ class NautiljonScraper:
             kv[label_n] = value or "N/A"
         return kv
 
+    def _extract_vf_releases(self, soup: BeautifulSoup) -> Dict[str, str]:
+        releases = {field: "N/A" for field in VF_RELEASE_FIELDS}
+        container = soup.select_one("li.nav_vols")
+        if not container:
+            return releases
+
+        for block in container.find_all("div", recursive=False):
+            heading = block.find("strong")
+            heading_norm = _norm(heading.get_text(" ", strip=True)) if heading else ""
+            if "dernier paru" in heading_norm:
+                prefix = "dernier_tome_vf"
+            elif "a paraitre" in heading_norm:
+                prefix = "prochain_tome_vf"
+            else:
+                continue
+
+            anchor = block.find("a", href=True)
+            image = block.find("img")
+            volume_sources = [
+                anchor.get("title", "") if anchor else "",
+                image.get("alt", "") if image else "",
+            ]
+            for source in volume_sources:
+                match = re.search(r"\bvol\.?\s*([0-9]+(?:[.,][0-9]+)?)\b", source, flags=re.IGNORECASE)
+                if match:
+                    releases[f"{prefix}_numero"] = match.group(1).replace(",", ".")
+                    break
+
+            date_node = block.select_one("span.infos_small")
+            if date_node:
+                releases[f"{prefix}_date"] = _clean_spaces(date_node.get_text(" ", strip=True)) or "N/A"
+            if anchor:
+                releases[f"{prefix}_url"] = _ensure_abs_url(anchor.get("href", "")) or "N/A"
+            if image:
+                image_url = image.get("src") or image.get("data-src") or ""
+                releases[f"{prefix}_couverture"] = _ensure_abs_url(image_url) or "N/A"
+        return releases
+
     def extract_series_detail_from_html(self, html: str) -> Dict[str, str]:
         soup = BeautifulSoup(html, "html.parser")
         detail = {field: "N/A" for field in PREFERRED_FIELDS if field not in {"url_fiche", "titre", "titre_alternatif", "extraction_time"}}
         detail["_titre_fr_fallback"] = self._extract_title_fr(soup)
+        detail.update(self._extract_vf_releases(soup))
+        detail["parutions_vf_verifiees_le"] = _now_str()
         ul = self._find_best_info_ul(soup)
         if not ul:
             return detail
@@ -2115,13 +2173,22 @@ class NautiljonScraper:
         fields = [field for field in ListRow.__dataclass_fields__.keys() if field != "extraction_time"]
         return any(_clean_spaces(existing.get(field, "N/A")) != _clean_spaces(current.get(field, "N/A")) for field in fields)
 
-    def _series_is_stale(self, existing: Dict[str, str], refresh_stale_days: Optional[int]) -> bool:
+    def _series_vf_is_ongoing(self, existing: Dict[str, str]) -> bool:
+        return "en cours" in _norm(existing.get("nb_vol_vf_detail", ""))
+
+    def _series_needs_release_refresh(
+        self,
+        existing: Dict[str, str],
+        refresh_stale_days: Optional[int],
+    ) -> bool:
+        if not self._series_vf_is_ongoing(existing):
+            return False
+        checked_at = _parse_extraction_time(existing.get("parutions_vf_verifiees_le"))
+        if checked_at is None:
+            return True
         if not refresh_stale_days or refresh_stale_days <= 0:
             return False
-        extracted_at = _parse_extraction_time(existing.get("extraction_time"))
-        if extracted_at is None:
-            return True
-        return (datetime.now() - extracted_at).days >= refresh_stale_days
+        return (datetime.now() - checked_at).days >= refresh_stale_days
 
     def scrape_letter_diff(
         self,
@@ -2158,9 +2225,10 @@ class NautiljonScraper:
         listing_failed = False
         access_blocked = False
         since_flush = 0
-        counters = {"new": 0, "changed": 0, "stale": 0, "reused": 0, "removed": 0}
+        counters = {"new": 0, "changed": 0, "parutions": 0, "reused": 0, "removed": 0}
         errors_before_letter = self.session_stats["errors"]
         checkpoint_path = self._letter_checkpoint_path(tag)
+        resume_needs_release_backfill = False
         letter_settings = {
             "letter": letter,
             "max_pages": max_pages,
@@ -2191,6 +2259,7 @@ class NautiljonScraper:
                 saved_counters = checkpoint.get("counters")
                 if isinstance(saved_counters, dict):
                     counters.update({key: int(saved_counters.get(key, value) or 0) for key, value in counters.items()})
+                resume_needs_release_backfill = checkpoint.get("data_schema_version") != DATA_SCHEMA_VERSION
                 print(
                     f"  Reprise lettre {label}: page {page_num + 1}, "
                     f"{len(updated_rows)} serie(s) deja traitee(s)."
@@ -2200,6 +2269,7 @@ class NautiljonScraper:
             self.save_letter_files(tag, updated_rows, partial=True)
             payload = {
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "data_schema_version": DATA_SCHEMA_VERSION,
                 "settings": letter_settings,
                 "page_num": next_page,
                 "accessible_listing_pages": accessible_listing_pages,
@@ -2209,6 +2279,29 @@ class NautiljonScraper:
             if self.backend == "flaresolverr":
                 payload["next_listing_url"] = self._flaresolverr_listing_urls.get((tag, next_page), "")
             self._write_json_atomic(checkpoint_path, payload)
+
+        if resume_needs_release_backfill:
+            candidates = [
+                (index, row)
+                for index, row in enumerate(updated_rows)
+                if self._series_needs_release_refresh(row, refresh_stale_days)
+            ]
+            if candidates:
+                print(
+                    f"  Migration du checkpoint: {len(candidates)} serie(s) VF en cours "
+                    "a completer pour les parutions."
+                )
+            for index, row in candidates:
+                try:
+                    refreshed = self._fetch_full_series_data(dict(row))
+                    if refreshed:
+                        updated_rows[index] = refreshed
+                        counters["parutions"] += 1
+                        self._sleep_delay()
+                except Exception as exc:
+                    self.session_stats["errors"] += 1
+                    print(f"    Erreur migration parutions: {str(exc)[:140]}")
+            save_checkpoint(page_num)
 
         while True:
             if max_pages is not None and page_num >= max_pages:
@@ -2267,8 +2360,8 @@ class NautiljonScraper:
                     elif self._series_changed_on_list(existing, series):
                         action = "changed"
                         needs_detail = True
-                    elif self._series_is_stale(existing, refresh_stale_days):
-                        action = "stale"
+                    elif self._series_needs_release_refresh(existing, refresh_stale_days):
+                        action = "parutions"
                         needs_detail = True
 
                     if needs_detail:
@@ -2333,7 +2426,7 @@ class NautiljonScraper:
             self.session_stats["diff_by_letter"][label] = {
                 "new": 0,
                 "changed": 0,
-                "stale": 0,
+                "parutions": 0,
                 "reused": len(existing_kept),
                 "removed": 0,
                 "listing_failed": True,
@@ -2728,7 +2821,12 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--letters", default=os.environ.get("NAUTILJON_LETTERS"))
     diff.add_argument("--max-pages-per-letter", type=int, default=_env_optional_int("NAUTILJON_MAX_PAGES_PER_LETTER"))
     diff.add_argument("--max-series-per-letter", type=int, default=_env_optional_int("NAUTILJON_MAX_SERIES_PER_LETTER"))
-    diff.add_argument("--refresh-stale-days", type=int, default=_env_optional_int("NAUTILJON_REFRESH_STALE_DAYS"))
+    diff.add_argument(
+        "--refresh-stale-days",
+        type=int,
+        default=_env_optional_int("NAUTILJON_REFRESH_STALE_DAYS"),
+        help="Rafraichit uniquement les parutions des series dont la VF est en cours.",
+    )
     diff.add_argument("--keep-missing", action="store_true", default=not _env_bool("NAUTILJON_DROP_MISSING", True))
     diff.add_argument(
         "--max-missing-ratio",

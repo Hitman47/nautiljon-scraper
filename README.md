@@ -73,7 +73,7 @@ NAUTILJON_FLUSH_EVERY=25
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_MAX_MISSING_RATIO=0.15
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
-NAUTILJON_REFRESH_STALE_DAYS=180
+NAUTILJON_REFRESH_STALE_DAYS=30
 NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=1g
 NAUTILJON_MEMSWAP_LIMIT=1g
@@ -93,6 +93,10 @@ NAUTILJON_SHM_SIZE=512m
 - Le lien de pagination exact est suivi et conserve dans le checkpoint.
 - Une disparition superieure a 15 % de la base bloque la finalisation.
 - Un controle avec `NAUTILJON_DROP_MISSING=false` ecrit dans `output/control/`.
+- `NAUTILJON_REFRESH_STALE_DAYS` ne recharge que les fiches dont `Nb volumes VF`
+  est indique `En cours`. Les series VF terminees ne sont pas revisitees par
+  anciennete. Les colonnes `dernier_tome_vf_*` et `prochain_tome_vf_*` viennent
+  directement de la fiche serie, sans ouvrir les fiches des tomes.
 - Un diff complet reutilise les lettres validees depuis moins de 30 jours si `FORCE=false`.
 - Le RSS reste separe du diff et ne peut pas valider un export mensuel.
 - Le conteneur est limite par le compose a 1 CPU et 1 Gio de RAM.
