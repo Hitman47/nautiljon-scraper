@@ -10,7 +10,8 @@ import re
 import sys
 import time
 import unicodedata
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -31,6 +32,7 @@ except OverflowError:
 BASE_URL = "https://www.nautiljon.com"
 DEFAULT_RSS_FEEDS = ["http://feeds.feedburner.com/nautiljon/NdFI"]
 DEFAULT_TIMEOUT = 45
+DEFAULT_DIAGNOSE_TIMEOUT = 15
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -155,6 +157,20 @@ class ListRow:
     extraction_time: str = ""
 
 
+@dataclass
+class RunResult:
+    status: str
+    reason: str
+    rows_count: int = 0
+    requested_letters: List[str] = field(default_factory=list)
+    completed_letters: List[str] = field(default_factory=list)
+    export_paths: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def exit_code(self) -> int:
+        return 0 if self.status in {"success", "skipped"} else 1
+
+
 class NautiljonScraper:
     def __init__(
         self,
@@ -259,6 +275,12 @@ class NautiljonScraper:
         data = self._load_last_success(mode)
         if not data:
             return False, None, None
+        if data.get("status") not in {None, "success"}:
+            return False, data, None
+        export_paths = data.get("export_paths")
+        if not isinstance(export_paths, dict) or not self._validate_final_exports(export_paths):
+            print("Ancien marqueur de succes ignore: export final absent ou incomplet.")
+            return False, data, None
         completed_at = str(data.get("completed_at", ""))
         try:
             age = datetime.now() - datetime.fromisoformat(completed_at)
@@ -268,17 +290,128 @@ class NautiljonScraper:
 
     def mark_success(self, mode: str, rows_count: int, export_paths: Dict[str, str]) -> None:
         payload = {
+            "status": "success",
             "completed_at": datetime.now().isoformat(timespec="seconds"),
             "rows_count": rows_count,
             "export_paths": export_paths,
             "session_stats": self.session_stats,
         }
         path = self._last_success_path(mode)
+        self._write_json_atomic(path, payload)
+        print(f"  OK marqueur de succes {mode}: {path}")
+
+    def _write_json_atomic(self, path: str, payload: object) -> None:
         tmp_path = path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
         os.replace(tmp_path, path)
-        print(f"  OK marqueur de succes {mode}: {path}")
+
+    def _state_path(self, name: str) -> str:
+        _, checkpoints_dir, _, state_dir = self._ensure_dirs()
+        if name == "diff_checkpoint":
+            return os.path.join(checkpoints_dir, "diff_run.json")
+        safe_name = re.sub(r"[^a-z0-9_.-]+", "_", name.lower()).strip("_") or "run"
+        return os.path.join(state_dir, f"{safe_name}.json")
+
+    def mark_run_state(self, mode: str, result: RunResult) -> str:
+        payload = {
+            "mode": mode,
+            "status": result.status,
+            "reason": result.reason,
+            "completed_at": datetime.now().isoformat(timespec="seconds"),
+            "rows_count": result.rows_count,
+            "requested_letters": result.requested_letters,
+            "completed_letters": result.completed_letters,
+            "export_paths": result.export_paths,
+            "session_stats": self.session_stats,
+        }
+        path = self._state_path(f"last_{mode}_run")
+        self._write_json_atomic(path, payload)
+        print(f"  ETAT {mode.upper()}: {result.status.upper()} ({result.reason})")
+        print(f"  Rapport d'etat: {path}")
+        return path
+
+    def _load_json_dict(self, path: str) -> Optional[Dict[str, object]]:
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _validate_final_exports(self, export_paths: Dict[str, str]) -> bool:
+        required = ("json_path", "csv_path", "stats_path", "report_path")
+        return all(
+            isinstance(export_paths.get(key), str)
+            and os.path.isfile(export_paths[key])
+            and os.path.getsize(export_paths[key]) > 0
+            for key in required
+        )
+
+    def _validate_final_letter_files(self, letters: List[str]) -> bool:
+        for letter in letters:
+            final_json, final_csv, _, _ = self._letter_paths(self._letter_tag(letter))
+            if not os.path.isfile(final_json) or not os.path.isfile(final_csv):
+                return False
+            if os.path.getsize(final_json) == 0 or os.path.getsize(final_csv) == 0:
+                return False
+            if not self._load_json_list(final_json):
+                return False
+        return True
+
+    def _diff_run_config(
+        self,
+        letters: List[str],
+        max_pages_per_letter: Optional[int],
+        max_series_per_letter: Optional[int],
+        refresh_stale_days: Optional[int],
+        drop_missing: bool,
+    ) -> Dict[str, object]:
+        return {
+            "letters": letters,
+            "max_pages_per_letter": max_pages_per_letter,
+            "max_series_per_letter": max_series_per_letter,
+            "refresh_stale_days": refresh_stale_days,
+            "drop_missing": drop_missing,
+        }
+
+    def _load_diff_run_checkpoint(self, config: Dict[str, object], resume: bool) -> List[str]:
+        if not resume:
+            return []
+        checkpoint = self._load_json_dict(self._state_path("diff_checkpoint"))
+        if not checkpoint or checkpoint.get("config") != config:
+            return []
+        completed = checkpoint.get("completed_letters", [])
+        if not isinstance(completed, list):
+            return []
+        configured_letters = config.get("letters", [])
+        configured_labels = {
+            self._letter_label(str(letter))
+            for letter in configured_letters
+        } if isinstance(configured_letters, list) else set()
+        result = [str(letter) for letter in completed if str(letter) in configured_labels]
+        if result:
+            print(f"Reprise du diff: {len(result)} lettre(s) deja finalisee(s): {', '.join(result)}")
+        return result
+
+    def _save_diff_run_checkpoint(self, config: Dict[str, object], completed_letters: List[str]) -> None:
+        payload = {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "config": config,
+            "completed_letters": completed_letters,
+        }
+        self._write_json_atomic(self._state_path("diff_checkpoint"), payload)
+
+    def _letter_checkpoint_path(self, letter_tag: str) -> str:
+        _, checkpoints_dir, _, _ = self._ensure_dirs()
+        return os.path.join(checkpoints_dir, f"nautiljon_lettre_{letter_tag}.json")
+
+    def _remove_checkpoint(self, path: str) -> None:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
     def _write_csv(self, path: str, rows: List[Dict[str, str]]) -> None:
         keys = set()
@@ -287,11 +420,13 @@ class NautiljonScraper:
         fieldnames = [field for field in PREFERRED_FIELDS]
         extras = sorted(key for key in keys if key not in set(PREFERRED_FIELDS))
         fieldnames.extend(extras)
-        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter=";")
             writer.writeheader()
             for row in rows:
                 writer.writerow({field: _clean_spaces(str(row.get(field, "N/A") or "N/A")) for field in fieldnames})
+        os.replace(tmp_path, path)
 
     def save_letter_files(self, letter_tag: str, rows: List[Dict[str, str]], partial: bool = False) -> None:
         final_json, final_csv, partial_json, partial_csv = self._letter_paths(letter_tag)
@@ -488,12 +623,11 @@ class NautiljonScraper:
         stats_path = os.path.join(exports_dir, f"{base_filename}_stats.json")
         report_path = os.path.join(exports_dir, f"{base_filename}_rapport.txt")
 
-        with open(json_path, "w", encoding="utf-8") as handle:
-            json.dump(rows, handle, ensure_ascii=False, indent=2)
+        self._write_json_atomic(json_path, rows)
         self._write_csv(csv_path, rows)
-        with open(stats_path, "w", encoding="utf-8") as handle:
-            json.dump(self.session_stats, handle, ensure_ascii=False, indent=2, default=str)
-        with open(report_path, "w", encoding="utf-8") as handle:
+        self._write_json_atomic(stats_path, self.session_stats)
+        tmp_report_path = report_path + ".tmp"
+        with open(tmp_report_path, "w", encoding="utf-8") as handle:
             handle.write("RAPPORT DE SCRAPING NAUTILJON\n")
             handle.write(f"Date: {_now_str()}\n")
             handle.write("=" * 50 + "\n\n")
@@ -501,6 +635,7 @@ class NautiljonScraper:
             handle.write(f"Erreurs: {self.session_stats.get('errors', 0)}\n")
             handle.write(f"Ignorées par type: {self.session_stats.get('skipped_by_type', 0)}\n")
             handle.write(f"Duree: {self.session_stats.get('duration', 'N/A')}\n")
+        os.replace(tmp_report_path, report_path)
         print(f"OK export final: {csv_path} ({len(rows)} lignes)")
         return {
             "json_path": json_path,
@@ -768,10 +903,10 @@ class NautiljonScraper:
         offset = page_num * 50
         encoded = quote_plus(query)
         candidates = [
+            f"{BASE_URL}/mangas/{encoded}.html",
             f"{BASE_URL}/mangas/?q={encoded}",
             f"{BASE_URL}/mangas/?search={encoded}",
             f"{BASE_URL}/mangas/?lettre={encoded}",
-            f"{BASE_URL}/mangas/{encoded}.html",
         ]
         if offset > 0:
             candidates = [self._url_with_dbt(url, page_num) for url in candidates]
@@ -788,17 +923,150 @@ class NautiljonScraper:
 
     def fetch_listing_page(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
         last_error = ""
+        accessible_empty_url = ""
         for url in self._listing_candidate_urls(letter, page_num):
             try:
                 html = self.fetch_html(url)
                 rows = self.extract_series_list_from_html(html)
                 if rows:
-                    return url, rows
-                last_error = "aucune entree"
+                    expected_tag = self._letter_tag(letter)
+                    matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
+                    if len(matching_rows) >= max(1, int(len(rows) * 0.8)):
+                        return url, matching_rows
+                    last_error = (
+                        f"resultats incoherents pour {self._letter_label(letter)} "
+                        f"({len(matching_rows)}/{len(rows)} correspondent)"
+                    )
+                    continue
+                if not self._search_session_expired(html):
+                    accessible_empty_url = accessible_empty_url or url
+                last_error = "page accessible sans entree"
             except Exception as exc:
                 last_error = str(exc)[:160]
                 continue
+        if accessible_empty_url:
+            return accessible_empty_url, []
         raise RuntimeError(f"Listing introuvable pour {letter} page {page_num}: {last_error}")
+
+    def _diagnose_endpoint(
+        self,
+        label: str,
+        url: str,
+        kind: str = "generic",
+        expected_letter: Optional[str] = None,
+        timeout: int = DEFAULT_DIAGNOSE_TIMEOUT,
+    ) -> Dict[str, object]:
+        result: Dict[str, object] = {
+            "label": label,
+            "url": url,
+            "ok": False,
+            "status_code": None,
+            "waf_blocked": False,
+        }
+        try:
+            response = requests.get(
+                url,
+                headers=dict(self.session.headers),
+                cookies=self.session.cookies.get_dict(),
+                timeout=timeout,
+            )
+            html = response.text
+            result.update({
+                "status_code": response.status_code,
+                "final_url": response.url,
+                "content_type": response.headers.get("content-type", ""),
+                "bytes": len(response.content),
+                "waf_blocked": self._blocked_by_waf(html),
+            })
+            if kind == "listing":
+                rows = self.extract_series_list_from_html(html) if response.ok and not result["waf_blocked"] else []
+                matching_rows = rows
+                if expected_letter:
+                    expected_tag = self._letter_tag(expected_letter)
+                    matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
+                result["rows"] = len(rows)
+                result["matching_rows"] = len(matching_rows)
+                result["ok"] = (
+                    response.ok
+                    and not result["waf_blocked"]
+                    and len(rows) > 0
+                    and len(matching_rows) >= max(1, int(len(rows) * 0.8))
+                )
+            elif kind == "detail":
+                detail = self.extract_series_detail_from_html(html) if response.ok and not result["waf_blocked"] else {}
+                useful = [value for key, value in detail.items() if key != "_titre_fr_fallback" and not _is_na(value)]
+                result["parsed_fields"] = len(useful)
+                result["ok"] = response.ok and not result["waf_blocked"] and len(useful) > 0
+            elif kind == "rss":
+                import xml.etree.ElementTree as ET
+
+                items = []
+                if response.ok:
+                    items = ET.fromstring(html).findall("./channel/item")
+                result["items"] = len(items)
+                result["ok"] = response.ok and len(items) > 0
+            else:
+                result["ok"] = response.ok and not result["waf_blocked"]
+        except Exception as exc:
+            result["error"] = str(exc)[:240]
+        return result
+
+    def diagnose(
+        self,
+        letter: str = "a",
+        detail_url: str = f"{BASE_URL}/mangas/one+piece.html",
+        rss_feed_urls: Optional[List[str]] = None,
+    ) -> Dict[str, object]:
+        print("=" * 60)
+        print("DIAGNOSTIC NAUTILJON - AUCUNE ECRITURE")
+        print("=" * 60)
+        checks: List[Tuple[str, str, str, Optional[str]]] = [
+            ("ip_sortie", "https://api.ipify.org?format=json", "generic", None),
+            ("robots", f"{BASE_URL}/robots.txt", "generic", None),
+            ("sitemap", f"{BASE_URL}/sitemap.xml", "generic", None),
+        ]
+        for index, url in enumerate(self._listing_candidate_urls(letter, 0), start=1):
+            checks.append((f"listing_{index}", url, "listing", letter))
+        checks.append(("fiche_connue", detail_url, "detail", None))
+        for index, feed_url in enumerate(rss_feed_urls or DEFAULT_RSS_FEEDS, start=1):
+            checks.append((f"rss_{index}", feed_url, "rss", None))
+
+        with ThreadPoolExecutor(max_workers=min(6, len(checks))) as executor:
+            futures = [
+                executor.submit(self._diagnose_endpoint, label, url, kind, expected_letter)
+                for label, url, kind, expected_letter in checks
+            ]
+            endpoints = [future.result() for future in futures]
+
+        egress_ok = any(item["label"] == "ip_sortie" and item["ok"] for item in endpoints)
+        listing_ok = any(str(item["label"]).startswith("listing_") and item["ok"] for item in endpoints)
+        detail_ok = any(item["label"] == "fiche_connue" and item["ok"] for item in endpoints)
+        rss_ok = any(str(item["label"]).startswith("rss_") and item["ok"] for item in endpoints)
+        ready_for_diff = egress_ok and listing_ok and detail_ok
+        report = {
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "egress_ok": egress_ok,
+            "listing_ok": listing_ok,
+            "detail_ok": detail_ok,
+            "rss_ok": rss_ok,
+            "ready_for_diff": ready_for_diff,
+            "endpoints": endpoints,
+        }
+
+        for item in endpoints:
+            status = "OK" if item["ok"] else "ECHEC"
+            suffix = " WAF/CLOUDFLARE" if item.get("waf_blocked") else ""
+            print(
+                f"{status:6} {str(item['label']):14} HTTP={item.get('status_code')}"
+                f" lignes={item.get('rows', '-')} champs={item.get('parsed_fields', '-')}{suffix}"
+            )
+        print("-" * 60)
+        if ready_for_diff:
+            print("VERDICT: PRET POUR UN DIFF CONTROLE")
+        else:
+            print("VERDICT: BLOQUE - NE PAS LANCER LE DIFF")
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return report
 
     def get_all_letters(self) -> List[str]:
         return [chr(i) for i in range(ord("a"), ord("z") + 1)] + ["%23"]
@@ -962,6 +1230,7 @@ class NautiljonScraper:
         refresh_stale_days: Optional[int] = None,
         drop_missing: bool = True,
         flush_every: int = 25,
+        resume: bool = True,
     ) -> List[Dict[str, str]]:
         label = self._letter_label(letter)
         tag = self._letter_tag(letter)
@@ -981,24 +1250,70 @@ class NautiljonScraper:
         seen_urls = set()
         page_num = 0
         empty_pages = 0
+        accessible_listing_pages = 0
         successful_listing_pages = 0
         listing_failed = False
         since_flush = 0
         counters = {"new": 0, "changed": 0, "stale": 0, "reused": 0, "removed": 0}
+        errors_before_letter = self.session_stats["errors"]
+        checkpoint_path = self._letter_checkpoint_path(tag)
+        letter_settings = {
+            "letter": letter,
+            "max_pages": max_pages,
+            "max_series": max_series,
+            "refresh_stale_days": refresh_stale_days,
+            "drop_missing": drop_missing,
+        }
+
+        if resume:
+            checkpoint = self._load_json_dict(checkpoint_path)
+            partial_rows = self._load_json_list(self._letter_paths(tag)[2])
+            if checkpoint and checkpoint.get("settings") == letter_settings and partial_rows:
+                updated_rows = [self._normalize_row(row) for row in partial_rows]
+                seen_urls = {
+                    _ensure_abs_url(row.get("url_fiche", ""))
+                    for row in updated_rows
+                    if row.get("url_fiche")
+                }
+                for url in seen_urls:
+                    existing_by_url.pop(url, None)
+                page_num = int(checkpoint.get("page_num", 0) or 0)
+                accessible_listing_pages = int(checkpoint.get("accessible_listing_pages", 0) or 0)
+                successful_listing_pages = int(checkpoint.get("successful_listing_pages", 0) or 0)
+                saved_counters = checkpoint.get("counters")
+                if isinstance(saved_counters, dict):
+                    counters.update({key: int(saved_counters.get(key, value) or 0) for key, value in counters.items()})
+                print(
+                    f"  Reprise lettre {label}: page {page_num + 1}, "
+                    f"{len(updated_rows)} serie(s) deja traitee(s)."
+                )
+
+        def save_checkpoint(next_page: int) -> None:
+            self.save_letter_files(tag, updated_rows, partial=True)
+            self._write_json_atomic(checkpoint_path, {
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "settings": letter_settings,
+                "page_num": next_page,
+                "accessible_listing_pages": accessible_listing_pages,
+                "successful_listing_pages": successful_listing_pages,
+                "counters": counters,
+            })
 
         while True:
             if max_pages is not None and page_num >= max_pages:
                 break
             try:
                 page_url, page_series = self.fetch_listing_page(letter, page_num)
+                accessible_listing_pages += 1
                 print(f"  Page {page_num + 1}: {len(page_series)} entrees ({page_url})")
             except Exception as exc:
                 empty_pages += 1
-                print(f"  Page {page_num + 1} indisponible ({empty_pages}/3): {str(exc)[:160]}")
+                print(f"  Page {page_num + 1} indisponible, tentative {empty_pages}/3: {str(exc)[:160]}")
+                save_checkpoint(page_num)
                 if empty_pages >= 3:
                     listing_failed = True
                     break
-                page_num += 1
+                self._sleep_delay()
                 continue
 
             if not page_series:
@@ -1007,12 +1322,13 @@ class NautiljonScraper:
                     break
             else:
                 successful_listing_pages += 1
-                empty_pages = 0
+                new_on_page = 0
                 for series in page_series:
                     url = _ensure_abs_url(series.get("url_fiche", ""))
                     if not url or url in seen_urls:
                         continue
                     seen_urls.add(url)
+                    new_on_page += 1
                     series["url_fiche"] = url
                     if self.is_banned_type(series.get("type_liste", "")):
                         self.session_stats["skipped_by_type"] += 1
@@ -1053,19 +1369,32 @@ class NautiljonScraper:
 
                     since_flush += 1
                     if flush_every and since_flush >= flush_every:
-                        self.save_letter_files(tag, updated_rows, partial=True)
+                        save_checkpoint(page_num)
                         since_flush = 0
 
-                self.save_letter_files(tag, updated_rows, partial=True)
+                save_checkpoint(page_num + 1)
+                if new_on_page == 0:
+                    empty_pages += 1
+                    print(f"  Page {page_num + 1} sans nouvelle URL ({empty_pages}/3).")
+                    if empty_pages >= 3:
+                        break
+                else:
+                    empty_pages = 0
                 if max_series is not None and len(updated_rows) >= max_series:
                     break
+
+            if not page_series:
+                save_checkpoint(page_num + 1)
 
             page_num += 1
             self._sleep_delay()
 
-        if successful_listing_pages == 0:
+        if accessible_listing_pages == 0:
             self.session_stats["errors"] += 1
-            existing_kept = sorted(existing_by_url.values(), key=lambda row: _norm(row.get("titre", "")))
+            existing_kept = sorted(
+                updated_rows + list(existing_by_url.values()),
+                key=lambda row: _norm(row.get("titre", "")),
+            )
             self.session_stats["series_by_letter"][label] = len(existing_kept)
             self.session_stats["total_series"] += len(existing_kept)
             self.session_stats["diff_by_letter"][label] = {
@@ -1085,18 +1414,39 @@ class NautiljonScraper:
                 print(f"  Listing {label} inaccessible: aucune donnee locale a mettre a jour.")
             return existing_kept
 
+        detail_failed = self.session_stats["errors"] > errors_before_letter
+        limited = max_pages is not None or max_series is not None
+        if listing_failed or detail_failed or limited:
+            safe_rows = sorted(
+                updated_rows + list(existing_by_url.values()),
+                key=lambda row: _norm(row.get("titre", "")),
+            )
+            counters["listing_failed"] = listing_failed
+            counters["detail_failed"] = detail_failed
+            counters["limited"] = limited
+            self.session_stats["series_by_letter"][label] = len(safe_rows)
+            self.session_stats["total_series"] += len(safe_rows)
+            self.session_stats["diff_by_letter"][label] = counters
+            if listing_failed:
+                print("  Fin de listing incertaine: fichier final inchange, checkpoint conserve.")
+            elif detail_failed:
+                print("  Detail(s) inaccessible(s): fichier final inchange, checkpoint conserve.")
+            else:
+                print("  Execution limitee: fichier final inchange, checkpoint conserve.")
+            return safe_rows
+
         if not drop_missing and existing_by_url:
             updated_rows.extend(existing_by_url.values())
         else:
-            if listing_failed:
-                print("  Fin de listing incertaine: les entrees absentes sont conservees.")
-                updated_rows.extend(existing_by_url.values())
-            else:
-                counters["removed"] = len(existing_by_url)
+            counters["removed"] = len(existing_by_url)
 
         updated_rows = sorted(updated_rows, key=lambda row: _norm(row.get("titre", "")))
         self.save_letter_files(tag, updated_rows, partial=False)
         self._remove_partial_files(tag)
+        self._remove_checkpoint(checkpoint_path)
+        counters["listing_failed"] = False
+        counters["detail_failed"] = False
+        counters["limited"] = False
         self.session_stats["series_by_letter"][label] = len(updated_rows)
         self.session_stats["total_series"] += len(updated_rows)
         self.session_stats["diff_by_letter"][label] = counters
@@ -1118,42 +1468,80 @@ class NautiljonScraper:
         drop_missing: bool = True,
         min_days_between_diff_exports: int = 30,
         abort_after_listing_failures: int = 1,
-        rss_fallback: bool = True,
-        rss_feed_urls: Optional[List[str]] = None,
-        merge_rss_candidates: bool = False,
+        flush_every: int = 25,
+        resume: bool = True,
         force: bool = False,
-    ) -> List[Dict[str, str]]:
+    ) -> RunResult:
+        all_catalog_letters = self.get_all_letters()
+        letters_to_scrape = letters or all_catalog_letters
+        requested_labels = [self._letter_label(letter) for letter in letters_to_scrape]
+        full_catalog_requested = (
+            set(letters_to_scrape) == set(all_catalog_letters)
+            and len(letters_to_scrape) == len(all_catalog_letters)
+            and max_pages_per_letter is None
+            and max_series_per_letter is None
+        )
         should_skip, last_success, age = self.should_skip_recent_success("diff", min_days_between_diff_exports)
-        if should_skip and not force and last_success and age is not None:
+        if full_catalog_requested and should_skip and not force and last_success and age is not None:
             print(
                 "Diff ignore: dernier diff finalise le "
                 f"{last_success.get('completed_at')} ({age.days} jours)."
             )
-            return []
+            result = RunResult(
+                status="skipped",
+                reason="recent_complete_export",
+                rows_count=int(last_success.get("rows_count", 0) or 0),
+                requested_letters=requested_labels,
+                completed_letters=requested_labels,
+                export_paths=dict(last_success.get("export_paths", {})),
+            )
+            self.mark_run_state("diff", result)
+            return result
 
         self.session_stats["start_time"] = datetime.now()
-        letters_to_scrape = letters or self.get_all_letters()
-        all_rows: List[Dict[str, str]] = []
+        config = self._diff_run_config(
+            letters_to_scrape,
+            max_pages_per_letter,
+            max_series_per_letter,
+            refresh_stale_days,
+            drop_missing,
+        )
+        completed_letters = self._load_diff_run_checkpoint(config, resume)
         fatal_error = False
         aborted_listing_failures = False
+        incomplete_reason = ""
         consecutive_listing_failures = 0
         try:
             for index, letter in enumerate(letters_to_scrape, start=1):
+                label = self._letter_label(letter)
+                if label in completed_letters:
+                    print(f"\nProgression: {index}/{len(letters_to_scrape)} - lettre {label} deja finalisee, ignoree")
+                    continue
                 print(f"\nProgression: {index}/{len(letters_to_scrape)}")
-                rows = self.scrape_letter_diff(
+                self.scrape_letter_diff(
                     letter,
                     max_pages=max_pages_per_letter,
                     max_series=max_series_per_letter,
                     refresh_stale_days=refresh_stale_days,
                     drop_missing=drop_missing,
+                    flush_every=flush_every,
+                    resume=resume,
                 )
-                all_rows.extend(rows)
-                label = self._letter_label(letter)
                 diff_stats = self.session_stats["diff_by_letter"].get(label, {})
+                letter_incomplete = bool(
+                    diff_stats.get("listing_failed")
+                    or diff_stats.get("detail_failed")
+                    or diff_stats.get("limited")
+                )
+                if not letter_incomplete:
+                    completed_letters.append(label)
+                    self._save_diff_run_checkpoint(config, completed_letters)
                 if diff_stats.get("listing_failed"):
+                    incomplete_reason = "listing_inaccessible"
                     consecutive_listing_failures += 1
                     if abort_after_listing_failures > 0 and consecutive_listing_failures >= abort_after_listing_failures:
                         aborted_listing_failures = True
+                        incomplete_reason = "listing_inaccessible"
                         print(
                             "Diff interrompu: "
                             f"{consecutive_listing_failures} listing(s) consecutif(s) inaccessible(s). "
@@ -1162,36 +1550,80 @@ class NautiljonScraper:
                         break
                 else:
                     consecutive_listing_failures = 0
+                if diff_stats.get("detail_failed"):
+                    incomplete_reason = "detail_inaccessible"
+                    print("Diff interrompu: au moins une fiche detail est inaccessible.")
+                    break
+                if diff_stats.get("limited"):
+                    incomplete_reason = "execution_limited"
+                    break
                 if index < len(letters_to_scrape):
                     pause = self._compute_delay(multiplier=3)
                     print(f"Pause {pause:.1f}s avant la lettre suivante")
                     time.sleep(pause)
         except Exception as exc:
             fatal_error = True
+            incomplete_reason = "fatal_error"
+            self.session_stats["errors"] += 1
             print(f"Erreur fatale: {exc}")
         finally:
             self.session_stats["end_time"] = datetime.now()
             if self.session_stats["start_time"]:
                 self.session_stats["duration"] = str(self.session_stats["end_time"] - self.session_stats["start_time"])
-            if aborted_listing_failures and rss_fallback:
+        combined = self.concat_letters()
+        all_requested_completed = set(completed_letters) == set(requested_labels)
+        export_paths: Dict[str, str] = {}
+        status = "failed"
+        reason = incomplete_reason or "incomplete_run"
+
+        if all_requested_completed and full_catalog_requested and not fatal_error and self.session_stats.get("errors", 0) == 0:
+            if not self._validate_final_letter_files(letters_to_scrape):
+                reason = "final_letter_files_invalid"
+            else:
                 try:
-                    print("Decouverte RSS apres blocage des listings...")
-                    self.discover_rss_candidates(feed_urls=rss_feed_urls, merge_candidates=merge_rss_candidates)
+                    export_paths = self.export_all_data(
+                        combined,
+                        base_filename=f"nautiljon_diff_concat_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    )
+                    if combined and self._validate_final_exports(export_paths):
+                        status = "success"
+                        reason = "complete_catalog_exported"
+                    else:
+                        reason = "final_export_invalid"
                 except Exception as exc:
                     self.session_stats["errors"] += 1
-                    print(f"Erreur decouverte RSS: {str(exc)[:160]}")
-            combined = self.concat_letters()
-            export_paths: Dict[str, str] = {}
-            if combined and not aborted_listing_failures:
-                export_paths = self.export_all_data(combined, base_filename=f"nautiljon_diff_concat_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-            if combined and not fatal_error and self.session_stats.get("errors", 0) == 0:
-                self.mark_success("diff", len(combined), export_paths)
-        return all_rows
+                    reason = "final_export_failed"
+                    print(f"Erreur export final: {str(exc)[:180]}")
+        elif all_requested_completed and not full_catalog_requested:
+            status = "partial"
+            reason = "controlled_subset_complete"
+        elif completed_letters:
+            status = "partial"
+        elif aborted_listing_failures:
+            reason = "listing_inaccessible"
+
+        result = RunResult(
+            status=status,
+            reason=reason,
+            rows_count=len(combined),
+            requested_letters=requested_labels,
+            completed_letters=completed_letters,
+            export_paths=export_paths,
+        )
+        if status == "success":
+            self.mark_success("diff", len(combined), export_paths)
+            self._remove_checkpoint(self._state_path("diff_checkpoint"))
+        elif all_requested_completed:
+            self._remove_checkpoint(self._state_path("diff_checkpoint"))
+        self.mark_run_state("diff", result)
+        return result
 
     def probe_discovery(self, letters: Optional[List[str]] = None, max_pages: int = 1) -> None:
         for letter in letters or ["a"]:
             for page_num in range(max_pages):
                 url, rows = self.fetch_listing_page(letter, page_num)
+                if not rows:
+                    raise RuntimeError(f"Listing accessible mais vide pour {self._letter_label(letter)} page {page_num + 1}")
                 print(f"{self._letter_label(letter)} page {page_num + 1}: {len(rows)} lignes via {url}")
 
 
@@ -1217,7 +1649,6 @@ def _parse_csv_list(raw: Optional[str]) -> Optional[List[str]]:
 
 def _new_scraper(args: argparse.Namespace) -> NautiljonScraper:
     out_dir = args.out_dir or os.environ.get("NAUTILJON_OUT_DIR", "./output")
-    os.makedirs(out_dir, exist_ok=True)
     delay = args.delay if args.delay is not None else _env_float("NAUTILJON_DELAY", 2.0)
     delay_min = args.delay_min
     delay_max = args.delay_max
@@ -1249,10 +1680,9 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--keep-missing", action="store_true", default=not _env_bool("NAUTILJON_DROP_MISSING", True))
     diff.add_argument("--min-days-between-diff-exports", type=int, default=_env_int("NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS", 30))
     diff.add_argument("--abort-after-listing-failures", type=int, default=_env_int("NAUTILJON_ABORT_AFTER_LISTING_FAILURES", 1))
-    diff.add_argument("--rss-fallback", dest="rss_fallback", action="store_true", default=_env_bool("NAUTILJON_RSS_FALLBACK", True))
-    diff.add_argument("--no-rss-fallback", dest="rss_fallback", action="store_false")
-    diff.add_argument("--rss-feeds", default=os.environ.get("NAUTILJON_RSS_FEEDS"))
-    diff.add_argument("--merge-rss-candidates", action="store_true", default=_env_bool("NAUTILJON_MERGE_RSS_CANDIDATES", False))
+    diff.add_argument("--flush-every", type=int, default=_env_int("NAUTILJON_FLUSH_EVERY", 25))
+    diff.add_argument("--resume", dest="resume", action="store_true", default=_env_bool("NAUTILJON_RESUME", True))
+    diff.add_argument("--no-resume", dest="resume", action="store_false")
     diff.add_argument("--force", action="store_true", default=_env_bool("NAUTILJON_FORCE_SCRAPE", False))
 
     rss = sub.add_parser("discover-rss", help="Decouvre des candidats de nouvelles fiches depuis les flux RSS.")
@@ -1262,6 +1692,14 @@ def _build_parser() -> argparse.ArgumentParser:
     probe = sub.add_parser("probe-discovery", help="Teste la decouverte HTTP des listings sans Selenium.")
     probe.add_argument("--letters", default=os.environ.get("NAUTILJON_LETTERS", "a"))
     probe.add_argument("--max-pages", type=int, default=1)
+
+    diagnose = sub.add_parser("diagnose", help="Teste le reseau, les listings et une fiche sans ecrire de donnees.")
+    diagnose.add_argument("--letter", default=os.environ.get("NAUTILJON_DIAGNOSE_LETTER", "a"))
+    diagnose.add_argument(
+        "--detail-url",
+        default=os.environ.get("NAUTILJON_DIAGNOSE_DETAIL_URL", f"{BASE_URL}/mangas/one+piece.html"),
+    )
+    diagnose.add_argument("--rss-feeds", default=os.environ.get("NAUTILJON_RSS_FEEDS"))
 
     sub.add_parser("selftest", help="Tests parser hors reseau.")
     return parser
@@ -1327,7 +1765,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         else:
             print("Aucune lettre JSON trouvee.")
     elif command == "diff":
-        scraper.scrape_all_letters_diff(
+        result = scraper.scrape_all_letters_diff(
             letters=_parse_letters(args.letters),
             max_pages_per_letter=args.max_pages_per_letter,
             max_series_per_letter=args.max_series_per_letter,
@@ -1335,11 +1773,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             drop_missing=not args.keep_missing,
             min_days_between_diff_exports=args.min_days_between_diff_exports,
             abort_after_listing_failures=args.abort_after_listing_failures,
-            rss_fallback=args.rss_fallback,
-            rss_feed_urls=_parse_csv_list(args.rss_feeds),
-            merge_rss_candidates=args.merge_rss_candidates,
+            flush_every=args.flush_every,
+            resume=args.resume,
             force=args.force,
         )
+        raise SystemExit(result.exit_code)
     elif command == "discover-rss":
         scraper.discover_rss_candidates(
             feed_urls=_parse_csv_list(args.rss_feeds),
@@ -1347,6 +1785,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
     elif command == "probe-discovery":
         scraper.probe_discovery(letters=_parse_letters(args.letters), max_pages=args.max_pages)
+    elif command == "diagnose":
+        report = scraper.diagnose(
+            letter=args.letter,
+            detail_url=args.detail_url,
+            rss_feed_urls=_parse_csv_list(args.rss_feeds),
+        )
+        raise SystemExit(0 if report["ready_for_diff"] else 1)
     else:
         parser.error(f"Commande inconnue: {command}")
 

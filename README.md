@@ -1,114 +1,69 @@
-# Nautiljon scraper
+# Nautiljon Scraper
 
-HTTP scraper for Nautiljon manga data, designed to run without Selenium.
+Scraper HTTP des fiches manga Nautiljon, sans Selenium. Il importe les CSV
+existants, maintient des fichiers par lettre et peut produire un diff mensuel
+avec reprise apres interruption.
 
-It can import existing CSV exports from `output/letters/`, rebuild per-letter JSON
-files, then run a monthly diff that discovers listing entries and refreshes only
-new, changed, or stale detail pages.
-
-## Commands
+## Commandes
 
 ```bash
 python scraper_nautiljon.py selftest
 python scraper_nautiljon.py import-csv
+python scraper_nautiljon.py diagnose
 python scraper_nautiljon.py probe-discovery --letters a --max-pages 1
 python scraper_nautiljon.py diff
+python scraper_nautiljon.py discover-rss
 python scraper_nautiljon.py concat
 ```
 
-Expected NAS layout:
+Consultez [DEPLOYMENT.md](DEPLOYMENT.md) pour le protocole Portainer complet.
+
+## Images GHCR
 
 ```text
-/media/nvme0n1p1/AppData/NautiljonScraper/output/
-├─ letters/
-│  ├─ existing CSV files
-│  ├─ nautiljon_lettre_A.json
-│  └─ ...
-├─ exports/
-├─ checkpoints/
-├─ state/
-└─ debug/
+ghcr.io/hitman47/nautiljon-scraper:latest  # production, branche main
+ghcr.io/hitman47/nautiljon-scraper:test    # validation, branches codex/*
 ```
 
-The initial import reads CSV files directly from `output/letters/`; no separate
-input folder is needed.
-
-## Docker
-
-```bash
-docker build -t nautiljon-scraper .
-docker run --rm -v /media/nvme0n1p1/AppData/NautiljonScraper/output:/data/output nautiljon-scraper import-csv
-docker run --rm -v /media/nvme0n1p1/AppData/NautiljonScraper/output:/data/output nautiljon-scraper diff
-```
-
-## GHCR
-
-The GitHub Actions workflow publishes:
+## Organisation des donnees
 
 ```text
-ghcr.io/hitman47/nautiljon-scraper:latest
+output/
+|-- letters/       CSV et JSON finalises par lettre
+|-- checkpoints/   reprise de la page et de la lettre en cours
+|-- exports/       exports consolides finalises
+|-- discovery/     candidats RSS non exhaustifs
+`-- state/         dernier run et dernier succes complet
 ```
 
-## Portainer
+Le fichier `state/last_diff_success.json` n'est ecrit qu'apres un passage sans
+erreur sur les 27 lettres et apres validation des exports. Un essai limite ou
+interrompu ecrit `state/last_diff_run.json` avec l'etat `PARTIAL` ou `FAILED`.
 
-Use `portainer-stack.yml`, or merge its `nautiljon` service into the same stack as
-Bedetheque.
-
-Recommended variables:
+## Variables principales
 
 ```text
 GLUETUN_CONTAINER=GlueTun-Nord_WG
 NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
-NAUTILJON_COMMAND=diff
+NAUTILJON_COMMAND=diagnose
 NAUTILJON_DELAY_MIN=2.0
 NAUTILJON_DELAY_MAX=5.0
+NAUTILJON_RESUME=true
+NAUTILJON_FLUSH_EVERY=25
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
-NAUTILJON_RSS_FALLBACK=true
-NAUTILJON_RSS_FEEDS=http://feeds.feedburner.com/nautiljon/NdFI
-NAUTILJON_MERGE_RSS_CANDIDATES=false
 NAUTILJON_REFRESH_STALE_DAYS=180
 NAUTILJON_CPUS=1.0
 NAUTILJON_MEM_LIMIT=256m
 NAUTILJON_MEMSWAP_LIMIT=256m
 ```
 
-First run after placing CSV files in `output/letters/`:
+## Garanties
 
-```text
-NAUTILJON_COMMAND=import-csv
-```
-
-Then switch back to:
-
-```text
-NAUTILJON_COMMAND=diff
-```
-
-For a cautious discovery test:
-
-```text
-NAUTILJON_COMMAND=probe-discovery
-NAUTILJON_LETTERS=a
-```
-
-To discover recent manga candidates from Nautiljon RSS without touching the
-letter exports:
-
-```text
-NAUTILJON_COMMAND=discover-rss
-```
-
-## Notes
-
-- No Selenium or browser is used.
-- Missing values are exported as `N/A`.
-- CSV files use `;` and `utf-8-sig`.
-- Only `yaoi` and `yuri` are filtered.
-- If Nautiljon blocks direct HTTP listings, `probe-discovery` will fail cleanly;
-  the existing CSV import and concat still work.
-- During `diff`, `NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1` stops the run after
-  the first fully inaccessible letter. Set it to `0` to disable this guard.
-- When listings are blocked, `NAUTILJON_RSS_FALLBACK=true` writes probable new
-  manga fiches to `output/discovery/nautiljon_rss_candidates.csv`. They stay out
-  of the main export unless `NAUTILJON_MERGE_RSS_CANDIDATES=true`.
+- `diagnose` ne cree et ne modifie aucun fichier.
+- Les CSV utilisent `;` et `utf-8-sig`.
+- Seuls `yaoi` et `yuri` sont exclus.
+- Les ecritures finales utilisent des fichiers temporaires puis un remplacement.
+- Une erreur de listing ou de detail ne remplace pas le fichier final de la lettre.
+- Le RSS reste separe du diff et ne peut pas valider un export mensuel.
+- Le conteneur est limite par le compose a 1 CPU et 256 Mio de RAM.

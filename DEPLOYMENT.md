@@ -1,75 +1,110 @@
-# Deployment
+# Protocole Portainer
 
-## Initial import
+Le scraper est un conteneur ponctuel : il execute une commande, puis s'arrete.
+Dans Portainer, changez `NAUTILJON_COMMAND`, mettez a jour la stack et consultez
+les logs du conteneur `nautiljon-scraper`.
 
-Put your existing CSV files in:
+## 1. Repertoire de test
+
+Les premiers essais ne doivent pas modifier la production. Creez :
 
 ```text
-/media/nvme0n1p1/AppData/NautiljonScraper/output/letters/
+/media/nvme0n1p1/AppData/NautiljonScraper/test-output/letters/
 ```
 
-Deploy the Portainer service with:
+Copiez-y les CSV par lettre, puis utilisez ces variables de stack :
+
+```text
+NAUTILJON_IMAGE=ghcr.io/hitman47/nautiljon-scraper:test
+NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/test-output
+GLUETUN_CONTAINER=GlueTun-Nord_WG
+```
+
+## 2. Import de reference
 
 ```text
 NAUTILJON_COMMAND=import-csv
 ```
 
-This creates per-letter JSON files beside the CSV files and writes a consolidated
-export under `output/exports/`.
+Le conteneur doit sortir avec le code `0`. Les logs doivent annoncer le nombre
+d'URL uniques et ne contenir aucune erreur `CSV illisible`.
 
-## Discovery probe
-
-Before enabling the monthly diff, test whether Nautiljon listings are reachable
-without Selenium:
+## 3. Diagnostic obligatoire
 
 ```text
-NAUTILJON_COMMAND=probe-discovery
-NAUTILJON_LETTERS=a
+NAUTILJON_COMMAND=diagnose
+NAUTILJON_DIAGNOSE_LETTER=a
+NAUTILJON_DIAGNOSE_DETAIL_URL=https://www.nautiljon.com/mangas/one+piece.html
 ```
 
-Expected result: logs show at least one discovered listing page and a non-zero
-number of rows.
+Cette commande ne modifie aucun fichier. Elle teste l'IP de sortie, `robots.txt`,
+le sitemap, quatre routes de listing, une fiche connue et le RSS.
 
-## Monthly diff
+Le seul resultat autorisant la suite est :
 
-Use:
+```text
+VERDICT: PRET POUR UN DIFF CONTROLE
+```
+
+`VERDICT: BLOQUE - NE PAS LANCER LE DIFF` et un code de sortie `1` signifient
+que Cloudflare ou le reseau bloque encore le scraper.
+
+## 4. Diff controle
+
+Cette etape n'est autorisee que si le diagnostic est vert :
 
 ```text
 NAUTILJON_COMMAND=diff
-NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
-NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
-NAUTILJON_RSS_FALLBACK=true
-NAUTILJON_RSS_FEEDS=http://feeds.feedburner.com/nautiljon/NdFI
-NAUTILJON_MERGE_RSS_CANDIDATES=false
-NAUTILJON_REFRESH_STALE_DAYS=180
+NAUTILJON_LETTERS=a
+NAUTILJON_FORCE_SCRAPE=true
+NAUTILJON_DROP_MISSING=false
 ```
 
-The diff:
+Un sous-ensemble de lettres se termine volontairement avec l'etat `PARTIAL`.
+Il ne produit jamais de marqueur mensuel ni d'export presente comme complet.
 
-- reads existing per-letter JSON files,
-- discovers listing entries for each letter,
-- adds new fiches,
-- refreshes changed listing entries,
-- refreshes stale detail pages,
-- writes updated letter JSON/CSV,
-- writes a final export,
-- writes `output/state/last_diff_success.json`.
+## 5. Diff mensuel complet
 
-Set `NAUTILJON_FORCE_SCRAPE=true` to ignore the 30-day protection once.
-Set `NAUTILJON_ABORT_AFTER_LISTING_FAILURES=0` only if you want the diff to
-continue through all letters even when listings are blocked.
+Retirez `NAUTILJON_LETTERS` ou laissez cette variable vide, puis utilisez :
 
-If listings are blocked, RSS fallback still writes probable new manga fiches to
-`output/discovery/nautiljon_rss_candidates.csv`. Keep
-`NAUTILJON_MERGE_RSS_CANDIDATES=false` unless you accept incomplete, unverified
-rows in the per-letter exports.
+```text
+NAUTILJON_COMMAND=diff
+NAUTILJON_FORCE_SCRAPE=false
+NAUTILJON_DROP_MISSING=true
+NAUTILJON_RESUME=true
+NAUTILJON_FLUSH_EVERY=25
+NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
+NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
+```
 
-## Same Gluetun as Bedetheque
+Un succes exige les 27 lettres, des fichiers finaux valides, aucune erreur de
+listing ou de detail et quatre fichiers d'export non vides. Il ecrit :
 
-The service uses:
+```text
+output/state/last_diff_run.json
+output/state/last_diff_success.json
+```
+
+Un echec ou une interruption conserve les checkpoints et ecrit seulement
+`last_diff_run.json` avec l'etat `FAILED` ou `PARTIAL`. Le redemarrage reprend la
+lettre et la page en cours, puis ignore les lettres deja finalisees.
+
+## 6. RSS separe
+
+```text
+NAUTILJON_COMMAND=discover-rss
+NAUTILJON_MERGE_RSS_CANDIDATES=false
+```
+
+Le RSS produit uniquement `output/discovery/nautiljon_rss_candidates.*`. Il
+n'est pas exhaustif et ne fait jamais partie du verdict du diff mensuel.
+
+## Reseau et ressources
+
+Le service partage la pile reseau de Gluetun :
 
 ```yaml
 network_mode: "container:${GLUETUN_CONTAINER:-GlueTun-Nord_WG}"
 ```
 
-No `ports:` or `networks:` should be added to this service.
+Il reste limite a 1 CPU, 256 Mio de RAM et 256 Mio de memoire totale avec swap.
