@@ -3,6 +3,7 @@ import os
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 from scraper_nautiljon import NautiljonScraper
 
@@ -166,7 +167,7 @@ class DiffStateTests(unittest.TestCase):
             scraper = self.make_scraper(out_dir)
 
             def fake_endpoint(this, label, url, kind="generic", expected_letter=None):
-                return {
+                result = {
                     "label": label,
                     "url": url,
                     "ok": True,
@@ -175,12 +176,37 @@ class DiffStateTests(unittest.TestCase):
                     "rows": 50 if kind == "listing" else None,
                     "parsed_fields": 10 if kind == "detail" else None,
                 }
+                if kind == "ip":
+                    result["public_ip"] = "203.0.113.10"
+                return result
 
             scraper._diagnose_endpoint = types.MethodType(fake_endpoint, scraper)
             report = scraper.diagnose()
 
             self.assertTrue(report["ready_for_diff"])
+            self.assertEqual(report["public_ip"], "203.0.113.10")
             self.assertFalse(os.path.exists(out_dir))
+
+    def test_ip_diagnostic_reports_public_ip(self):
+        scraper = self.make_scraper("unused")
+        response = mock.Mock()
+        response.text = '{"ip":"198.51.100.42"}'
+        response.content = response.text.encode("utf-8")
+        response.status_code = 200
+        response.ok = True
+        response.url = "https://api.ipify.org/?format=json"
+        response.headers = {"content-type": "application/json"}
+        response.json.return_value = {"ip": "198.51.100.42"}
+
+        with mock.patch("scraper_nautiljon.requests.get", return_value=response):
+            result = scraper._diagnose_endpoint(
+                "ip_sortie",
+                "https://api.ipify.org?format=json",
+                kind="ip",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["public_ip"], "198.51.100.42")
 
 
 if __name__ == "__main__":

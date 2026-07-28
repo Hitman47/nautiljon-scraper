@@ -37,7 +37,7 @@ NAUTILJON_DIAGNOSE_LETTER=a
 NAUTILJON_DIAGNOSE_DETAIL_URL=https://www.nautiljon.com/mangas/one+piece.html
 ```
 
-Cette commande ne modifie aucun fichier. Elle teste l'IP de sortie, `robots.txt`,
+Cette commande ne modifie aucun fichier. Elle affiche l'IP publique de sortie et teste `robots.txt`,
 le sitemap, quatre routes de listing, une fiche connue et le RSS.
 
 Le seul resultat autorisant la suite est :

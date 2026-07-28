@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html as html_lib
+import ipaddress
 import json
 import os
 import random
@@ -992,6 +993,15 @@ class NautiljonScraper:
                     and len(rows) > 0
                     and len(matching_rows) >= max(1, int(len(rows) * 0.8))
                 )
+            elif kind == "ip":
+                public_ip = ""
+                if response.ok:
+                    try:
+                        public_ip = str(ipaddress.ip_address(response.json().get("ip", "")))
+                    except (TypeError, ValueError):
+                        public_ip = ""
+                result["public_ip"] = public_ip
+                result["ok"] = response.ok and bool(public_ip)
             elif kind == "detail":
                 detail = self.extract_series_detail_from_html(html) if response.ok and not result["waf_blocked"] else {}
                 useful = [value for key, value in detail.items() if key != "_titre_fr_fallback" and not _is_na(value)]
@@ -1021,7 +1031,7 @@ class NautiljonScraper:
         print("DIAGNOSTIC NAUTILJON - AUCUNE ECRITURE")
         print("=" * 60)
         checks: List[Tuple[str, str, str, Optional[str]]] = [
-            ("ip_sortie", "https://api.ipify.org?format=json", "generic", None),
+            ("ip_sortie", "https://api.ipify.org?format=json", "ip", None),
             ("robots", f"{BASE_URL}/robots.txt", "generic", None),
             ("sitemap", f"{BASE_URL}/sitemap.xml", "generic", None),
         ]
@@ -1042,9 +1052,12 @@ class NautiljonScraper:
         listing_ok = any(str(item["label"]).startswith("listing_") and item["ok"] for item in endpoints)
         detail_ok = any(item["label"] == "fiche_connue" and item["ok"] for item in endpoints)
         rss_ok = any(str(item["label"]).startswith("rss_") and item["ok"] for item in endpoints)
+        ip_result = next((item for item in endpoints if item["label"] == "ip_sortie"), {})
+        public_ip = str(ip_result.get("public_ip", "")) or "INCONNUE"
         ready_for_diff = egress_ok and listing_ok and detail_ok
         report = {
             "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "public_ip": public_ip,
             "egress_ok": egress_ok,
             "listing_ok": listing_ok,
             "detail_ok": detail_ok,
@@ -1056,9 +1069,10 @@ class NautiljonScraper:
         for item in endpoints:
             status = "OK" if item["ok"] else "ECHEC"
             suffix = " WAF/CLOUDFLARE" if item.get("waf_blocked") else ""
+            ip_suffix = f" IP={item['public_ip']}" if item.get("public_ip") else ""
             print(
                 f"{status:6} {str(item['label']):14} HTTP={item.get('status_code')}"
-                f" lignes={item.get('rows', '-')} champs={item.get('parsed_fields', '-')}{suffix}"
+                f" lignes={item.get('rows', '-')} champs={item.get('parsed_fields', '-')}{ip_suffix}{suffix}"
             )
         print("-" * 60)
         if ready_for_diff:
@@ -1066,6 +1080,13 @@ class NautiljonScraper:
         else:
             print("VERDICT: BLOQUE - NE PAS LANCER LE DIFF")
         print(json.dumps(report, ensure_ascii=False, indent=2))
+        print("=" * 60)
+        print(f"IP SORTIE VPN: {public_ip}")
+        print(f"LISTINGS: {'OK' if listing_ok else 'BLOQUES'} | FICHE: {'OK' if detail_ok else 'BLOQUEE'}")
+        if ready_for_diff:
+            print("VERDICT FINAL: PRET POUR UN DIFF CONTROLE")
+        else:
+            print("VERDICT FINAL: BLOQUE - NE PAS LANCER LE DIFF")
         return report
 
     def get_all_letters(self) -> List[str]:
