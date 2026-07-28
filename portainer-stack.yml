@@ -3,9 +3,15 @@ services:
     image: "${NAUTILJON_IMAGE:-ghcr.io/hitman47/nautiljon-scraper:latest}"
     container_name: nautiljon-scraper
     network_mode: "container:${GLUETUN_CONTAINER:-GlueTun-Nord_WG}"
-    command: ["${NAUTILJON_COMMAND:-diff}"]
+    command: ["${NAUTILJON_COMMAND:-browser-test}"]
     environment:
       NAUTILJON_OUT_DIR: /data/output
+      NAUTILJON_BACKEND: "${NAUTILJON_BACKEND:-selenium}"
+      NAUTILJON_BROWSER_HEADLESS: "${NAUTILJON_BROWSER_HEADLESS:-false}"
+      NAUTILJON_BROWSER_PROFILE: /data/browser-profile
+      NAUTILJON_CHROME_BINARY: /usr/bin/chromium
+      NAUTILJON_CHROMEDRIVER: /usr/bin/chromedriver
+      NAUTILJON_CLOUDFLARE_WAIT_SECONDS: "${NAUTILJON_CLOUDFLARE_WAIT_SECONDS:-30}"
       NAUTILJON_DELAY: "${NAUTILJON_DELAY:-2.0}"
       NAUTILJON_DELAY_MIN: "${NAUTILJON_DELAY_MIN:-2.0}"
       NAUTILJON_DELAY_MAX: "${NAUTILJON_DELAY_MAX:-5.0}"
@@ -23,7 +29,9 @@ services:
       NAUTILJON_LETTERS: "${NAUTILJON_LETTERS:-}"
     volumes:
       - "${NAUTILJON_HOST_OUTPUT:-/media/nvme0n1p1/AppData/NautiljonScraper/output}:/data/output"
+      - "${NAUTILJON_HOST_BROWSER_PROFILE:-/media/nvme0n1p1/AppData/NautiljonScraper/browser-profile}:/data/browser-profile"
     cpus: "${NAUTILJON_CPUS:-1.0}"
-    mem_limit: "${NAUTILJON_MEM_LIMIT:-256m}"
-    memswap_limit: "${NAUTILJON_MEMSWAP_LIMIT:-256m}"
+    mem_limit: "${NAUTILJON_MEM_LIMIT:-1g}"
+    memswap_limit: "${NAUTILJON_MEMSWAP_LIMIT:-1g}"
+    shm_size: "${NAUTILJON_SHM_SIZE:-512m}"
     restart: "no"

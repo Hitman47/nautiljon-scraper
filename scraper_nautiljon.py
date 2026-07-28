@@ -21,6 +21,13 @@ from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, ur
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from urllib3.util.retry import Retry
 
 
@@ -179,11 +186,17 @@ class NautiljonScraper:
         delay: float = 2.0,
         delay_min: Optional[float] = None,
         delay_max: Optional[float] = None,
+        backend: str = "selenium",
+        browser_headless: bool = False,
     ):
         self.out_dir = out_dir
         self.delay = delay
         self.delay_min = delay_min
         self.delay_max = delay_max
+        self.backend = backend.strip().lower()
+        self.browser_headless = browser_headless
+        self.driver: Optional[webdriver.Chrome] = None
+        self._browser_letter_urls: Dict[str, str] = {}
         self.session = self._build_session()
         self.session_stats = {
             "total_series": 0,
@@ -777,7 +790,312 @@ class NautiljonScraper:
         normalized["url_fiche"] = _ensure_abs_url(normalized.get("url_fiche", ""))
         return normalized
 
+    def setup_browser(self) -> webdriver.Chrome:
+        if self.driver:
+            return self.driver
+
+        debug_dir = os.path.join(self.out_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        log_path = os.path.join(debug_dir, f"chromedriver_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        profile_dir = os.environ.get(
+            "NAUTILJON_BROWSER_PROFILE",
+            os.path.join(self.out_dir, "browser-profile"),
+        )
+        os.makedirs(profile_dir, exist_ok=True)
+
+        options = webdriver.ChromeOptions()
+        browser_binary = os.environ.get("NAUTILJON_CHROME_BINARY", "/usr/bin/chromium")
+        if os.path.isfile(browser_binary):
+            options.binary_location = browser_binary
+        if self.browser_headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--window-size=1365,900")
+        options.add_argument("--lang=fr-FR")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-session-crashed-bubble")
+        options.add_argument("--disable-features=Translate,MediaRouter")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-sync")
+        options.add_argument("--remote-allow-origins=*")
+        options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")
+        options.add_experimental_option("prefs", {
+            "intl.accept_languages": "fr-FR,fr,en-US,en",
+            "profile.default_content_setting_values.notifications": 2,
+            "profile.exit_type": "Normal",
+            "profile.exited_cleanly": True,
+        })
+
+        driver_binary = os.environ.get("NAUTILJON_CHROMEDRIVER", "/usr/bin/chromedriver")
+        service = ChromeService(
+            executable_path=driver_binary if os.path.isfile(driver_binary) else None,
+            log_output=log_path,
+        )
+        print(f"Navigateur Selenium: chromium ({'headless' if self.browser_headless else 'Xvfb visible'})")
+        print(f"Profil persistant: {profile_dir}")
+        print(f"Log ChromeDriver: {log_path}")
+        try:
+            self.driver = webdriver.Chrome(service=service, options=options)
+            self.driver.set_page_load_timeout(60)
+            self.driver.set_window_size(1365, 900)
+            self.driver.get("about:blank")
+            version = self.driver.capabilities.get("browserVersion", "inconnue")
+            print(f"Session Selenium active, Chromium {version}")
+            return self.driver
+        except WebDriverException as exc:
+            raise RuntimeError(f"Impossible de demarrer Chromium/Selenium: {str(exc)[:500]}") from exc
+
+    def close_browser(self) -> None:
+        if not self.driver:
+            return
+        try:
+            self.driver.quit()
+        finally:
+            self.driver = None
+            self._browser_letter_urls.clear()
+
+    def _save_browser_debug(self, context: str) -> Dict[str, str]:
+        if not self.driver:
+            return {}
+        debug_dir = os.path.join(self.out_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        safe_context = re.sub(r"[^a-zA-Z0-9_.-]+", "_", context).strip("_") or "page"
+        base = os.path.join(debug_dir, f"selenium_{safe_context}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        paths: Dict[str, str] = {}
+        try:
+            html_path = base + ".html"
+            with open(html_path, "w", encoding="utf-8") as handle:
+                handle.write(self.driver.page_source)
+            paths["html"] = html_path
+        except Exception:
+            pass
+        try:
+            png_path = base + ".png"
+            self.driver.save_screenshot(png_path)
+            paths["screenshot"] = png_path
+        except Exception:
+            pass
+        return paths
+
+    def _dismiss_cookie_consent(self) -> bool:
+        if not self.driver:
+            return False
+        css_selectors = [
+            "#didomi-notice-agree-button",
+            "#onetrust-accept-btn-handler",
+            "button[mode='primary']",
+            "button[aria-label*='Accepter']",
+            "button[aria-label*='accepter']",
+        ]
+        xpaths = [
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tout accepter')]",
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accepter')]",
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), \"j'accepte\")]",
+            "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accepter')]",
+        ]
+
+        contexts = [None]
+        try:
+            contexts.extend(self.driver.find_elements(By.CSS_SELECTOR, "iframe"))
+        except Exception:
+            pass
+        for frame in contexts:
+            try:
+                self.driver.switch_to.default_content()
+                if frame is not None:
+                    self.driver.switch_to.frame(frame)
+                elements = []
+                for selector in css_selectors:
+                    elements.extend(self.driver.find_elements(By.CSS_SELECTOR, selector))
+                for xpath in xpaths:
+                    elements.extend(self.driver.find_elements(By.XPATH, xpath))
+                for element in elements:
+                    if element.is_displayed() and element.is_enabled():
+                        self.driver.execute_script("arguments[0].click();", element)
+                        self.driver.switch_to.default_content()
+                        print("Consentement cookies accepte automatiquement.")
+                        time.sleep(0.5)
+                        return True
+            except Exception:
+                continue
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        return False
+
+    def _wait_browser_page(self, context: str) -> None:
+        if not self.driver:
+            raise RuntimeError("Driver Selenium non initialise")
+        try:
+            WebDriverWait(self.driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        except TimeoutException as exc:
+            debug = self._save_browser_debug(context)
+            raise RuntimeError(f"Page Selenium vide ou trop lente ({context}). Debug: {debug}") from exc
+
+        challenge_deadline = time.time() + _env_int("NAUTILJON_CLOUDFLARE_WAIT_SECONDS", 30)
+        while self._blocked_by_waf(self.driver.page_source):
+            text = _norm(self.driver.page_source)
+            challenge = "just a moment" in text or "performing security verification" in text
+            if not challenge or time.time() >= challenge_deadline:
+                debug = self._save_browser_debug(context)
+                raise RuntimeError(f"Cloudflare bloque le navigateur Selenium ({context}). Debug: {debug}")
+            time.sleep(1)
+        self._dismiss_cookie_consent()
+
+    def _browser_get(self, url: str, context: str) -> str:
+        driver = self.setup_browser()
+        try:
+            driver.get(_ensure_abs_url(url))
+        except WebDriverException as exc:
+            debug = self._save_browser_debug(context)
+            raise RuntimeError(f"Navigation Selenium impossible ({context}): {str(exc)[:300]}. Debug: {debug}") from exc
+        self._wait_browser_page(context)
+        return driver.page_source
+
+    def _find_visible_search_input(self):
+        if not self.driver:
+            return None
+        selectors = [
+            "input[name='q']",
+            "input[type='search']",
+            "#content input[type='text']",
+            "form input[type='text']",
+        ]
+        for selector in selectors:
+            for element in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                if element.is_displayed() and element.is_enabled():
+                    return element
+        return None
+
+    def _submit_manga_search_form(self, query: str) -> bool:
+        search_input = self._find_visible_search_input()
+        if not self.driver or search_input is None:
+            return False
+        try:
+            search_input.click()
+            search_input.send_keys(Keys.CONTROL, "a")
+            search_input.send_keys(query)
+            form = search_input.find_element(By.XPATH, "./ancestor::form[1]")
+            buttons = form.find_elements(By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], button")
+            if buttons:
+                self.driver.execute_script("arguments[0].click();", buttons[0])
+            else:
+                search_input.send_keys(Keys.ENTER)
+            self._sleep_delay()
+            self._wait_browser_page("mangas_form_submit")
+            return True
+        except Exception as exc:
+            print(f"Soumission du formulaire Nautiljon impossible: {str(exc)[:160]}")
+            return False
+
+    def _click_manga_letter_link(self, letter: str) -> bool:
+        if not self.driver:
+            return False
+        target = self._letter_label(letter)
+        xpaths = [
+            f"//a[normalize-space(.)='{target}' and contains(@href, '/mangas')]",
+            f"//*[@id='content']//a[normalize-space(.)='{target}']",
+            f"//a[normalize-space(.)='{target}']",
+        ]
+        for xpath in xpaths:
+            for link in self.driver.find_elements(By.XPATH, xpath):
+                if not link.is_displayed() or not link.is_enabled():
+                    continue
+                try:
+                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", link)
+                    self.driver.execute_script("arguments[0].click();", link)
+                    self._sleep_delay()
+                    self._wait_browser_page("mangas_letter_click")
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    def open_manga_letter_index(self, letter: str) -> str:
+        driver = self.setup_browser()
+        label = self._letter_label(letter)
+        query = "#" if letter == "%23" else letter.lower()
+        print(f"Initialisation Selenium de la lettre {label} via l'interface Nautiljon.")
+        self._browser_get(f"{BASE_URL}/mangas/", "mangas_root")
+        if self._click_manga_letter_link(letter) and not self._search_session_expired(driver.page_source):
+            return driver.current_url
+
+        self._browser_get(f"{BASE_URL}/mangas/", "mangas_root_form")
+        if not self._submit_manga_search_form(query):
+            raise RuntimeError("Impossible d'initialiser la recherche Nautiljon via son interface")
+        if self._search_session_expired(driver.page_source):
+            raise RuntimeError("La session de recherche Nautiljon expire immediatement")
+        return driver.current_url
+
+    def _fetch_listing_page_selenium(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
+        driver = self.setup_browser()
+        tag = self._letter_tag(letter)
+        if page_num == 0 or tag not in self._browser_letter_urls:
+            self._browser_letter_urls[tag] = self.open_manga_letter_index(letter)
+        page_url = self._url_with_dbt(self._browser_letter_urls[tag], page_num)
+        if page_num > 0 or driver.current_url != page_url:
+            html = self._browser_get(page_url, f"listing_{tag}_{page_num + 1}")
+        else:
+            html = driver.page_source
+        if self._search_session_expired(html):
+            self._browser_letter_urls[tag] = self.open_manga_letter_index(letter)
+            page_url = self._url_with_dbt(self._browser_letter_urls[tag], page_num)
+            html = self._browser_get(page_url, f"listing_{tag}_{page_num + 1}_recovery")
+        rows = self.extract_series_list_from_html(html)
+        expected_tag = self._letter_tag(letter)
+        matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
+        if rows and len(matching_rows) < max(1, int(len(rows) * 0.8)):
+            raise RuntimeError(
+                f"Listing Selenium incoherent pour {self._letter_label(letter)}: "
+                f"{len(matching_rows)}/{len(rows)} titres correspondent"
+            )
+        return driver.current_url, matching_rows
+
+    def browser_test(self, letter: str = "a") -> Dict[str, object]:
+        print("=" * 60)
+        print("TEST SELENIUM NAUTILJON - AUCUN EXPORT MODIFIE")
+        print("=" * 60)
+        report: Dict[str, object] = {"letter": self._letter_label(letter), "listing_ok": False, "detail_ok": False}
+        try:
+            _, rows = self._fetch_listing_page_selenium(letter, 0)
+            report["listing_rows"] = len(rows)
+            report["listing_ok"] = len(rows) > 0
+            if rows:
+                html = self._browser_get(rows[0]["url_fiche"], "browser_test_detail")
+                detail = self.extract_series_detail_from_html(html)
+                useful = [value for key, value in detail.items() if key != "_titre_fr_fallback" and not _is_na(value)]
+                report["detail_fields"] = len(useful)
+                report["detail_ok"] = len(useful) > 0
+                report["sample_title"] = rows[0].get("titre", "N/A")
+        except Exception as exc:
+            report["error"] = str(exc)
+            report["debug"] = self._save_browser_debug("browser_test_failed")
+        finally:
+            self.close_browser()
+        report["ready_for_diff"] = bool(report["listing_ok"] and report["detail_ok"])
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print("VERDICT SELENIUM: " + ("PRET POUR DIFF CONTROLE" if report["ready_for_diff"] else "BLOQUE"))
+        return report
+
+    def browser_smoke(self) -> bool:
+        print("TEST DEMARRAGE CHROMIUM / SELENIUM")
+        try:
+            driver = self.setup_browser()
+            print(f"URL navigateur: {driver.current_url}")
+            print("VERDICT NAVIGATEUR: OK")
+            return True
+        except Exception as exc:
+            print(f"VERDICT NAVIGATEUR: ECHEC ({str(exc)[:500]})")
+            return False
+        finally:
+            self.close_browser()
+
     def fetch_html(self, url: str) -> str:
+        if self.backend == "selenium":
+            return self._browser_get(url, "fiche_detail")
         response = self.session.get(_ensure_abs_url(url), timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         response.encoding = response.encoding or "utf-8"
@@ -923,6 +1241,8 @@ class NautiljonScraper:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(items), parts.fragment))
 
     def fetch_listing_page(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
+        if self.backend == "selenium":
+            return self._fetch_listing_page_selenium(letter, page_num)
         last_error = ""
         accessible_empty_url = ""
         for url in self._listing_candidate_urls(letter, page_num):
@@ -1255,7 +1575,7 @@ class NautiljonScraper:
     ) -> List[Dict[str, str]]:
         label = self._letter_label(letter)
         tag = self._letter_tag(letter)
-        print(f"\n{'=' * 60}\nLETTRE {label} - DIFF HTTP\n{'=' * 60}")
+        print(f"\n{'=' * 60}\nLETTRE {label} - DIFF {self.backend.upper()}\n{'=' * 60}")
 
         existing_rows = self._load_json_list(self._letter_paths(tag)[0])
         if not existing_rows:
@@ -1533,6 +1853,8 @@ class NautiljonScraper:
         incomplete_reason = ""
         consecutive_listing_failures = 0
         try:
+            if self.backend == "selenium":
+                self.setup_browser()
             for index, letter in enumerate(letters_to_scrape, start=1):
                 label = self._letter_label(letter)
                 if label in completed_letters:
@@ -1588,6 +1910,7 @@ class NautiljonScraper:
             self.session_stats["errors"] += 1
             print(f"Erreur fatale: {exc}")
         finally:
+            self.close_browser()
             self.session_stats["end_time"] = datetime.now()
             if self.session_stats["start_time"]:
                 self.session_stats["duration"] = str(self.session_stats["end_time"] - self.session_stats["start_time"])
@@ -1679,11 +2002,21 @@ def _new_scraper(args: argparse.Namespace) -> NautiljonScraper:
         delay_max = _env_float("NAUTILJON_DELAY_MAX", delay)
     if (delay_min is None) != (delay_max is None):
         raise ValueError("NAUTILJON_DELAY_MIN et NAUTILJON_DELAY_MAX doivent etre definis ensemble.")
-    return NautiljonScraper(out_dir=out_dir, delay=delay, delay_min=delay_min, delay_max=delay_max)
+    backend = os.environ.get("NAUTILJON_BACKEND", "selenium").strip().lower()
+    if backend not in {"selenium", "http"}:
+        raise ValueError("NAUTILJON_BACKEND doit valoir selenium ou http.")
+    return NautiljonScraper(
+        out_dir=out_dir,
+        delay=delay,
+        delay_min=delay_min,
+        delay_max=delay_max,
+        backend=backend,
+        browser_headless=_env_bool("NAUTILJON_BROWSER_HEADLESS", False),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Scraper Nautiljon HTTP sans Selenium.")
+    parser = argparse.ArgumentParser(description="Scraper Nautiljon Selenium avec reprise securisee.")
     parser.add_argument("--out-dir", default=os.environ.get("NAUTILJON_OUT_DIR", "./output"))
     parser.add_argument("--delay", type=float, default=None)
     parser.add_argument("--delay-min", type=float, default=None)
@@ -1721,6 +2054,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("NAUTILJON_DIAGNOSE_DETAIL_URL", f"{BASE_URL}/mangas/one+piece.html"),
     )
     diagnose.add_argument("--rss-feeds", default=os.environ.get("NAUTILJON_RSS_FEEDS"))
+
+    browser_test = sub.add_parser("browser-test", help="Teste un listing et une fiche via Selenium sans exporter.")
+    browser_test.add_argument("--letter", default=os.environ.get("NAUTILJON_DIAGNOSE_LETTER", "a"))
+
+    sub.add_parser("browser-smoke", help="Verifie uniquement le demarrage de Chromium et ChromeDriver.")
 
     sub.add_parser("selftest", help="Tests parser hors reseau.")
     return parser
@@ -1813,6 +2151,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             rss_feed_urls=_parse_csv_list(args.rss_feeds),
         )
         raise SystemExit(0 if report["ready_for_diff"] else 1)
+    elif command == "browser-test":
+        report = scraper.browser_test(letter="%23" if args.letter == "#" else args.letter.lower())
+        raise SystemExit(0 if report["ready_for_diff"] else 1)
+    elif command == "browser-smoke":
+        raise SystemExit(0 if scraper.browser_smoke() else 1)
     else:
         parser.error(f"Commande inconnue: {command}")
 

@@ -19,7 +19,7 @@ def make_row(label: str):
 
 class DiffStateTests(unittest.TestCase):
     def make_scraper(self, out_dir: str) -> NautiljonScraper:
-        return NautiljonScraper(out_dir=out_dir, delay=0)
+        return NautiljonScraper(out_dir=out_dir, delay=0, backend="http")
 
     def seed_letter(self, scraper: NautiljonScraper, letter: str) -> None:
         label = scraper._letter_label(letter)
@@ -207,6 +207,42 @@ class DiffStateTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["public_ip"], "198.51.100.42")
+
+    def test_browser_backend_dispatches_listing_to_selenium(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="selenium")
+
+        def fake_listing(this, letter, page_num):
+            return "https://example.test/a", [make_row("A")]
+
+        scraper._fetch_listing_page_selenium = types.MethodType(fake_listing, scraper)
+        url, rows = scraper.fetch_listing_page("a", 0)
+
+        self.assertEqual(url, "https://example.test/a")
+        self.assertEqual(len(rows), 1)
+
+    def test_browser_test_checks_listing_and_detail_without_export(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = os.path.join(temp_dir, "output")
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="selenium")
+
+            def fake_listing(this, letter, page_num):
+                return "https://example.test/a", [make_row("A")]
+
+            def fake_get(this, url, context):
+                return """
+                <div id="content"><h1>Test A</h1><ul class="mb10">
+                <li>Titre original : Test</li><li>Origine : Japon - 2026</li>
+                <li>Type : Seinen</li><li>Genres : Action</li>
+                </ul></div>
+                """
+
+            scraper._fetch_listing_page_selenium = types.MethodType(fake_listing, scraper)
+            scraper._browser_get = types.MethodType(fake_get, scraper)
+            scraper.close_browser = types.MethodType(lambda this: None, scraper)
+            report = scraper.browser_test("a")
+
+            self.assertTrue(report["ready_for_diff"])
+            self.assertFalse(os.path.exists(os.path.join(out_dir, "exports")))
 
 
 if __name__ == "__main__":

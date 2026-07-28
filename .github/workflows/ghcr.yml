@@ -72,3 +72,8 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Smoke test Chromium in published image
+        run: |
+          docker pull "${IMAGE_NAME}:${GITHUB_SHA}"
+          docker run --rm "${IMAGE_NAME}:${GITHUB_SHA}" browser-smoke
