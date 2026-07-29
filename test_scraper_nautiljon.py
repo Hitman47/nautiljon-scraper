@@ -325,8 +325,18 @@ class DiffStateTests(unittest.TestCase):
                 force=True,
             )
 
-            self.assertEqual(forced_result.status, "success")
-            self.assertEqual(forced_calls, ["A", "B"])
+            self.assertEqual(forced_result.status, "failed")
+            self.assertEqual(forced_result.reason, "full_catalog_force_refused")
+            self.assertEqual(forced_calls, [])
+
+            forced_subset_result = forced.scrape_all_letters_diff(
+                letters=["a"],
+                min_days_between_diff_exports=30,
+                force=True,
+            )
+
+            self.assertEqual(forced_subset_result.status, "partial")
+            self.assertEqual(forced_calls, ["A"])
 
     def test_expired_controlled_letter_is_scraped_again(self):
         with tempfile.TemporaryDirectory() as out_dir:

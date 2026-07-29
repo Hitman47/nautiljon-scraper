@@ -2596,11 +2596,19 @@ class NautiljonScraper:
             )
             self.mark_run_state("diff", result)
             return result
-        if all_catalog_requested and force:
+        if letters is None and force:
             print(
-                "ATTENTION: NAUTILJON_FORCE_SCRAPE=true; les caches recents des lettres "
-                "seront ignores et les 27 lettres seront retraitees."
+                "Diff complet refuse: NAUTILJON_FORCE_SCRAPE=true ignorerait tous les "
+                "caches recents. Remettez NAUTILJON_FORCE_SCRAPE=false, ou indiquez "
+                "explicitement une liste limitee de lettres pour un controle force."
             )
+            result = RunResult(
+                status="failed",
+                reason="full_catalog_force_refused",
+                requested_letters=requested_labels,
+            )
+            self.mark_run_state("diff", result)
+            return result
         should_skip, last_success, age = self.should_skip_recent_success("diff", min_days_between_diff_exports)
         if full_catalog_requested and should_skip and not force and last_success and age is not None:
             print(

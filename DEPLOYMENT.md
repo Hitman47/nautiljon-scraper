@@ -133,6 +133,8 @@ Les trois reglages importants doivent etre modifies ensemble apres un controle :
 `NAUTILJON_LETTERS=` (vide), `NAUTILJON_FORCE_SCRAPE=false` et
 `NAUTILJON_DROP_MISSING=true`. Le scraper refuse maintenant les 27 lettres si
 le mode controle `DROP_MISSING=false` est reste actif.
+Il refuse aussi un lancement global si `NAUTILJON_FORCE_SCRAPE=true` est reste
+actif ; le mode force est reserve a une liste explicite de lettres.
 
 Le succes exige les 27 lettres, aucune erreur de listing ou de fiche et des
 exports finaux valides. Une interruption conserve la page courante et les lettres

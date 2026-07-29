@@ -98,6 +98,8 @@ NAUTILJON_SHM_SIZE=512m
 - Un controle avec `NAUTILJON_DROP_MISSING=false` ecrit dans `output/control/`.
 - Un lancement des 27 lettres avec `NAUTILJON_DROP_MISSING=false` est refuse :
   le mode controle doit toujours utiliser une liste explicite de lettres.
+- Un lancement global avec `NAUTILJON_FORCE_SCRAPE=true` est egalement refuse.
+  Le mode force exige une liste explicite et limitee de lettres.
 - `NAUTILJON_REFRESH_STALE_DAYS` ne recharge que les fiches dont `Nb volumes VF`
   est indique `En cours`. Les series VF terminees ne sont pas revisitees par
   anciennete. Les colonnes `dernier_tome_vf_*` et `prochain_tome_vf_*` viennent
