@@ -2402,6 +2402,15 @@ class NautiljonScraper:
                                 updated_rows.append(full)
                                 counters[action] += 1
                                 self._sleep_delay()
+                        except NautiljonAccessBlockedError as exc:
+                            self.session_stats["errors"] += 1
+                            access_blocked = True
+                            listing_failed = True
+                            seen_urls.discard(url)
+                            if existing:
+                                existing_by_url[url] = existing
+                            print(f"    ACCES BLOQUE pendant une fiche detail: {str(exc)[:220]}")
+                            break
                         except Exception as exc:
                             self.session_stats["errors"] += 1
                             print(f"    Erreur detail: {str(exc)[:140]}")
@@ -2417,6 +2426,9 @@ class NautiljonScraper:
                         save_checkpoint(page_num)
                         since_flush = 0
 
+                if access_blocked:
+                    save_checkpoint(page_num)
+                    break
                 save_checkpoint(page_num + 1)
                 if new_on_page == 0:
                     empty_pages += 1

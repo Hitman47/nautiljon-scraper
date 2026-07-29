@@ -84,7 +84,8 @@ NAUTILJON_SHM_SIZE=512m
 
 - `flaresolverr-test` compare les IP puis teste un listing et une fiche sans exporter.
 - Un diff est refuse si FlareSolverr et Gluetun n'utilisent pas la meme IP publique.
-- Une IP explicitement interdite par Nautiljon arrete le diff sans nouvelle tentative.
+- Une IP explicitement interdite par Nautiljon arrete le diff sans nouvelle tentative,
+  y compris si le blocage apparait pendant une fiche detail.
 - Selenium reste disponible avec `browser-test` pour le diagnostic.
 - Les CSV utilisent `;` et `utf-8-sig`.
 - Seuls `yaoi` et `yuri` sont exclus.

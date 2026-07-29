@@ -82,6 +82,32 @@ class DiffStateTests(unittest.TestCase):
             self.assertTrue(scraper.session_stats["diff_by_letter"]["A"]["access_blocked"])
             self.assertTrue(os.path.exists(scraper._letter_checkpoint_path("A")))
 
+    def test_detail_access_block_stops_immediately_on_same_page(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            first = make_row("A")
+            second = make_row("A")
+            second["url_fiche"] = "https://www.nautiljon.com/mangas/second-a.html"
+            detail_calls = []
+
+            scraper.fetch_listing_page = types.MethodType(
+                lambda this, letter, page_num: ("https://example.test/a", [first, second]),
+                scraper,
+            )
+
+            def blocked_detail(this, series):
+                detail_calls.append(series["url_fiche"])
+                raise NautiljonAccessBlockedError("IP interdite pour abus")
+
+            scraper._fetch_full_series_data = types.MethodType(blocked_detail, scraper)
+            scraper.scrape_letter_diff("a", drop_missing=False, resume=True)
+
+            stats = scraper.session_stats["diff_by_letter"]["A"]
+            checkpoint = scraper._load_json_dict(scraper._letter_checkpoint_path("A"))
+            self.assertEqual(len(detail_calls), 1)
+            self.assertTrue(stats["access_blocked"])
+            self.assertEqual(checkpoint["page_num"], 0)
+
     def test_access_block_has_dedicated_run_reason(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = self.make_scraper(out_dir)
