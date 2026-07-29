@@ -2576,13 +2576,31 @@ class NautiljonScraper:
         all_catalog_letters = self.get_all_letters()
         letters_to_scrape = letters or all_catalog_letters
         requested_labels = [self._letter_label(letter) for letter in letters_to_scrape]
-        full_catalog_requested = (
+        all_catalog_requested = (
             set(letters_to_scrape) == set(all_catalog_letters)
             and len(letters_to_scrape) == len(all_catalog_letters)
             and max_pages_per_letter is None
             and max_series_per_letter is None
-            and drop_missing
         )
+        full_catalog_requested = all_catalog_requested and drop_missing
+        if all_catalog_requested and not drop_missing:
+            print(
+                "Diff complet refuse: NAUTILJON_DROP_MISSING=false est reserve aux controles "
+                "sur une liste explicite de lettres. Utilisez NAUTILJON_DROP_MISSING=true "
+                "pour les 27 lettres."
+            )
+            result = RunResult(
+                status="failed",
+                reason="full_catalog_requires_drop_missing",
+                requested_letters=requested_labels,
+            )
+            self.mark_run_state("diff", result)
+            return result
+        if all_catalog_requested and force:
+            print(
+                "ATTENTION: NAUTILJON_FORCE_SCRAPE=true; les caches recents des lettres "
+                "seront ignores et les 27 lettres seront retraitees."
+            )
         should_skip, last_success, age = self.should_skip_recent_success("diff", min_days_between_diff_exports)
         if full_catalog_requested and should_skip and not force and last_success and age is not None:
             print(
@@ -2650,6 +2668,17 @@ class NautiljonScraper:
                     if cached:
                         cached_rows, marker, cache_age = cached
                         self.save_letter_files(tag, cached_rows, partial=False)
+                        checkpoint_path = self._letter_checkpoint_path(tag)
+                        if os.path.isfile(checkpoint_path) or any(
+                            os.path.isfile(path) for path in self._letter_paths(tag)[2:]
+                        ):
+                            self._archive_letter_progress(
+                                tag,
+                                checkpoint_path,
+                                "remplace_par_cache_valide",
+                            )
+                            self._remove_partial_files(tag)
+                            self._remove_checkpoint(checkpoint_path)
                         cached_stats = marker.get("stats")
                         stats = dict(cached_stats) if isinstance(cached_stats, dict) else {}
                         stats.update({

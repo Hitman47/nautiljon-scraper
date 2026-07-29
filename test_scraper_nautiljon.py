@@ -191,6 +191,23 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(result.reason, "controlled_subset_complete")
             self.assertFalse(os.path.exists(scraper._last_success_path("diff")))
 
+    def test_complete_catalog_refuses_control_mode(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            scraper.get_all_letters = types.MethodType(lambda this: ["a", "b"], scraper)
+            calls = []
+            self.install_fake_letter_scrape(scraper, {}, calls=calls)
+
+            result = scraper.scrape_all_letters_diff(
+                letters=None,
+                drop_missing=False,
+                min_days_between_diff_exports=0,
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.reason, "full_catalog_requires_drop_missing")
+            self.assertEqual(calls, [])
+
     def test_complete_catalog_writes_valid_success(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = self.make_scraper(out_dir)
@@ -276,6 +293,11 @@ class DiffStateTests(unittest.TestCase):
                     }
                 },
             })
+            scraper.save_letter_files("A", [make_row("A")], partial=True)
+            scraper._write_json_atomic(scraper._letter_checkpoint_path("A"), {
+                "settings": {"letter": "a"},
+                "page_num": 7,
+            })
             calls = []
             self.install_fake_letter_scrape(scraper, {}, calls=calls)
 
@@ -288,6 +310,10 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(calls, ["B"])
             self.assertEqual(len(scraper._load_json_list(scraper._letter_paths("A")[0])), 2)
             self.assertTrue(scraper.session_stats["diff_by_letter"]["A"]["cache_reused"])
+            self.assertFalse(os.path.exists(scraper._letter_checkpoint_path("A")))
+            self.assertFalse(os.path.exists(scraper._letter_paths("A")[2]))
+            archive_root = os.path.join(out_dir, "checkpoints", "archive")
+            self.assertTrue(os.path.isdir(archive_root))
 
             forced = self.make_scraper(out_dir)
             forced.get_all_letters = types.MethodType(lambda this: ["a", "b"], forced)

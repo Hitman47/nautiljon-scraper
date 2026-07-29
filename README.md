@@ -96,6 +96,8 @@ NAUTILJON_SHM_SIZE=512m
   archive dans `output/checkpoints/archive/` avant tout remplacement.
 - Une disparition superieure a 15 % de la base bloque la finalisation.
 - Un controle avec `NAUTILJON_DROP_MISSING=false` ecrit dans `output/control/`.
+- Un lancement des 27 lettres avec `NAUTILJON_DROP_MISSING=false` est refuse :
+  le mode controle doit toujours utiliser une liste explicite de lettres.
 - `NAUTILJON_REFRESH_STALE_DAYS` ne recharge que les fiches dont `Nb volumes VF`
   est indique `En cours`. Les series VF terminees ne sont pas revisitees par
   anciennete. Les colonnes `dernier_tome_vf_*` et `prochain_tome_vf_*` viennent
