@@ -3,6 +3,7 @@ import os
 import tempfile
 import types
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta
 from unittest import mock
 
@@ -910,6 +911,48 @@ class DiffStateTests(unittest.TestCase):
         self.assertEqual(calls.count("https://www.nautiljon.com/mangas/"), 1)
         self.assertIn("q=a", calls[1])
         self.assertIn("q=b", calls[2])
+
+    def test_flaresolverr_listing_submits_signed_search_form(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+        labels = ["#"] + [chr(code) for code in range(ord("A"), ord("Z") + 1)]
+        root_html = """
+        <form action="/mangas/" method="get">
+          <input name="q" type="text" value="">
+          <input name="st" type="hidden" value="signed-token">
+          <select name="webcomic"><option value="">----</option><option value="1">Oui</option></select>
+          <input name="edition_sup" type="hidden" value="2">
+          <input name="types_include[]" type="checkbox" value="12">
+          <input type="submit" value="Search">
+        </form>
+        """ + "".join(
+            f'<a href="/mangas/?q={"%23" if label == "#" else label.lower()}">{label}</a>'
+            for label in labels
+        )
+        calls = []
+
+        def fake_fetch(this, url):
+            calls.append(url)
+            this._last_flaresolverr_url = url
+            return root_html if url.endswith("/mangas/") else "<html>listing</html>"
+
+        def fake_parse(this, html):
+            row = make_row("A")
+            row["titre"] = "A Test"
+            return [row]
+
+        scraper._fetch_html_flaresolverr = types.MethodType(fake_fetch, scraper)
+        scraper.extract_series_list_from_html = types.MethodType(fake_parse, scraper)
+
+        _, rows = scraper.fetch_listing_page("a", 0)
+
+        self.assertEqual(rows[0]["titre"], "A Test")
+        parsed = urllib.parse.urlsplit(calls[1])
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        self.assertEqual(params["q"], ["a"])
+        self.assertEqual(params["st"], ["signed-token"])
+        self.assertEqual(params["webcomic"], [""])
+        self.assertEqual(params["edition_sup"], ["2"])
+        self.assertNotIn("types_include[]", params)
 
     def test_flaresolverr_listing_follows_exact_next_token(self):
         scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")

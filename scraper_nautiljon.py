@@ -1692,11 +1692,85 @@ class NautiljonScraper:
             )
         return driver.current_url, matching_rows
 
+    @staticmethod
+    def _manga_search_form_template(
+        soup: BeautifulSoup,
+    ) -> Optional[Tuple[str, List[Tuple[str, str]]]]:
+        """Return the GET form action and the controls a browser would submit."""
+        for form in soup.find_all("form"):
+            method = str(form.get("method", "get")).lower()
+            action = _ensure_abs_url(str(form.get("action", "")))
+            parsed_action = urlsplit(action)
+            if method != "get" or parsed_action.path.rstrip("/") != "/mangas":
+                continue
+            if not form.find(["input", "textarea"], attrs={"name": "q"}):
+                continue
+
+            params: List[Tuple[str, str]] = []
+            for field in form.find_all(["input", "select", "textarea"]):
+                name = str(field.get("name", ""))
+                if not name or field.has_attr("disabled"):
+                    continue
+
+                if field.name == "input":
+                    input_type = str(field.get("type", "text")).lower()
+                    if input_type in {"button", "file", "image", "reset", "submit"}:
+                        continue
+                    if input_type in {"checkbox", "radio"} and not field.has_attr("checked"):
+                        continue
+                    params.append((name, str(field.get("value", ""))))
+                    continue
+
+                if field.name == "textarea":
+                    params.append((name, field.get_text()))
+                    continue
+
+                options = [option for option in field.find_all("option") if not option.has_attr("disabled")]
+                selected = [option for option in options if option.has_attr("selected")]
+                if field.has_attr("multiple"):
+                    chosen = selected
+                else:
+                    chosen = selected or options[:1]
+                for option in chosen:
+                    params.append((name, str(option.get("value", option.get_text(" ", strip=True)))))
+            return action, params
+        return None
+
+    @staticmethod
+    def _manga_search_url(
+        template: Tuple[str, List[Tuple[str, str]]],
+        query: str,
+    ) -> str:
+        action, form_params = template
+        params: List[Tuple[str, str]] = []
+        query_replaced = False
+        for name, value in form_params:
+            if name == "q":
+                params.append((name, query))
+                query_replaced = True
+            else:
+                params.append((name, value))
+        if not query_replaced:
+            params.insert(0, ("q", query))
+
+        parsed = urlsplit(action)
+        action_params = parse_qsl(parsed.query, keep_blank_values=True)
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                urlencode(action_params + params, doseq=True),
+                parsed.fragment,
+            )
+        )
+
     def _load_flaresolverr_letter_urls(self) -> None:
         if self._flaresolverr_letter_urls:
             return
         html = self._fetch_html_flaresolverr(f"{BASE_URL}/mangas/")
         soup = BeautifulSoup(html, "html.parser")
+        search_template = self._manga_search_form_template(soup)
         for anchor in soup.find_all("a", href=True):
             label = _clean_spaces(anchor.get_text(" ", strip=True)).upper()
             if label == "#" or re.fullmatch(r"[A-Z]", label):
@@ -1717,7 +1791,18 @@ class NautiljonScraper:
                 "FlareSolverr: index Nautiljon non exploitable; liens alphabetiques "
                 f"introuvables: {', '.join(missing)}. Debug: {debug}"
             )
-        print(f"Index Nautiljon initialise via FlareSolverr: {len(self._flaresolverr_letter_urls)} lettres")
+        if search_template:
+            for label in self._flaresolverr_letter_urls:
+                search_query = "#" if label == "#" else label.lower()
+                self._flaresolverr_letter_urls[label] = self._manga_search_url(
+                    search_template,
+                    search_query,
+                )
+        mode = "formulaire signe" if search_template else "liens alphabetiques"
+        print(
+            f"Index Nautiljon initialise via FlareSolverr: "
+            f"{len(self._flaresolverr_letter_urls)} lettres ({mode})"
+        )
 
     @staticmethod
     def _extract_next_listing_url(html: str, current_url: str, page_num: int) -> Optional[str]:
