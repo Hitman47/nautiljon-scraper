@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - "codex/**"
     tags:
       - "v*"
   workflow_dispatch:
@@ -13,7 +14,33 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate source and deployment files
+        run: |
+          python -m compileall -q scraper_nautiljon.py test_scraper_nautiljon.py
+          python scraper_nautiljon.py selftest
+          bash -n docker-entrypoint.sh
+          docker compose -f portainer-stack.yml config --quiet
+
+      - name: Run tests
+        run: python -m unittest -v
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
 
     steps:
@@ -25,6 +52,11 @@ jobs:
         run: |
           image_name="ghcr.io/${GITHUB_REPOSITORY}"
           echo "IMAGE_NAME=${image_name,,}" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF_NAME" == "main" || "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "CHANNEL_TAG=latest" >> "$GITHUB_ENV"
+          else
+            echo "CHANNEL_TAG=test" >> "$GITHUB_ENV"
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -36,14 +68,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: nautiljon-scraper:ci
+          cache-to: type=gha,mode=max
+          cache-from: type=gha
+
+      - name: Smoke test Chromium before publication
+        run: docker run --rm nautiljon-scraper:ci browser-smoke
+
+      - name: Publish validated image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ env.CHANNEL_TAG }}
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}

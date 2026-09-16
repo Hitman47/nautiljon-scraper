@@ -3,14 +3,17 @@ from __future__ import annotations
 import argparse
 import csv
 import html as html_lib
+import ipaddress
 import json
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -19,6 +22,13 @@ from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, ur
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from urllib3.util.retry import Retry
 
 
@@ -31,6 +41,7 @@ except OverflowError:
 BASE_URL = "https://www.nautiljon.com"
 DEFAULT_RSS_FEEDS = ["http://feeds.feedburner.com/nautiljon/NdFI"]
 DEFAULT_TIMEOUT = 45
+DEFAULT_DIAGNOSE_TIMEOUT = 15
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -40,6 +51,13 @@ DEFAULT_HEADERS = {
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
 }
 BANNED_TYPE_KEYWORDS = ["yaoi", "yuri"]
+DATA_SCHEMA_VERSION = 2
+VF_RELEASE_FIELDS = [
+    "dernier_tome_vf_numero", "dernier_tome_vf_date",
+    "dernier_tome_vf_url", "dernier_tome_vf_couverture",
+    "prochain_tome_vf_numero", "prochain_tome_vf_date",
+    "prochain_tome_vf_url", "prochain_tome_vf_couverture",
+]
 PREFERRED_FIELDS = [
     "url_fiche", "titre", "titre_alternatif", "extraction_time",
     "titre_original", "origine", "annee_vo",
@@ -49,6 +67,7 @@ PREFERRED_FIELDS = [
     "editeur_vo", "prepublication",
     "nb_vol_vo_liste", "nb_vol_vf_liste", "nb_vol_vo_detail", "nb_vol_vf_detail",
     "date_vo_liste", "date_vf_liste", "date_vo_detail", "date_vf_detail",
+    *VF_RELEASE_FIELDS, "parutions_vf_verifiees_le",
     "note_liste", "note_detail",
     "nb_chapitres_vo", "statut_vo", "nb_chapitres_vf", "statut_vf",
     "age_liste", "age_detail",
@@ -155,6 +174,24 @@ class ListRow:
     extraction_time: str = ""
 
 
+@dataclass
+class RunResult:
+    status: str
+    reason: str
+    rows_count: int = 0
+    requested_letters: List[str] = field(default_factory=list)
+    completed_letters: List[str] = field(default_factory=list)
+    export_paths: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def exit_code(self) -> int:
+        return 0 if self.status in {"success", "skipped"} else 1
+
+
+class NautiljonAccessBlockedError(RuntimeError):
+    pass
+
+
 class NautiljonScraper:
     def __init__(
         self,
@@ -162,11 +199,54 @@ class NautiljonScraper:
         delay: float = 2.0,
         delay_min: Optional[float] = None,
         delay_max: Optional[float] = None,
+        backend: str = "selenium",
+        browser_headless: bool = False,
     ):
         self.out_dir = out_dir
         self.delay = delay
         self.delay_min = delay_min
         self.delay_max = delay_max
+        self.backend = backend.strip().lower()
+        self.browser_headless = browser_headless
+        self.driver: Optional[webdriver.Chrome] = None
+        self.browser_process: Optional[subprocess.Popen] = None
+        self._browser_log_handle = None
+        self._browser_letter_urls: Dict[str, str] = {}
+        self.flaresolverr_session_id: Optional[str] = None
+        self._last_flaresolverr_url = ""
+        self._flaresolverr_letter_urls: Dict[str, str] = {}
+        self._flaresolverr_listing_urls: Dict[Tuple[str, int], str] = {}
+        self._flaresolverr_page_has_next: Dict[Tuple[str, int], bool] = {}
+        conservative_defaults = delay > 0 or delay_min is not None or delay_max is not None
+        self.batch_size = max(0, _env_int("NAUTILJON_BATCH_SIZE", 40 if conservative_defaults else 0))
+        self.batch_pause_min = max(
+            0.0,
+            _env_float("NAUTILJON_BATCH_PAUSE_MIN", 180.0 if conservative_defaults else 0.0),
+        )
+        self.batch_pause_max = max(
+            self.batch_pause_min,
+            _env_float("NAUTILJON_BATCH_PAUSE_MAX", 480.0 if conservative_defaults else 0.0),
+        )
+        self.letter_pause_min = max(
+            0.0,
+            _env_float("NAUTILJON_LETTER_PAUSE_MIN", 120.0 if conservative_defaults else 0.0),
+        )
+        self.letter_pause_max = max(
+            self.letter_pause_min,
+            _env_float("NAUTILJON_LETTER_PAUSE_MAX", 300.0 if conservative_defaults else 0.0),
+        )
+        self.failure_pause_min = max(
+            0.0,
+            _env_float("NAUTILJON_FAILURE_PAUSE_MIN", 300.0 if conservative_defaults else 0.0),
+        )
+        self.failure_pause_max = max(
+            self.failure_pause_min,
+            _env_float("NAUTILJON_FAILURE_PAUSE_MAX", 900.0 if conservative_defaults else 0.0),
+        )
+        self.block_cooldown_hours = max(0.0, _env_float("NAUTILJON_BLOCK_COOLDOWN_HOURS", 24.0))
+        self._remote_request_count = 0
+        self._last_remote_request_at = 0.0
+        self._anti_ban_sleep_seconds = 0.0
         self.session = self._build_session()
         self.session_stats = {
             "total_series": 0,
@@ -177,17 +257,32 @@ class NautiljonScraper:
             "start_time": None,
             "end_time": None,
             "duration": None,
+            "remote_requests": 0,
+            "anti_ban_sleep_seconds": 0.0,
+            "anti_ban_config": {
+                "delay_min": self.delay_min if self.delay_min is not None else self.delay,
+                "delay_max": self.delay_max if self.delay_max is not None else self.delay,
+                "batch_size": self.batch_size,
+                "batch_pause_min": self.batch_pause_min,
+                "batch_pause_max": self.batch_pause_max,
+                "letter_pause_min": self.letter_pause_min,
+                "letter_pause_max": self.letter_pause_max,
+                "failure_pause_min": self.failure_pause_min,
+                "failure_pause_max": self.failure_pause_max,
+                "block_cooldown_hours": self.block_cooldown_hours,
+            },
         }
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
         retry = Retry(
-            total=5,
-            connect=5,
-            read=5,
-            backoff_factor=1.0,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET", "HEAD", "POST"),
+            total=2,
+            connect=2,
+            read=2,
+            backoff_factor=2.0,
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=("GET", "HEAD"),
+            respect_retry_after_header=True,
         )
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("http://", adapter)
@@ -205,9 +300,61 @@ class NautiljonScraper:
 
     def _sleep_delay(self, multiplier: float = 1.0) -> float:
         delay = self._compute_delay(multiplier=multiplier)
-        if delay > 0:
-            time.sleep(delay)
+        self._sleep_for(delay, "temporisation standard", announce=False)
         return delay
+
+    @staticmethod
+    def _is_nautiljon_url(url: str) -> bool:
+        host = (urlsplit(_ensure_abs_url(url)).hostname or "").lower()
+        return host == "nautiljon.com" or host.endswith(".nautiljon.com")
+
+    def _sleep_for(self, seconds: float, reason: str, announce: bool = True) -> float:
+        seconds = max(0.0, float(seconds))
+        if seconds <= 0:
+            return 0.0
+        if announce:
+            print(f"Pause anti-ban {seconds:.1f}s: {reason}")
+        time.sleep(seconds)
+        self._anti_ban_sleep_seconds += seconds
+        self.session_stats["anti_ban_sleep_seconds"] = round(self._anti_ban_sleep_seconds, 3)
+        return seconds
+
+    def _pace_remote_request(self, url: str, context: str) -> float:
+        """Serialize and pace every Nautiljon navigation from every backend."""
+        if not self._is_nautiljon_url(url):
+            return 0.0
+
+        wait_seconds = 0.0
+        wait_reason = f"avant {context}"
+        now = time.monotonic()
+        if self._last_remote_request_at > 0:
+            target_delay = self._compute_delay()
+            elapsed = max(0.0, now - self._last_remote_request_at)
+            wait_seconds = max(0.0, target_delay - elapsed)
+
+        if (
+            self.batch_size > 0
+            and self._remote_request_count > 0
+            and self._remote_request_count % self.batch_size == 0
+        ):
+            batch_pause = random.uniform(self.batch_pause_min, self.batch_pause_max)
+            if batch_pause > wait_seconds:
+                wait_seconds = batch_pause
+                wait_reason = f"repos apres {self._remote_request_count} requetes"
+
+        self._sleep_for(wait_seconds, wait_reason, announce=wait_seconds >= 5)
+        self._last_remote_request_at = time.monotonic()
+        self._remote_request_count += 1
+        self.session_stats["remote_requests"] = self._remote_request_count
+        return wait_seconds
+
+    def _sleep_letter_pause(self) -> float:
+        pause = random.uniform(self.letter_pause_min, self.letter_pause_max)
+        return self._sleep_for(pause, "repos entre deux lettres", announce=True)
+
+    def _sleep_failure_pause(self) -> float:
+        pause = random.uniform(self.failure_pause_min, self.failure_pause_max)
+        return self._sleep_for(pause, "erreur reseau avant nouvelle tentative", announce=True)
 
     def _ensure_dirs(self) -> Tuple[str, str, str, str]:
         exports_dir = os.path.join(self.out_dir, "exports")
@@ -259,6 +406,15 @@ class NautiljonScraper:
         data = self._load_last_success(mode)
         if not data:
             return False, None, None
+        if data.get("status") not in {None, "success"}:
+            return False, data, None
+        if mode == "diff" and data.get("data_schema_version") != DATA_SCHEMA_VERSION:
+            print("Ancien marqueur de succes ignore: schema de donnees obsolete.")
+            return False, data, None
+        export_paths = data.get("export_paths")
+        if not isinstance(export_paths, dict) or not self._validate_final_exports(export_paths):
+            print("Ancien marqueur de succes ignore: export final absent ou incomplet.")
+            return False, data, None
         completed_at = str(data.get("completed_at", ""))
         try:
             age = datetime.now() - datetime.fromisoformat(completed_at)
@@ -268,17 +424,197 @@ class NautiljonScraper:
 
     def mark_success(self, mode: str, rows_count: int, export_paths: Dict[str, str]) -> None:
         payload = {
+            "status": "success",
+            "data_schema_version": DATA_SCHEMA_VERSION,
             "completed_at": datetime.now().isoformat(timespec="seconds"),
             "rows_count": rows_count,
             "export_paths": export_paths,
             "session_stats": self.session_stats,
         }
         path = self._last_success_path(mode)
+        self._write_json_atomic(path, payload)
+        print(f"  OK marqueur de succes {mode}: {path}")
+
+    def _write_json_atomic(self, path: str, payload: object) -> None:
         tmp_path = path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
         os.replace(tmp_path, path)
-        print(f"  OK marqueur de succes {mode}: {path}")
+
+    def _state_path(self, name: str) -> str:
+        _, checkpoints_dir, _, state_dir = self._ensure_dirs()
+        if name == "diff_checkpoint":
+            return os.path.join(checkpoints_dir, "diff_run.json")
+        safe_name = re.sub(r"[^a-z0-9_.-]+", "_", name.lower()).strip("_") or "run"
+        return os.path.join(state_dir, f"{safe_name}.json")
+
+    def _record_access_cooldown(self, reason: str) -> str:
+        blocked_at = datetime.now()
+        resume_after = blocked_at + timedelta(hours=self.block_cooldown_hours)
+        payload = {
+            "blocked_at": blocked_at.isoformat(timespec="seconds"),
+            "resume_after": resume_after.isoformat(timespec="seconds"),
+            "cooldown_hours": self.block_cooldown_hours,
+            "reason": reason,
+        }
+        path = self._state_path("access_cooldown")
+        self._write_json_atomic(path, payload)
+        print(
+            "Quarantaine anti-ban active jusqu'au "
+            f"{payload['resume_after']} ({self.block_cooldown_hours:g} h)."
+        )
+        return path
+
+    def _active_access_cooldown(self) -> Optional[Dict[str, object]]:
+        path = self._state_path("access_cooldown")
+        payload = self._load_json_dict(path)
+        if not payload:
+            return None
+        try:
+            resume_after = datetime.fromisoformat(str(payload.get("resume_after", "")))
+        except ValueError:
+            return None
+        if datetime.now() >= resume_after:
+            return None
+        payload["path"] = path
+        return payload
+
+    def _clear_access_cooldown(self) -> None:
+        path = self._state_path("access_cooldown")
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError as exc:
+            print(f"Avertissement: quarantaine anti-ban non supprimee ({str(exc)[:160]}).")
+
+    def mark_run_state(self, mode: str, result: RunResult) -> str:
+        payload = {
+            "mode": mode,
+            "data_schema_version": DATA_SCHEMA_VERSION,
+            "status": result.status,
+            "reason": result.reason,
+            "completed_at": datetime.now().isoformat(timespec="seconds"),
+            "rows_count": result.rows_count,
+            "requested_letters": result.requested_letters,
+            "completed_letters": result.completed_letters,
+            "export_paths": result.export_paths,
+            "session_stats": self.session_stats,
+        }
+        path = self._state_path(f"last_{mode}_run")
+        self._write_json_atomic(path, payload)
+        print(f"  ETAT {mode.upper()}: {result.status.upper()} ({result.reason})")
+        print(f"  Rapport d'etat: {path}")
+        return path
+
+    def _load_json_dict(self, path: str) -> Optional[Dict[str, object]]:
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _validate_final_exports(self, export_paths: Dict[str, str]) -> bool:
+        required = ("json_path", "csv_path", "stats_path", "report_path")
+        return all(
+            isinstance(export_paths.get(key), str)
+            and os.path.isfile(export_paths[key])
+            and os.path.getsize(export_paths[key]) > 0
+            for key in required
+        )
+
+    def _validate_final_letter_files(self, letters: List[str]) -> bool:
+        for letter in letters:
+            final_json, final_csv, _, _ = self._letter_paths(self._letter_tag(letter))
+            if not os.path.isfile(final_json) or not os.path.isfile(final_csv):
+                return False
+            if os.path.getsize(final_json) == 0 or os.path.getsize(final_csv) == 0:
+                return False
+            if not self._load_json_list(final_json):
+                return False
+        return True
+
+    def _diff_run_config(
+        self,
+        letters: List[str],
+        max_pages_per_letter: Optional[int],
+        max_series_per_letter: Optional[int],
+        refresh_stale_days: Optional[int],
+        drop_missing: bool,
+        max_missing_ratio: float = 0.15,
+    ) -> Dict[str, object]:
+        return {
+            "data_schema_version": DATA_SCHEMA_VERSION,
+            "letters": letters,
+            "max_pages_per_letter": max_pages_per_letter,
+            "max_series_per_letter": max_series_per_letter,
+            "refresh_stale_days": refresh_stale_days,
+            "drop_missing": drop_missing,
+            "max_missing_ratio": max_missing_ratio,
+        }
+
+    def _load_diff_run_checkpoint(self, config: Dict[str, object], resume: bool) -> List[str]:
+        if not resume:
+            return []
+        checkpoint = self._load_json_dict(self._state_path("diff_checkpoint"))
+        if not checkpoint or checkpoint.get("config") != config:
+            return []
+        completed = checkpoint.get("completed_letters", [])
+        if not isinstance(completed, list):
+            return []
+        configured_letters = config.get("letters", [])
+        configured_labels = {
+            self._letter_label(str(letter))
+            for letter in configured_letters
+        } if isinstance(configured_letters, list) else set()
+        result = [str(letter) for letter in completed if str(letter) in configured_labels]
+        if result:
+            print(f"Reprise du diff: {len(result)} lettre(s) deja finalisee(s): {', '.join(result)}")
+        return result
+
+    def _save_diff_run_checkpoint(self, config: Dict[str, object], completed_letters: List[str]) -> None:
+        payload = {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "config": config,
+            "completed_letters": completed_letters,
+        }
+        self._write_json_atomic(self._state_path("diff_checkpoint"), payload)
+
+    def _letter_checkpoint_path(self, letter_tag: str) -> str:
+        _, checkpoints_dir, _, _ = self._ensure_dirs()
+        return os.path.join(checkpoints_dir, f"nautiljon_lettre_{letter_tag}.json")
+
+    def _archive_letter_progress(self, letter_tag: str, checkpoint_path: str, reason: str) -> Optional[str]:
+        paths = [checkpoint_path, *self._letter_paths(letter_tag)[2:]]
+        existing_paths = [path for path in paths if os.path.isfile(path)]
+        if not existing_paths:
+            return None
+        _, checkpoints_dir, _, _ = self._ensure_dirs()
+        safe_reason = re.sub(r"[^a-z0-9_-]+", "_", _norm(reason)).strip("_") or "incompatible"
+        archive_dir = os.path.join(
+            checkpoints_dir,
+            "archive",
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{letter_tag}_{safe_reason}",
+        )
+        os.makedirs(archive_dir, exist_ok=True)
+        for path in existing_paths:
+            shutil.copy2(path, os.path.join(archive_dir, os.path.basename(path)))
+        print(f"  Progression precedente archivee avant remplacement: {archive_dir}")
+        return archive_dir
+
+    def _letter_checkpoint_is_compatible(self, letter_tag: str, checkpoint: Dict[str, object]) -> bool:
+        settings = checkpoint.get("settings")
+        if not isinstance(settings, dict):
+            return False
+        saved_letter = str(settings.get("letter", "") or "")
+        return bool(saved_letter) and self._letter_tag(saved_letter) == letter_tag
+
+    def _remove_checkpoint(self, path: str) -> None:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
     def _write_csv(self, path: str, rows: List[Dict[str, str]]) -> None:
         keys = set()
@@ -287,11 +623,13 @@ class NautiljonScraper:
         fieldnames = [field for field in PREFERRED_FIELDS]
         extras = sorted(key for key in keys if key not in set(PREFERRED_FIELDS))
         fieldnames.extend(extras)
-        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter=";")
             writer.writeheader()
             for row in rows:
                 writer.writerow({field: _clean_spaces(str(row.get(field, "N/A") or "N/A")) for field in fieldnames})
+        os.replace(tmp_path, path)
 
     def save_letter_files(self, letter_tag: str, rows: List[Dict[str, str]], partial: bool = False) -> None:
         final_json, final_csv, partial_json, partial_csv = self._letter_paths(letter_tag)
@@ -304,6 +642,175 @@ class NautiljonScraper:
         self._write_csv(csv_path, rows)
         if not partial:
             print(f"  Lettre sauvegardee: {os.path.basename(final_json)} / {os.path.basename(final_csv)}")
+
+    def save_controlled_letter_files(self, letter_tag: str, rows: List[Dict[str, str]]) -> Dict[str, str]:
+        control_dir = os.path.join(self.out_dir, "control")
+        os.makedirs(control_dir, exist_ok=True)
+        base = os.path.join(control_dir, f"nautiljon_lettre_{letter_tag}.control")
+        json_path = base + ".json"
+        csv_path = base + ".csv"
+        tmp_json = json_path + ".tmp"
+        with open(tmp_json, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp_json, json_path)
+        self._write_csv(csv_path, rows)
+        print(f"  Controle sauvegarde sans modifier la lettre finale: {json_path} / {csv_path}")
+        return {"json_path": json_path, "csv_path": csv_path}
+
+    def _letter_cache_paths(self, letter_tag: str) -> Tuple[str, str, str]:
+        cache_dir = os.path.join(self.out_dir, "letter-cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        base = os.path.join(cache_dir, f"nautiljon_lettre_{letter_tag}.validated")
+        marker_path = self._state_path(f"letter_{letter_tag}_success")
+        return base + ".json", base + ".csv", marker_path
+
+    def _save_letter_cache(
+        self,
+        letter_tag: str,
+        rows: List[Dict[str, str]],
+        counters: Dict[str, object],
+        source_mode: str,
+        completed_at: Optional[str] = None,
+    ) -> Dict[str, object]:
+        json_path, csv_path, marker_path = self._letter_cache_paths(letter_tag)
+        normalized_rows = [self._normalize_row(row) for row in rows]
+        self._write_json_atomic(json_path, normalized_rows)
+        self._write_csv(csv_path, normalized_rows)
+        payload: Dict[str, object] = {
+            "status": "success",
+            "version": DATA_SCHEMA_VERSION,
+            "letter": letter_tag,
+            "completed_at": completed_at or datetime.now().isoformat(timespec="seconds"),
+            "rows_count": len(normalized_rows),
+            "json_path": json_path,
+            "csv_path": csv_path,
+            "source_mode": source_mode,
+            "backend": self.backend,
+            "excluded_types": list(BANNED_TYPE_KEYWORDS),
+            "stats": dict(counters),
+        }
+        self._write_json_atomic(marker_path, payload)
+        print(f"  Cache valide {letter_tag}: {len(normalized_rows)} series ({marker_path})")
+        return payload
+
+    def _validate_letter_cache(
+        self,
+        letter_tag: str,
+        marker: Dict[str, object],
+        min_days: int,
+        max_missing_ratio: float,
+    ) -> Optional[Tuple[List[Dict[str, str]], timedelta]]:
+        if min_days <= 0 or marker.get("status") != "success" or marker.get("letter") != letter_tag:
+            return None
+        if marker.get("version") != DATA_SCHEMA_VERSION:
+            return None
+        if marker.get("excluded_types") != list(BANNED_TYPE_KEYWORDS):
+            return None
+        try:
+            age = datetime.now() - datetime.fromisoformat(str(marker.get("completed_at", "")))
+        except ValueError:
+            return None
+        if age < timedelta(0) or age >= timedelta(days=min_days):
+            return None
+        stats = marker.get("stats")
+        if not isinstance(stats, dict):
+            return None
+        if any(stats.get(key) for key in ("listing_failed", "access_blocked", "coverage_failed", "detail_failed", "limited")):
+            return None
+        try:
+            missing_ratio = float(stats.get("missing_ratio", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if max_missing_ratio >= 0 and missing_ratio > max_missing_ratio:
+            return None
+        json_path = marker.get("json_path")
+        csv_path = marker.get("csv_path")
+        if not isinstance(json_path, str) or not isinstance(csv_path, str):
+            return None
+        if not os.path.isfile(csv_path) or os.path.getsize(csv_path) == 0:
+            return None
+        rows = [self._normalize_row(row) for row in self._load_json_list(json_path)]
+        if not rows or len(rows) != int(marker.get("rows_count", 0) or 0):
+            return None
+        urls = [_ensure_abs_url(row.get("url_fiche", "")) for row in rows]
+        if any(not url for url in urls) or len(set(urls)) != len(rows):
+            return None
+        if any(self._letter_tag_for_row(row) != letter_tag for row in rows):
+            return None
+        return rows, age
+
+    def _adopt_recent_control_cache(
+        self,
+        letter_tag: str,
+        min_days: int,
+        max_missing_ratio: float,
+    ) -> Optional[Dict[str, object]]:
+        report = self._load_json_dict(self._state_path("last_diff_run"))
+        if not report or report.get("status") != "partial" or report.get("reason") != "controlled_subset_complete":
+            return None
+        if report.get("data_schema_version") != DATA_SCHEMA_VERSION:
+            return None
+        completed = report.get("completed_letters")
+        if not isinstance(completed, list) or letter_tag not in completed:
+            return None
+        completed_at = str(report.get("completed_at", ""))
+        try:
+            age = datetime.now() - datetime.fromisoformat(completed_at)
+        except ValueError:
+            return None
+        if min_days <= 0 or age < timedelta(0) or age >= timedelta(days=min_days):
+            return None
+        session_stats = report.get("session_stats")
+        diff_by_letter = session_stats.get("diff_by_letter") if isinstance(session_stats, dict) else None
+        counters = diff_by_letter.get(letter_tag) if isinstance(diff_by_letter, dict) else None
+        if not isinstance(counters, dict):
+            return None
+        if any(counters.get(key) for key in ("listing_failed", "access_blocked", "coverage_failed", "detail_failed", "limited")):
+            return None
+        try:
+            missing_ratio = float(counters.get("missing_ratio", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if max_missing_ratio >= 0 and missing_ratio > max_missing_ratio:
+            return None
+        if int(counters.get("missing_count", 0) or 0) != 0:
+            print(
+                f"  Controle recent {letter_tag} non adopte: il contient des fiches historiques "
+                "conservees mais non observees."
+            )
+            return None
+        base = os.path.join(self.out_dir, "control", f"nautiljon_lettre_{letter_tag}.control")
+        control_json = base + ".json"
+        control_csv = base + ".csv"
+        rows = [self._normalize_row(row) for row in self._load_json_list(control_json)]
+        if not rows or not os.path.isfile(control_csv) or os.path.getsize(control_csv) == 0:
+            return None
+        print(f"  Adoption du controle recent de la lettre {letter_tag} dans le cache valide.")
+        return self._save_letter_cache(
+            letter_tag,
+            rows,
+            counters,
+            source_mode="controlled_legacy",
+            completed_at=completed_at,
+        )
+
+    def _load_reusable_letter_cache(
+        self,
+        letter_tag: str,
+        min_days: int,
+        max_missing_ratio: float,
+    ) -> Optional[Tuple[List[Dict[str, str]], Dict[str, object], timedelta]]:
+        _, _, marker_path = self._letter_cache_paths(letter_tag)
+        marker = self._load_json_dict(marker_path)
+        if not marker:
+            marker = self._adopt_recent_control_cache(letter_tag, min_days, max_missing_ratio)
+        if not marker:
+            return None
+        validated = self._validate_letter_cache(letter_tag, marker, min_days, max_missing_ratio)
+        if not validated:
+            return None
+        rows, age = validated
+        return rows, marker, age
 
     def _remove_partial_files(self, letter_tag: str) -> None:
         _, _, partial_json, partial_csv = self._letter_paths(letter_tag)
@@ -488,12 +995,11 @@ class NautiljonScraper:
         stats_path = os.path.join(exports_dir, f"{base_filename}_stats.json")
         report_path = os.path.join(exports_dir, f"{base_filename}_rapport.txt")
 
-        with open(json_path, "w", encoding="utf-8") as handle:
-            json.dump(rows, handle, ensure_ascii=False, indent=2)
+        self._write_json_atomic(json_path, rows)
         self._write_csv(csv_path, rows)
-        with open(stats_path, "w", encoding="utf-8") as handle:
-            json.dump(self.session_stats, handle, ensure_ascii=False, indent=2, default=str)
-        with open(report_path, "w", encoding="utf-8") as handle:
+        self._write_json_atomic(stats_path, self.session_stats)
+        tmp_report_path = report_path + ".tmp"
+        with open(tmp_report_path, "w", encoding="utf-8") as handle:
             handle.write("RAPPORT DE SCRAPING NAUTILJON\n")
             handle.write(f"Date: {_now_str()}\n")
             handle.write("=" * 50 + "\n\n")
@@ -501,6 +1007,7 @@ class NautiljonScraper:
             handle.write(f"Erreurs: {self.session_stats.get('errors', 0)}\n")
             handle.write(f"Ignorées par type: {self.session_stats.get('skipped_by_type', 0)}\n")
             handle.write(f"Duree: {self.session_stats.get('duration', 'N/A')}\n")
+        os.replace(tmp_report_path, report_path)
         print(f"OK export final: {csv_path} ({len(rows)} lignes)")
         return {
             "json_path": json_path,
@@ -641,24 +1148,734 @@ class NautiljonScraper:
         normalized["url_fiche"] = _ensure_abs_url(normalized.get("url_fiche", ""))
         return normalized
 
+    def setup_browser(self) -> webdriver.Chrome:
+        if self.driver:
+            return self.driver
+
+        debug_dir = os.path.join(self.out_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        log_path = os.path.join(debug_dir, f"chromedriver_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        profile_dir = os.environ.get(
+            "NAUTILJON_BROWSER_PROFILE",
+            os.path.join(self.out_dir, "browser-profile"),
+        )
+        os.makedirs(profile_dir, exist_ok=True)
+
+        browser_binary = os.environ.get("NAUTILJON_CHROME_BINARY", "/usr/bin/chromium")
+        attach_browser = _env_bool("NAUTILJON_BROWSER_ATTACH", False)
+        options = webdriver.ChromeOptions()
+
+        common_args = [
+            "--no-sandbox",
+            "--window-size=1280,800",
+            "--lang=fr-FR",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--disable-features=Translate,MediaRouter",
+            "--disable-extensions",
+            "--disable-gpu",
+            "--disable-sync",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-breakpad",
+            "--renderer-process-limit=2",
+            "--disk-cache-size=67108864",
+            "--media-cache-size=16777216",
+            "--remote-allow-origins=*",
+        ]
+
+        if attach_browser:
+            if not os.path.isfile(browser_binary):
+                raise RuntimeError(f"Binaire Chromium introuvable: {browser_binary}")
+            debugger_address = os.environ.get("NAUTILJON_DEBUGGER_ADDRESS", "127.0.0.1:9222").strip()
+            self._start_browser_process(browser_binary, profile_dir, debugger_address, common_args)
+            options.debugger_address = debugger_address
+        else:
+            if os.path.isfile(browser_binary):
+                options.binary_location = browser_binary
+            if self.browser_headless:
+                options.add_argument("--headless=new")
+            for argument in common_args:
+                options.add_argument(argument)
+            options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")
+            options.add_experimental_option("prefs", {
+                "intl.accept_languages": "fr-FR,fr,en-US,en",
+                "profile.default_content_setting_values.notifications": 2,
+                "profile.exit_type": "Normal",
+                "profile.exited_cleanly": True,
+            })
+
+        driver_binary = os.environ.get("NAUTILJON_CHROMEDRIVER", "/usr/bin/chromedriver")
+        service = ChromeService(
+            executable_path=driver_binary if os.path.isfile(driver_binary) else None,
+            log_output=log_path,
+        )
+        browser_mode = "attache au Chromium autonome" if attach_browser else "lance par ChromeDriver"
+        print(f"Navigateur Selenium: chromium ({'headless' if self.browser_headless else 'Xvfb visible'}, {browser_mode})")
+        print(f"Profil persistant: {profile_dir}")
+        print(f"Log ChromeDriver: {log_path}")
+        try:
+            self.driver = webdriver.Chrome(service=service, options=options)
+            self.driver.set_page_load_timeout(60)
+            self.driver.set_window_size(1280, 800)
+            self.driver.get("about:blank")
+            version = self.driver.capabilities.get("browserVersion", "inconnue")
+            print(f"Session Selenium active, Chromium {version}")
+            return self.driver
+        except WebDriverException as exc:
+            self._stop_browser_process()
+            raise RuntimeError(f"Impossible de demarrer Chromium/Selenium: {str(exc)[:500]}") from exc
+
+    def _start_browser_process(
+        self,
+        browser_binary: str,
+        profile_dir: str,
+        debugger_address: str,
+        common_args: List[str],
+    ) -> None:
+        if self.browser_process and self.browser_process.poll() is None:
+            return
+
+        host, separator, port_text = debugger_address.rpartition(":")
+        if not separator or not port_text.isdigit():
+            raise RuntimeError(f"NAUTILJON_DEBUGGER_ADDRESS invalide: {debugger_address}")
+        host = host or "127.0.0.1"
+        port = int(port_text)
+
+        for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            path = os.path.join(profile_dir, name)
+            try:
+                if os.path.lexists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+        debug_dir = os.path.join(self.out_dir, "debug")
+        browser_log_path = os.path.join(
+            debug_dir,
+            f"chromium_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+        )
+        self._browser_log_handle = open(browser_log_path, "a", encoding="utf-8")
+        command = [
+            browser_binary,
+            f"--remote-debugging-address={host}",
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={os.path.abspath(profile_dir)}",
+            *common_args,
+        ]
+        if self.browser_headless:
+            command.append("--headless=new")
+        command.append("about:blank")
+
+        print(f"Demarrage autonome de Chromium: {debugger_address}")
+        print(f"Log Chromium: {browser_log_path}")
+        self.browser_process = subprocess.Popen(
+            command,
+            stdout=self._browser_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+        endpoint = f"http://{debugger_address}/json/version"
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if self.browser_process.poll() is not None:
+                self._stop_browser_process()
+                raise RuntimeError(f"Chromium autonome s'est arrete avant son attachement. Log: {browser_log_path}")
+            try:
+                response = requests.get(endpoint, timeout=0.5)
+                if response.ok:
+                    return
+            except requests.RequestException:
+                pass
+            time.sleep(0.2)
+
+        self._stop_browser_process()
+        raise RuntimeError(f"Port de debogage Chromium indisponible apres 20 secondes: {endpoint}")
+
+    def _stop_browser_process(self) -> None:
+        process = self.browser_process
+        self.browser_process = None
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if self._browser_log_handle:
+            self._browser_log_handle.close()
+            self._browser_log_handle = None
+
+    def close_browser(self) -> None:
+        try:
+            if self.driver:
+                self.driver.quit()
+        finally:
+            self.driver = None
+            self._browser_letter_urls.clear()
+            self._stop_browser_process()
+            self.close_flaresolverr()
+
+    def _flaresolverr_api_url(self) -> str:
+        url = os.environ.get("NAUTILJON_FLARESOLVERR_URL", "http://flaresolverr:8191/v1").strip().rstrip("/")
+        if not url:
+            raise RuntimeError("NAUTILJON_FLARESOLVERR_URL est vide")
+        return url if url.endswith("/v1") else url + "/v1"
+
+    @staticmethod
+    def _flaresolverr_proxy() -> Optional[Dict[str, str]]:
+        url = os.environ.get("NAUTILJON_FLARESOLVERR_PROXY_URL", "").strip()
+        if not url:
+            return None
+        proxy = {"url": url}
+        username = os.environ.get("NAUTILJON_FLARESOLVERR_PROXY_USERNAME", "").strip()
+        password = os.environ.get("NAUTILJON_FLARESOLVERR_PROXY_PASSWORD", "").strip()
+        if username:
+            proxy["username"] = username
+        if password:
+            proxy["password"] = password
+        return proxy
+
+    def _flaresolverr_post(self, payload: Dict[str, object]) -> Dict[str, object]:
+        timeout_ms = max(1000, _env_int("NAUTILJON_FLARESOLVERR_TIMEOUT_MS", 120000))
+        try:
+            response = requests.post(
+                self._flaresolverr_api_url(),
+                json=payload,
+                timeout=(5, max(30, timeout_ms / 1000 + 15)),
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise RuntimeError(f"FlareSolverr inaccessible: {str(exc)[:300]}") from exc
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            message = data.get("message", "reponse API invalide") if isinstance(data, dict) else "reponse API invalide"
+            raise RuntimeError(f"FlareSolverr a refuse la requete: {message}")
+        return data
+
+    def setup_flaresolverr(self) -> str:
+        if self.flaresolverr_session_id:
+            return self.flaresolverr_session_id
+        session_id = f"nautiljon-{os.getpid()}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        attempts = max(1, _env_int("NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS", 30))
+        retry_delay = max(0, _env_float("NAUTILJON_FLARESOLVERR_STARTUP_DELAY", 2.0))
+        payload: Dict[str, object] = {"cmd": "sessions.create", "session": session_id}
+        proxy = self._flaresolverr_proxy()
+        if proxy:
+            payload["proxy"] = proxy
+        for attempt in range(1, attempts + 1):
+            try:
+                self._flaresolverr_post(payload)
+                break
+            except RuntimeError as exc:
+                if attempt == attempts:
+                    raise RuntimeError(
+                        f"FlareSolverr non pret apres {attempts} tentative(s): {exc}"
+                    ) from exc
+                print(f"FlareSolverr pas encore pret ({attempt}/{attempts}); nouvel essai dans {retry_delay:g}s")
+                time.sleep(retry_delay)
+        self.flaresolverr_session_id = session_id
+        print(f"Session FlareSolverr active: {session_id}")
+        return session_id
+
+    def close_flaresolverr(self) -> None:
+        session_id = self.flaresolverr_session_id
+        self.flaresolverr_session_id = None
+        self._flaresolverr_letter_urls.clear()
+        self._flaresolverr_listing_urls.clear()
+        self._flaresolverr_page_has_next.clear()
+        if not session_id:
+            return
+        try:
+            self._flaresolverr_post({"cmd": "sessions.destroy", "session": session_id})
+            print(f"Session FlareSolverr fermee: {session_id}")
+        except Exception as exc:
+            print(f"Avertissement: fermeture FlareSolverr impossible: {str(exc)[:180]}")
+
+    def _fetch_html_flaresolverr(self, url: str) -> str:
+        timeout_ms = max(1000, _env_int("NAUTILJON_FLARESOLVERR_TIMEOUT_MS", 120000))
+        target_url = _ensure_abs_url(url)
+        self._pace_remote_request(target_url, "navigation FlareSolverr")
+        payload: Dict[str, object] = {
+            "cmd": "request.get",
+            "url": target_url,
+            "session": self.setup_flaresolverr(),
+            "maxTimeout": timeout_ms,
+        }
+        if (urlsplit(target_url).hostname or "").endswith("nautiljon.com"):
+            payload["cookies"] = [{
+                "name": "cookieconsent_status",
+                "value": "dismiss",
+                "domain": ".nautiljon.com",
+                "path": "/",
+            }]
+        data = self._flaresolverr_post(payload)
+        solution = data.get("solution")
+        if not isinstance(solution, dict):
+            raise RuntimeError("FlareSolverr: solution absente")
+        status_code = int(solution.get("status", 0) or 0)
+        html = solution.get("response", "")
+        self._last_flaresolverr_url = str(solution.get("url", url))
+        if status_code in {403, 429} and (not isinstance(html, str) or not html):
+            raise NautiljonAccessBlockedError(f"FlareSolverr: HTTP {status_code} pour {url}")
+        if not isinstance(html, str) or not html:
+            raise RuntimeError(f"FlareSolverr: reponse vide pour {url}")
+        if self._nautiljon_access_blocked(html):
+            raise NautiljonAccessBlockedError(
+                "Nautiljon a interdit l'IP de sortie pour abus; arret immediat sans nouvelle tentative"
+            )
+        if self._blocked_by_waf(html):
+            raise NautiljonAccessBlockedError(
+                f"FlareSolverr n'a pas resolu Cloudflare pour {url}"
+            )
+        if status_code in {403, 429}:
+            raise NautiljonAccessBlockedError(f"FlareSolverr: HTTP {status_code} pour {url}")
+        if status_code >= 400:
+            raise RuntimeError(f"FlareSolverr: HTTP {status_code} pour {url}")
+        return html
+
+    def _save_browser_debug(self, context: str) -> Dict[str, str]:
+        if not self.driver:
+            return {}
+        debug_dir = os.path.join(self.out_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        safe_context = re.sub(r"[^a-zA-Z0-9_.-]+", "_", context).strip("_") or "page"
+        base = os.path.join(debug_dir, f"selenium_{safe_context}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        paths: Dict[str, str] = {}
+        try:
+            html_path = base + ".html"
+            with open(html_path, "w", encoding="utf-8") as handle:
+                handle.write(self.driver.page_source)
+            paths["html"] = html_path
+        except Exception:
+            pass
+        try:
+            png_path = base + ".png"
+            self.driver.save_screenshot(png_path)
+            paths["screenshot"] = png_path
+        except Exception:
+            pass
+        return paths
+
+    def _dismiss_cookie_consent(self) -> bool:
+        if not self.driver:
+            return False
+        css_selectors = [
+            "#didomi-notice-agree-button",
+            "#onetrust-accept-btn-handler",
+            "button[mode='primary']",
+            "button[aria-label*='Accepter']",
+            "button[aria-label*='accepter']",
+        ]
+        xpaths = [
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tout accepter')]",
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accepter')]",
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), \"j'accepte\")]",
+            "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accepter')]",
+        ]
+
+        contexts = [None]
+        try:
+            contexts.extend(self.driver.find_elements(By.CSS_SELECTOR, "iframe"))
+        except Exception:
+            pass
+        for frame in contexts:
+            try:
+                self.driver.switch_to.default_content()
+                if frame is not None:
+                    self.driver.switch_to.frame(frame)
+                elements = []
+                for selector in css_selectors:
+                    elements.extend(self.driver.find_elements(By.CSS_SELECTOR, selector))
+                for xpath in xpaths:
+                    elements.extend(self.driver.find_elements(By.XPATH, xpath))
+                for element in elements:
+                    if element.is_displayed() and element.is_enabled():
+                        self.driver.execute_script("arguments[0].click();", element)
+                        self.driver.switch_to.default_content()
+                        print("Consentement cookies accepte automatiquement.")
+                        time.sleep(0.5)
+                        return True
+            except Exception:
+                continue
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        return False
+
+    def _wait_browser_page(self, context: str) -> None:
+        if not self.driver:
+            raise RuntimeError("Driver Selenium non initialise")
+        try:
+            WebDriverWait(self.driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        except TimeoutException as exc:
+            debug = self._save_browser_debug(context)
+            raise RuntimeError(f"Page Selenium vide ou trop lente ({context}). Debug: {debug}") from exc
+
+        wait_seconds = _env_int("NAUTILJON_CLOUDFLARE_WAIT_SECONDS", 120)
+        challenge_deadline = time.time() + wait_seconds
+        announced = False
+        while True:
+            html = self.driver.page_source
+            if self._cloudflare_challenge(html):
+                if not announced:
+                    print(f"Verification Cloudflare detectee; attente automatique jusqu'a {wait_seconds}s.")
+                    announced = True
+                if time.time() >= challenge_deadline:
+                    debug = self._save_browser_debug(context)
+                    raise NautiljonAccessBlockedError(
+                        f"La verification Cloudflare ne s'est pas terminee apres {wait_seconds}s "
+                        f"({context}). Debug: {debug}"
+                    )
+                time.sleep(1)
+                continue
+            if self._blocked_by_waf(html):
+                debug = self._save_browser_debug(context)
+                raise NautiljonAccessBlockedError(
+                    f"Cloudflare bloque le navigateur Selenium ({context}). Debug: {debug}"
+                )
+            break
+        if announced:
+            print("Verification Cloudflare terminee.")
+        self._dismiss_cookie_consent()
+
+    def _browser_get(self, url: str, context: str) -> str:
+        driver = self.setup_browser()
+        target_url = _ensure_abs_url(url)
+        self._pace_remote_request(target_url, f"navigation Selenium {context}")
+        try:
+            driver.get(target_url)
+        except WebDriverException as exc:
+            debug = self._save_browser_debug(context)
+            raise RuntimeError(f"Navigation Selenium impossible ({context}): {str(exc)[:300]}. Debug: {debug}") from exc
+        self._wait_browser_page(context)
+        return driver.page_source
+
+    def _find_visible_search_input(self):
+        if not self.driver:
+            return None
+        selectors = [
+            "input[name='q']",
+            "input[type='search']",
+            "#content input[type='text']",
+            "form input[type='text']",
+        ]
+        for selector in selectors:
+            for element in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                if element.is_displayed() and element.is_enabled():
+                    return element
+        return None
+
+    def _submit_manga_search_form(self, query: str) -> bool:
+        search_input = self._find_visible_search_input()
+        if not self.driver or search_input is None:
+            return False
+        try:
+            search_input.click()
+            search_input.send_keys(Keys.CONTROL, "a")
+            search_input.send_keys(query)
+            form = search_input.find_element(By.XPATH, "./ancestor::form[1]")
+            buttons = form.find_elements(By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], button")
+            self._pace_remote_request(self.driver.current_url, "soumission du formulaire mangas")
+            if buttons:
+                self.driver.execute_script("arguments[0].click();", buttons[0])
+            else:
+                search_input.send_keys(Keys.ENTER)
+            self._sleep_delay()
+            self._wait_browser_page("mangas_form_submit")
+            return True
+        except Exception as exc:
+            print(f"Soumission du formulaire Nautiljon impossible: {str(exc)[:160]}")
+            return False
+
+    def _click_manga_letter_link(self, letter: str) -> bool:
+        if not self.driver:
+            return False
+        target = self._letter_label(letter)
+        xpaths = [
+            f"//a[normalize-space(.)='{target}' and contains(@href, '/mangas')]",
+            f"//*[@id='content']//a[normalize-space(.)='{target}']",
+            f"//a[normalize-space(.)='{target}']",
+        ]
+        for xpath in xpaths:
+            for link in self.driver.find_elements(By.XPATH, xpath):
+                if not link.is_displayed() or not link.is_enabled():
+                    continue
+                try:
+                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", link)
+                    self._pace_remote_request(self.driver.current_url, f"clic lettre {target}")
+                    self.driver.execute_script("arguments[0].click();", link)
+                    self._sleep_delay()
+                    self._wait_browser_page("mangas_letter_click")
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    def open_manga_letter_index(self, letter: str) -> str:
+        driver = self.setup_browser()
+        label = self._letter_label(letter)
+        query = "#" if letter == "%23" else letter.lower()
+        print(f"Initialisation Selenium de la lettre {label} via l'interface Nautiljon.")
+        self._browser_get(f"{BASE_URL}/mangas/", "mangas_root")
+        if self._click_manga_letter_link(letter) and not self._search_session_expired(driver.page_source):
+            return driver.current_url
+
+        self._browser_get(f"{BASE_URL}/mangas/", "mangas_root_form")
+        if not self._submit_manga_search_form(query):
+            raise RuntimeError("Impossible d'initialiser la recherche Nautiljon via son interface")
+        if self._search_session_expired(driver.page_source):
+            raise RuntimeError("La session de recherche Nautiljon expire immediatement")
+        return driver.current_url
+
+    def _fetch_listing_page_selenium(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
+        driver = self.setup_browser()
+        tag = self._letter_tag(letter)
+        if page_num == 0 or tag not in self._browser_letter_urls:
+            self._browser_letter_urls[tag] = self.open_manga_letter_index(letter)
+        page_url = self._url_with_dbt(self._browser_letter_urls[tag], page_num)
+        if page_num > 0 or driver.current_url != page_url:
+            html = self._browser_get(page_url, f"listing_{tag}_{page_num + 1}")
+        else:
+            html = driver.page_source
+        if self._search_session_expired(html):
+            self._browser_letter_urls[tag] = self.open_manga_letter_index(letter)
+            page_url = self._url_with_dbt(self._browser_letter_urls[tag], page_num)
+            html = self._browser_get(page_url, f"listing_{tag}_{page_num + 1}_recovery")
+        rows = self.extract_series_list_from_html(html)
+        expected_tag = self._letter_tag(letter)
+        matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
+        if rows and len(matching_rows) < max(1, int(len(rows) * 0.8)):
+            raise RuntimeError(
+                f"Listing Selenium incoherent pour {self._letter_label(letter)}: "
+                f"{len(matching_rows)}/{len(rows)} titres correspondent"
+            )
+        return driver.current_url, matching_rows
+
+    def _load_flaresolverr_letter_urls(self) -> None:
+        if self._flaresolverr_letter_urls:
+            return
+        html = self._fetch_html_flaresolverr(f"{BASE_URL}/mangas/")
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            label = _clean_spaces(anchor.get_text(" ", strip=True)).upper()
+            if label == "#" or re.fullmatch(r"[A-Z]", label):
+                href = str(anchor.get("href", ""))
+                if "/mangas/" in href and "q=" in href and "st=" in href:
+                    self._flaresolverr_letter_urls[label] = _ensure_abs_url(href)
+        missing = [self._letter_label(letter) for letter in self.get_all_letters() if self._letter_label(letter) not in self._flaresolverr_letter_urls]
+        if missing:
+            raise RuntimeError(f"FlareSolverr: liens alphabetiques introuvables: {', '.join(missing)}")
+        print(f"Index Nautiljon initialise via FlareSolverr: {len(self._flaresolverr_letter_urls)} lettres")
+
+    @staticmethod
+    def _extract_next_listing_url(html: str, current_url: str, page_num: int) -> Optional[str]:
+        target_offset = (page_num + 1) * 50
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            href = urljoin(current_url, str(anchor.get("href", "")))
+            parsed = urlsplit(href)
+            if "/mangas/" not in parsed.path:
+                continue
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            try:
+                offset = int(query.get("dbt", "-1"))
+            except ValueError:
+                continue
+            if offset == target_offset:
+                return href
+        return None
+
+    def _set_flaresolverr_listing_url(self, letter: str, page_num: int, url: str) -> None:
+        if url:
+            self._flaresolverr_listing_urls[(self._letter_tag(letter), page_num)] = _ensure_abs_url(url)
+
+    def _flaresolverr_listing_has_next(self, letter: str, page_num: int) -> bool:
+        return self._flaresolverr_page_has_next.get((self._letter_tag(letter), page_num), False)
+
+    def _fetch_listing_page_flaresolverr(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
+        self._load_flaresolverr_letter_urls()
+        label = self._letter_label(letter)
+        key = (self._letter_tag(letter), page_num)
+        page_url = self._flaresolverr_listing_urls.get(key)
+        if not page_url:
+            page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
+        html = self._fetch_html_flaresolverr(page_url)
+        if self._search_session_expired(html):
+            self._flaresolverr_letter_urls.clear()
+            self._load_flaresolverr_letter_urls()
+            page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
+            html = self._fetch_html_flaresolverr(page_url)
+        final_url = self._last_flaresolverr_url or page_url
+        rows = self.extract_series_list_from_html(html)
+        expected_tag = self._letter_tag(letter)
+        matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
+        if rows and len(matching_rows) < max(1, int(len(rows) * 0.8)):
+            raise RuntimeError(
+                f"Listing FlareSolverr incoherent pour {label}: "
+                f"{len(matching_rows)}/{len(rows)} titres correspondent"
+            )
+        next_url = self._extract_next_listing_url(html, final_url, page_num)
+        self._flaresolverr_page_has_next[key] = bool(next_url)
+        if next_url:
+            self._set_flaresolverr_listing_url(letter, page_num + 1, next_url)
+        return final_url, matching_rows
+
+    def browser_test(self, letter: str = "a") -> Dict[str, object]:
+        print("=" * 60)
+        print("TEST SELENIUM NAUTILJON - AUCUN EXPORT MODIFIE")
+        print("=" * 60)
+        report: Dict[str, object] = {"letter": self._letter_label(letter), "listing_ok": False, "detail_ok": False}
+        try:
+            _, rows = self._fetch_listing_page_selenium(letter, 0)
+            report["listing_rows"] = len(rows)
+            report["listing_ok"] = len(rows) > 0
+            if rows:
+                html = self._browser_get(rows[0]["url_fiche"], "browser_test_detail")
+                detail = self.extract_series_detail_from_html(html)
+                useful = [value for key, value in detail.items() if key != "_titre_fr_fallback" and not _is_na(value)]
+                report["detail_fields"] = len(useful)
+                report["detail_ok"] = len(useful) > 0
+                report["sample_title"] = rows[0].get("titre", "N/A")
+        except Exception as exc:
+            report["error"] = str(exc)
+            if self.driver:
+                report["current_url"] = self.driver.current_url
+                report["page_title"] = self.driver.title
+            report["debug"] = self._save_browser_debug("browser_test_failed")
+        finally:
+            self.close_browser()
+        report["ready_for_diff"] = bool(report["listing_ok"] and report["detail_ok"])
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print("VERDICT SELENIUM: " + ("PRET POUR DIFF CONTROLE" if report["ready_for_diff"] else "BLOQUE"))
+        return report
+
+    def browser_smoke(self) -> bool:
+        print("TEST DEMARRAGE CHROMIUM / SELENIUM")
+        try:
+            driver = self.setup_browser()
+            print(f"URL navigateur: {driver.current_url}")
+            print("VERDICT NAVIGATEUR: OK")
+            return True
+        except Exception as exc:
+            print(f"VERDICT NAVIGATEUR: ECHEC ({str(exc)[:500]})")
+            return False
+        finally:
+            self.close_browser()
+
+    def _flaresolverr_public_ips(self) -> Tuple[str, str]:
+        direct_response = requests.get("http://api.ipify.org?format=json", timeout=15)
+        direct_response.raise_for_status()
+        direct_ip = str(ipaddress.ip_address(direct_response.json().get("ip", "")))
+        flaresolverr_ip_html = self._fetch_html_flaresolverr("http://api.ipify.org?format=json")
+        ip_match = re.search(r'"ip"\s*:\s*"([^"]+)"', flaresolverr_ip_html)
+        if not ip_match:
+            raise RuntimeError("IP de sortie FlareSolverr introuvable dans la reponse ipify")
+        return direct_ip, str(ipaddress.ip_address(ip_match.group(1)))
+
+    def flaresolverr_test(self, letter: str = "a") -> Dict[str, object]:
+        print("=" * 60)
+        print("TEST FLARESOLVERR NAUTILJON - AUCUN EXPORT MODIFIE")
+        print("=" * 60)
+        report: Dict[str, object] = {
+            "letter": self._letter_label(letter),
+            "api_ok": False,
+            "same_public_ip": False,
+            "listing_ok": False,
+            "detail_ok": False,
+        }
+        try:
+            direct_ip, flaresolverr_ip = self._flaresolverr_public_ips()
+            report["api_ok"] = True
+            report["gluetun_public_ip"] = direct_ip
+            report["flaresolverr_public_ip"] = flaresolverr_ip
+            report["same_public_ip"] = direct_ip == flaresolverr_ip
+
+            _, rows = self.fetch_listing_page(letter, 0)
+            report["listing_rows"] = len(rows)
+            report["listing_ok"] = len(rows) > 0
+            if rows:
+                html = self.fetch_html(rows[0]["url_fiche"])
+                detail = self.extract_series_detail_from_html(html)
+                useful = [value for key, value in detail.items() if key != "_titre_fr_fallback" and not _is_na(value)]
+                report["detail_fields"] = len(useful)
+                report["detail_ok"] = len(useful) > 0
+                report["sample_title"] = rows[0].get("titre", "N/A")
+        except Exception as exc:
+            report["error"] = str(exc)
+        finally:
+            self.close_flaresolverr()
+        report["ready_for_diff"] = bool(
+            report["api_ok"]
+            and report["same_public_ip"]
+            and report["listing_ok"]
+            and report["detail_ok"]
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print("VERDICT FLARESOLVERR: " + ("PRET POUR DIFF CONTROLE" if report["ready_for_diff"] else "BLOQUE"))
+        return report
+
     def fetch_html(self, url: str) -> str:
-        response = self.session.get(_ensure_abs_url(url), timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
+        if self.backend == "selenium":
+            return self._browser_get(url, "fiche_detail")
+        if self.backend == "flaresolverr":
+            return self._fetch_html_flaresolverr(url)
+        target_url = _ensure_abs_url(url)
+        self._pace_remote_request(target_url, "requete HTTP")
+        response = self.session.get(target_url, timeout=DEFAULT_TIMEOUT)
         response.encoding = response.encoding or "utf-8"
         html = response.text
+        if self._nautiljon_access_blocked(html):
+            raise NautiljonAccessBlockedError(
+                "Nautiljon a interdit l'IP de sortie pour abus; arret immediat sans nouvelle tentative"
+            )
         if self._blocked_by_waf(html):
-            raise RuntimeError("Nautiljon a renvoye une page de blocage/WAF.")
+            raise NautiljonAccessBlockedError("Nautiljon a renvoye une page de blocage/WAF.")
+        if response.status_code in {403, 429} or response.headers.get("cf-mitigated") == "challenge":
+            raise NautiljonAccessBlockedError(
+                f"Nautiljon refuse la requete HTTP {response.status_code}; arret sans nouvelle tentative."
+            )
+        response.raise_for_status()
         return html
+
+    def _nautiljon_access_blocked(self, html: str) -> bool:
+        text = _norm(html)
+        return (
+            "interdite pour abus" in text
+            and (
+                "recuperation de donnees" in text
+                or "pour debloquer votre acces" in text
+                or "utilisation d'un vpn" in text
+            )
+        )
 
     def _blocked_by_waf(self, html: str) -> bool:
         text = _norm(html)
         return (
-            "sorry you have been blocked" in text
+            self._nautiljon_access_blocked(html)
+            or "sorry you have been blocked" in text
             or "you are unable to access nautiljon.com" in text
             or "unable to access nautiljon.com" in text
             or "just a moment" in text
             or "performing security verification" in text
             or "access denied" in text
+            or self._cloudflare_challenge(html)
+        )
+
+    def _cloudflare_challenge(self, html: str) -> bool:
+        text = _norm(html)
+        raw = (html or "").lower()
+        return (
+            "verification de securite en cours" in text
+            or "verification en cours" in text
+            or "checking your browser" in text
+            or "just a moment" in text
+            or "performing security verification" in text
+            or "cf-chl-" in raw
+            or "challenges.cloudflare.com" in raw
         )
 
     def _search_session_expired(self, html: str) -> bool:
@@ -768,10 +1985,10 @@ class NautiljonScraper:
         offset = page_num * 50
         encoded = quote_plus(query)
         candidates = [
+            f"{BASE_URL}/mangas/{encoded}.html",
             f"{BASE_URL}/mangas/?q={encoded}",
             f"{BASE_URL}/mangas/?search={encoded}",
             f"{BASE_URL}/mangas/?lettre={encoded}",
-            f"{BASE_URL}/mangas/{encoded}.html",
         ]
         if offset > 0:
             candidates = [self._url_with_dbt(url, page_num) for url in candidates]
@@ -787,18 +2004,174 @@ class NautiljonScraper:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(items), parts.fragment))
 
     def fetch_listing_page(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
+        if self.backend == "selenium":
+            return self._fetch_listing_page_selenium(letter, page_num)
+        if self.backend == "flaresolverr":
+            return self._fetch_listing_page_flaresolverr(letter, page_num)
         last_error = ""
+        accessible_empty_url = ""
         for url in self._listing_candidate_urls(letter, page_num):
             try:
                 html = self.fetch_html(url)
                 rows = self.extract_series_list_from_html(html)
                 if rows:
-                    return url, rows
-                last_error = "aucune entree"
+                    expected_tag = self._letter_tag(letter)
+                    matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
+                    if len(matching_rows) >= max(1, int(len(rows) * 0.8)):
+                        return url, matching_rows
+                    last_error = (
+                        f"resultats incoherents pour {self._letter_label(letter)} "
+                        f"({len(matching_rows)}/{len(rows)} correspondent)"
+                    )
+                    continue
+                if not self._search_session_expired(html):
+                    accessible_empty_url = accessible_empty_url or url
+                last_error = "page accessible sans entree"
             except Exception as exc:
                 last_error = str(exc)[:160]
                 continue
+        if accessible_empty_url:
+            return accessible_empty_url, []
         raise RuntimeError(f"Listing introuvable pour {letter} page {page_num}: {last_error}")
+
+    def _diagnose_endpoint(
+        self,
+        label: str,
+        url: str,
+        kind: str = "generic",
+        expected_letter: Optional[str] = None,
+        timeout: int = DEFAULT_DIAGNOSE_TIMEOUT,
+    ) -> Dict[str, object]:
+        result: Dict[str, object] = {
+            "label": label,
+            "url": url,
+            "ok": False,
+            "status_code": None,
+            "waf_blocked": False,
+        }
+        try:
+            self._pace_remote_request(url, f"diagnostic {label}")
+            response = requests.get(
+                url,
+                headers=dict(self.session.headers),
+                cookies=self.session.cookies.get_dict(),
+                timeout=timeout,
+            )
+            html = response.text
+            result.update({
+                "status_code": response.status_code,
+                "final_url": response.url,
+                "content_type": response.headers.get("content-type", ""),
+                "bytes": len(response.content),
+                "waf_blocked": self._blocked_by_waf(html),
+            })
+            if kind == "listing":
+                rows = self.extract_series_list_from_html(html) if response.ok and not result["waf_blocked"] else []
+                matching_rows = rows
+                if expected_letter:
+                    expected_tag = self._letter_tag(expected_letter)
+                    matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
+                result["rows"] = len(rows)
+                result["matching_rows"] = len(matching_rows)
+                result["ok"] = (
+                    response.ok
+                    and not result["waf_blocked"]
+                    and len(rows) > 0
+                    and len(matching_rows) >= max(1, int(len(rows) * 0.8))
+                )
+            elif kind == "ip":
+                public_ip = ""
+                if response.ok:
+                    try:
+                        public_ip = str(ipaddress.ip_address(response.json().get("ip", "")))
+                    except (TypeError, ValueError):
+                        public_ip = ""
+                result["public_ip"] = public_ip
+                result["ok"] = response.ok and bool(public_ip)
+            elif kind == "detail":
+                detail = self.extract_series_detail_from_html(html) if response.ok and not result["waf_blocked"] else {}
+                useful = [value for key, value in detail.items() if key != "_titre_fr_fallback" and not _is_na(value)]
+                result["parsed_fields"] = len(useful)
+                result["ok"] = response.ok and not result["waf_blocked"] and len(useful) > 0
+            elif kind == "rss":
+                import xml.etree.ElementTree as ET
+
+                items = []
+                if response.ok:
+                    items = ET.fromstring(html).findall("./channel/item")
+                result["items"] = len(items)
+                result["ok"] = response.ok and len(items) > 0
+            else:
+                result["ok"] = response.ok and not result["waf_blocked"]
+        except Exception as exc:
+            result["error"] = str(exc)[:240]
+        return result
+
+    def diagnose(
+        self,
+        letter: str = "a",
+        detail_url: str = f"{BASE_URL}/mangas/one+piece.html",
+        rss_feed_urls: Optional[List[str]] = None,
+    ) -> Dict[str, object]:
+        print("=" * 60)
+        print("DIAGNOSTIC NAUTILJON - AUCUNE ECRITURE")
+        print("=" * 60)
+        checks: List[Tuple[str, str, str, Optional[str]]] = [
+            ("ip_sortie", "https://api.ipify.org?format=json", "ip", None),
+            ("robots", f"{BASE_URL}/robots.txt", "generic", None),
+            ("sitemap", f"{BASE_URL}/sitemap.xml", "generic", None),
+        ]
+        for index, url in enumerate(self._listing_candidate_urls(letter, 0), start=1):
+            checks.append((f"listing_{index}", url, "listing", letter))
+        checks.append(("fiche_connue", detail_url, "detail", None))
+        for index, feed_url in enumerate(rss_feed_urls or DEFAULT_RSS_FEEDS, start=1):
+            checks.append((f"rss_{index}", feed_url, "rss", None))
+
+        endpoints = [
+            self._diagnose_endpoint(label, url, kind, expected_letter)
+            for label, url, kind, expected_letter in checks
+        ]
+
+        egress_ok = any(item["label"] == "ip_sortie" and item["ok"] for item in endpoints)
+        listing_ok = any(str(item["label"]).startswith("listing_") and item["ok"] for item in endpoints)
+        detail_ok = any(item["label"] == "fiche_connue" and item["ok"] for item in endpoints)
+        rss_ok = any(str(item["label"]).startswith("rss_") and item["ok"] for item in endpoints)
+        ip_result = next((item for item in endpoints if item["label"] == "ip_sortie"), {})
+        public_ip = str(ip_result.get("public_ip", "")) or "INCONNUE"
+        ready_for_diff = egress_ok and listing_ok and detail_ok
+        report = {
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "public_ip": public_ip,
+            "egress_ok": egress_ok,
+            "listing_ok": listing_ok,
+            "detail_ok": detail_ok,
+            "rss_ok": rss_ok,
+            "ready_for_diff": ready_for_diff,
+            "endpoints": endpoints,
+        }
+
+        for item in endpoints:
+            status = "OK" if item["ok"] else "ECHEC"
+            suffix = " WAF/CLOUDFLARE" if item.get("waf_blocked") else ""
+            ip_suffix = f" IP={item['public_ip']}" if item.get("public_ip") else ""
+            print(
+                f"{status:6} {str(item['label']):14} HTTP={item.get('status_code')}"
+                f" lignes={item.get('rows', '-')} champs={item.get('parsed_fields', '-')}{ip_suffix}{suffix}"
+            )
+        print("-" * 60)
+        if ready_for_diff:
+            print("VERDICT: PRET POUR UN DIFF CONTROLE")
+        else:
+            print("VERDICT: BLOQUE - NE PAS LANCER LE DIFF")
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print("=" * 60)
+        print(f"IP SORTIE VPN: {public_ip}")
+        print(f"LISTINGS: {'OK' if listing_ok else 'BLOQUES'} | FICHE: {'OK' if detail_ok else 'BLOQUEE'}")
+        if ready_for_diff:
+            print("VERDICT FINAL: PRET POUR UN DIFF CONTROLE")
+        else:
+            print("VERDICT FINAL: BLOQUE - NE PAS LANCER LE DIFF")
+        return report
 
     def get_all_letters(self) -> List[str]:
         return [chr(i) for i in range(ord("a"), ord("z") + 1)] + ["%23"]
@@ -860,10 +2233,50 @@ class NautiljonScraper:
             kv[label_n] = value or "N/A"
         return kv
 
+    def _extract_vf_releases(self, soup: BeautifulSoup) -> Dict[str, str]:
+        releases = {field: "N/A" for field in VF_RELEASE_FIELDS}
+        container = soup.select_one("li.nav_vols")
+        if not container:
+            return releases
+
+        for block in container.find_all("div", recursive=False):
+            heading = block.find("strong")
+            heading_norm = _norm(heading.get_text(" ", strip=True)) if heading else ""
+            if "dernier paru" in heading_norm:
+                prefix = "dernier_tome_vf"
+            elif "a paraitre" in heading_norm:
+                prefix = "prochain_tome_vf"
+            else:
+                continue
+
+            anchor = block.find("a", href=True)
+            image = block.find("img")
+            volume_sources = [
+                anchor.get("title", "") if anchor else "",
+                image.get("alt", "") if image else "",
+            ]
+            for source in volume_sources:
+                match = re.search(r"\bvol\.?\s*([0-9]+(?:[.,][0-9]+)?)\b", source, flags=re.IGNORECASE)
+                if match:
+                    releases[f"{prefix}_numero"] = match.group(1).replace(",", ".")
+                    break
+
+            date_node = block.select_one("span.infos_small")
+            if date_node:
+                releases[f"{prefix}_date"] = _clean_spaces(date_node.get_text(" ", strip=True)) or "N/A"
+            if anchor:
+                releases[f"{prefix}_url"] = _ensure_abs_url(anchor.get("href", "")) or "N/A"
+            if image:
+                image_url = image.get("src") or image.get("data-src") or ""
+                releases[f"{prefix}_couverture"] = _ensure_abs_url(image_url) or "N/A"
+        return releases
+
     def extract_series_detail_from_html(self, html: str) -> Dict[str, str]:
         soup = BeautifulSoup(html, "html.parser")
         detail = {field: "N/A" for field in PREFERRED_FIELDS if field not in {"url_fiche", "titre", "titre_alternatif", "extraction_time"}}
         detail["_titre_fr_fallback"] = self._extract_title_fr(soup)
+        detail.update(self._extract_vf_releases(soup))
+        detail["parutions_vf_verifiees_le"] = _now_str()
         ul = self._find_best_info_ul(soup)
         if not ul:
             return detail
@@ -946,13 +2359,22 @@ class NautiljonScraper:
         fields = [field for field in ListRow.__dataclass_fields__.keys() if field != "extraction_time"]
         return any(_clean_spaces(existing.get(field, "N/A")) != _clean_spaces(current.get(field, "N/A")) for field in fields)
 
-    def _series_is_stale(self, existing: Dict[str, str], refresh_stale_days: Optional[int]) -> bool:
+    def _series_vf_is_ongoing(self, existing: Dict[str, str]) -> bool:
+        return "en cours" in _norm(existing.get("nb_vol_vf_detail", ""))
+
+    def _series_needs_release_refresh(
+        self,
+        existing: Dict[str, str],
+        refresh_stale_days: Optional[int],
+    ) -> bool:
+        if not self._series_vf_is_ongoing(existing):
+            return False
+        checked_at = _parse_extraction_time(existing.get("parutions_vf_verifiees_le"))
+        if checked_at is None:
+            return True
         if not refresh_stale_days or refresh_stale_days <= 0:
             return False
-        extracted_at = _parse_extraction_time(existing.get("extraction_time"))
-        if extracted_at is None:
-            return True
-        return (datetime.now() - extracted_at).days >= refresh_stale_days
+        return (datetime.now() - checked_at).days >= refresh_stale_days
 
     def scrape_letter_diff(
         self,
@@ -961,11 +2383,13 @@ class NautiljonScraper:
         max_series: Optional[int] = None,
         refresh_stale_days: Optional[int] = None,
         drop_missing: bool = True,
+        max_missing_ratio: float = 0.15,
         flush_every: int = 25,
+        resume: bool = True,
     ) -> List[Dict[str, str]]:
         label = self._letter_label(letter)
         tag = self._letter_tag(letter)
-        print(f"\n{'=' * 60}\nLETTRE {label} - DIFF HTTP\n{'=' * 60}")
+        print(f"\n{'=' * 60}\nLETTRE {label} - DIFF {self.backend.upper()}\n{'=' * 60}")
 
         existing_rows = self._load_json_list(self._letter_paths(tag)[0])
         if not existing_rows:
@@ -975,44 +2399,167 @@ class NautiljonScraper:
             for row in existing_rows
             if row.get("url_fiche")
         }
+        initial_existing_count = len(existing_by_url)
         print(f"  Base existante: {len(existing_by_url)} series")
 
         updated_rows: List[Dict[str, str]] = []
         seen_urls = set()
         page_num = 0
         empty_pages = 0
+        accessible_listing_pages = 0
         successful_listing_pages = 0
         listing_failed = False
+        access_blocked = False
+        detail_abort = False
+        consecutive_detail_failures = 0
+        consecutive_page_failures = 0
+        max_detail_failures = max(1, _env_int("NAUTILJON_ABORT_AFTER_DETAIL_FAILURES", 2))
+        max_page_failures = max(1, _env_int("NAUTILJON_PAGE_FAILURE_RETRIES", 1))
         since_flush = 0
-        counters = {"new": 0, "changed": 0, "stale": 0, "reused": 0, "removed": 0}
+        counters = {"new": 0, "changed": 0, "parutions": 0, "reused": 0, "removed": 0}
+        errors_before_letter = self.session_stats["errors"]
+        checkpoint_path = self._letter_checkpoint_path(tag)
+        resumed_from_checkpoint = False
+        letter_settings = {
+            "letter": letter,
+            "max_pages": max_pages,
+            "max_series": max_series,
+            "refresh_stale_days": refresh_stale_days,
+            "drop_missing": drop_missing,
+            "max_missing_ratio": max_missing_ratio,
+        }
+
+        checkpoint = self._load_json_dict(checkpoint_path)
+        partial_rows = self._load_json_list(self._letter_paths(tag)[2])
+        if resume:
+            if checkpoint and self._letter_checkpoint_is_compatible(tag, checkpoint) and partial_rows:
+                updated_rows = [self._normalize_row(row) for row in partial_rows]
+                seen_urls = {
+                    _ensure_abs_url(row.get("url_fiche", ""))
+                    for row in updated_rows
+                    if row.get("url_fiche")
+                }
+                for url in seen_urls:
+                    existing_by_url.pop(url, None)
+                page_num = int(checkpoint.get("page_num", 0) or 0)
+                accessible_listing_pages = int(checkpoint.get("accessible_listing_pages", 0) or 0)
+                successful_listing_pages = int(checkpoint.get("successful_listing_pages", 0) or 0)
+                next_listing_url = str(checkpoint.get("next_listing_url", "") or "")
+                if self.backend == "flaresolverr" and next_listing_url:
+                    self._set_flaresolverr_listing_url(letter, page_num, next_listing_url)
+                saved_counters = checkpoint.get("counters")
+                if isinstance(saved_counters, dict):
+                    counters.update({key: int(saved_counters.get(key, value) or 0) for key, value in counters.items()})
+                resumed_from_checkpoint = True
+                print(
+                    f"  Reprise lettre {label}: page {page_num + 1}, "
+                    f"{len(updated_rows)} serie(s) deja traitee(s)."
+                )
+            elif checkpoint:
+                self._archive_letter_progress(tag, checkpoint_path, "checkpoint_non_reutilisable")
+        elif checkpoint:
+            self._archive_letter_progress(tag, checkpoint_path, "reprise_desactivee")
+
+        def save_checkpoint(next_page: int) -> None:
+            self.save_letter_files(tag, updated_rows, partial=True)
+            payload = {
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "data_schema_version": DATA_SCHEMA_VERSION,
+                "settings": letter_settings,
+                "page_num": next_page,
+                "accessible_listing_pages": accessible_listing_pages,
+                "successful_listing_pages": successful_listing_pages,
+                "counters": counters,
+            }
+            if self.backend == "flaresolverr":
+                payload["next_listing_url"] = self._flaresolverr_listing_urls.get((tag, next_page), "")
+            self._write_json_atomic(checkpoint_path, payload)
+
+        if resumed_from_checkpoint:
+            candidates = [
+                (index, row)
+                for index, row in enumerate(updated_rows)
+                if self._series_needs_release_refresh(row, refresh_stale_days)
+            ]
+            if candidates:
+                print(
+                    f"  Reprise: {len(candidates)} serie(s) VF en cours "
+                    "a completer ou rafraichir pour les parutions."
+                )
+            for index, row in candidates:
+                try:
+                    refreshed = self._fetch_full_series_data(dict(row))
+                    if refreshed:
+                        updated_rows[index] = refreshed
+                        counters["parutions"] += 1
+                        consecutive_detail_failures = 0
+                        self._sleep_delay()
+                except NautiljonAccessBlockedError as exc:
+                    self.session_stats["errors"] += 1
+                    access_blocked = True
+                    listing_failed = True
+                    print(f"    ACCES BLOQUE pendant la reprise des parutions: {str(exc)[:220]}")
+                    break
+                except Exception as exc:
+                    self.session_stats["errors"] += 1
+                    consecutive_detail_failures += 1
+                    print(f"    Erreur migration parutions: {str(exc)[:140]}")
+                    if consecutive_detail_failures >= max_detail_failures:
+                        detail_abort = True
+                        print(
+                            "    Trop d'erreurs de fiches consecutives; arret prudent de la lettre "
+                            f"({consecutive_detail_failures}/{max_detail_failures})."
+                        )
+                        break
+            save_checkpoint(page_num)
 
         while True:
+            if access_blocked or detail_abort:
+                break
             if max_pages is not None and page_num >= max_pages:
                 break
             try:
                 page_url, page_series = self.fetch_listing_page(letter, page_num)
+                accessible_listing_pages += 1
+                consecutive_page_failures = 0
                 print(f"  Page {page_num + 1}: {len(page_series)} entrees ({page_url})")
+            except NautiljonAccessBlockedError as exc:
+                access_blocked = True
+                listing_failed = True
+                print(f"  ACCES BLOQUE: {str(exc)[:240]}")
+                save_checkpoint(page_num)
+                break
             except Exception as exc:
-                empty_pages += 1
-                print(f"  Page {page_num + 1} indisponible ({empty_pages}/3): {str(exc)[:160]}")
-                if empty_pages >= 3:
+                consecutive_page_failures += 1
+                print(
+                    f"  Page {page_num + 1} indisponible, tentative "
+                    f"{consecutive_page_failures}/{max_page_failures}: {str(exc)[:160]}"
+                )
+                save_checkpoint(page_num)
+                if consecutive_page_failures >= max_page_failures:
                     listing_failed = True
                     break
-                page_num += 1
+                self._sleep_failure_pause()
                 continue
 
             if not page_series:
+                if self.backend == "flaresolverr":
+                    listing_failed = True
+                    print("  Page vide inattendue via FlareSolverr: fin de listing non validee.")
+                    save_checkpoint(page_num)
+                    break
                 empty_pages += 1
                 if empty_pages >= 3:
                     break
             else:
                 successful_listing_pages += 1
-                empty_pages = 0
+                new_on_page = 0
                 for series in page_series:
                     url = _ensure_abs_url(series.get("url_fiche", ""))
                     if not url or url in seen_urls:
                         continue
                     seen_urls.add(url)
+                    new_on_page += 1
                     series["url_fiche"] = url
                     if self.is_banned_type(series.get("type_liste", "")):
                         self.session_stats["skipped_by_type"] += 1
@@ -1029,8 +2576,8 @@ class NautiljonScraper:
                     elif self._series_changed_on_list(existing, series):
                         action = "changed"
                         needs_detail = True
-                    elif self._series_is_stale(existing, refresh_stale_days):
-                        action = "stale"
+                    elif self._series_needs_release_refresh(existing, refresh_stale_days):
+                        action = "parutions"
                         needs_detail = True
 
                     if needs_detail:
@@ -1040,12 +2587,30 @@ class NautiljonScraper:
                             if full:
                                 updated_rows.append(full)
                                 counters[action] += 1
+                                consecutive_detail_failures = 0
                                 self._sleep_delay()
+                        except NautiljonAccessBlockedError as exc:
+                            self.session_stats["errors"] += 1
+                            access_blocked = True
+                            listing_failed = True
+                            seen_urls.discard(url)
+                            if existing:
+                                existing_by_url[url] = existing
+                            print(f"    ACCES BLOQUE pendant une fiche detail: {str(exc)[:220]}")
+                            break
                         except Exception as exc:
                             self.session_stats["errors"] += 1
+                            consecutive_detail_failures += 1
                             print(f"    Erreur detail: {str(exc)[:140]}")
                             if existing:
                                 updated_rows.append(existing)
+                            if consecutive_detail_failures >= max_detail_failures:
+                                detail_abort = True
+                                print(
+                                    "    Trop d'erreurs de fiches consecutives; arret prudent de la lettre "
+                                    f"({consecutive_detail_failures}/{max_detail_failures})."
+                                )
+                                break
                             continue
                     else:
                         updated_rows.append(existing)
@@ -1053,28 +2618,59 @@ class NautiljonScraper:
 
                     since_flush += 1
                     if flush_every and since_flush >= flush_every:
-                        self.save_letter_files(tag, updated_rows, partial=True)
+                        save_checkpoint(page_num)
                         since_flush = 0
 
-                self.save_letter_files(tag, updated_rows, partial=True)
+                if access_blocked or detail_abort:
+                    save_checkpoint(page_num)
+                    break
+                save_checkpoint(page_num + 1)
+                if new_on_page == 0:
+                    empty_pages += 1
+                    print(f"  Page {page_num + 1} sans nouvelle URL ({empty_pages}/3).")
+                    if empty_pages >= 3:
+                        break
+                else:
+                    empty_pages = 0
                 if max_series is not None and len(updated_rows) >= max_series:
                     break
+                if self.backend == "flaresolverr" and not self._flaresolverr_listing_has_next(letter, page_num):
+                    if len(page_series) >= 50:
+                        listing_failed = True
+                        print(
+                            f"  Pagination incoherente: page {page_num + 1} pleine "
+                            "mais aucun lien vers la page suivante."
+                        )
+                        save_checkpoint(page_num)
+                    else:
+                        print(f"  Fin de pagination explicite apres la page {page_num + 1}.")
+                    break
+
+            if not page_series:
+                save_checkpoint(page_num + 1)
 
             page_num += 1
             self._sleep_delay()
 
-        if successful_listing_pages == 0:
+        if accessible_listing_pages == 0:
             self.session_stats["errors"] += 1
-            existing_kept = sorted(existing_by_url.values(), key=lambda row: _norm(row.get("titre", "")))
+            existing_kept = sorted(
+                updated_rows + list(existing_by_url.values()),
+                key=lambda row: _norm(row.get("titre", "")),
+            )
             self.session_stats["series_by_letter"][label] = len(existing_kept)
             self.session_stats["total_series"] += len(existing_kept)
             self.session_stats["diff_by_letter"][label] = {
                 "new": 0,
                 "changed": 0,
-                "stale": 0,
+                "parutions": 0,
                 "reused": len(existing_kept),
                 "removed": 0,
                 "listing_failed": True,
+                "access_blocked": access_blocked,
+                "coverage_failed": False,
+                "detail_failed": False,
+                "limited": False,
             }
             if existing_kept:
                 print(
@@ -1085,22 +2681,83 @@ class NautiljonScraper:
                 print(f"  Listing {label} inaccessible: aucune donnee locale a mettre a jour.")
             return existing_kept
 
-        if not drop_missing and existing_by_url:
+        detail_failed = self.session_stats["errors"] > errors_before_letter
+        limited = max_pages is not None or max_series is not None
+        missing_count = len(existing_by_url)
+        missing_ratio = (missing_count / initial_existing_count) if initial_existing_count else 0.0
+        coverage_failed = bool(
+            not limited
+            and initial_existing_count >= 20
+            and max_missing_ratio >= 0
+            and missing_ratio > max_missing_ratio
+        )
+        if coverage_failed:
+            print(
+                f"  Couverture invalide: {missing_count}/{initial_existing_count} fiches historiques absentes "
+                f"({missing_ratio:.1%}), seuil autorise {max_missing_ratio:.1%}."
+            )
+        if listing_failed or coverage_failed or detail_failed or limited:
+            safe_rows = sorted(
+                updated_rows + list(existing_by_url.values()),
+                key=lambda row: _norm(row.get("titre", "")),
+            )
+            counters["listing_failed"] = listing_failed
+            counters["access_blocked"] = access_blocked
+            counters["coverage_failed"] = coverage_failed
+            counters["missing_count"] = missing_count
+            counters["missing_ratio"] = round(missing_ratio, 6)
+            counters["detail_failed"] = detail_failed
+            counters["limited"] = limited
+            self.session_stats["series_by_letter"][label] = len(safe_rows)
+            self.session_stats["total_series"] += len(safe_rows)
+            self.session_stats["diff_by_letter"][label] = counters
+            if listing_failed:
+                print("  Fin de listing incertaine: fichier final inchange, checkpoint conserve.")
+            elif coverage_failed:
+                print("  Couverture anormale: fichier final inchange, checkpoint conserve.")
+            elif detail_failed:
+                print("  Detail(s) inaccessible(s): fichier final inchange, checkpoint conserve.")
+            else:
+                print("  Execution limitee: fichier final inchange, checkpoint conserve.")
+            return safe_rows
+
+        cache_rows = list(updated_rows)
+        if not drop_missing:
             updated_rows.extend(existing_by_url.values())
         else:
-            if listing_failed:
-                print("  Fin de listing incertaine: les entrees absentes sont conservees.")
-                updated_rows.extend(existing_by_url.values())
-            else:
-                counters["removed"] = len(existing_by_url)
+            counters["removed"] = missing_count
 
         updated_rows = sorted(updated_rows, key=lambda row: _norm(row.get("titre", "")))
-        self.save_letter_files(tag, updated_rows, partial=False)
+        cache_rows = updated_rows if drop_missing else sorted(cache_rows, key=lambda row: _norm(row.get("titre", "")))
+        if drop_missing:
+            self.save_letter_files(tag, updated_rows, partial=False)
+        else:
+            self.save_controlled_letter_files(tag, updated_rows)
         self._remove_partial_files(tag)
+        self._remove_checkpoint(checkpoint_path)
+        counters["listing_failed"] = False
+        counters["access_blocked"] = False
+        counters["coverage_failed"] = False
+        counters["missing_count"] = missing_count
+        counters["missing_ratio"] = round(missing_ratio, 6)
+        counters["detail_failed"] = False
+        counters["limited"] = False
         self.session_stats["series_by_letter"][label] = len(updated_rows)
         self.session_stats["total_series"] += len(updated_rows)
         self.session_stats["diff_by_letter"][label] = counters
-        print(f"  Lettre {label}: {len(updated_rows)} series ({counters})")
+        try:
+            self._save_letter_cache(
+                tag,
+                cache_rows,
+                counters,
+                source_mode="final" if drop_missing else "controlled",
+            )
+            counters["cache_saved"] = True
+        except Exception as exc:
+            counters["cache_saved"] = False
+            print(f"  Avertissement: cache de la lettre {label} non sauvegarde ({str(exc)[:180]}).")
+        suffix = "controle uniquement" if not drop_missing else "fichier final mis a jour"
+        print(f"  Lettre {label}: {len(updated_rows)} series, {suffix} ({counters})")
         return updated_rows
 
     def _read_existing_csv_for_letter(self, tag: str) -> List[Dict[str, str]]:
@@ -1116,44 +2773,201 @@ class NautiljonScraper:
         max_series_per_letter: Optional[int] = None,
         refresh_stale_days: Optional[int] = None,
         drop_missing: bool = True,
+        max_missing_ratio: float = 0.15,
         min_days_between_diff_exports: int = 30,
         abort_after_listing_failures: int = 1,
-        rss_fallback: bool = True,
-        rss_feed_urls: Optional[List[str]] = None,
-        merge_rss_candidates: bool = False,
+        flush_every: int = 25,
+        resume: bool = True,
         force: bool = False,
-    ) -> List[Dict[str, str]]:
+    ) -> RunResult:
+        all_catalog_letters = self.get_all_letters()
+        letters_to_scrape = letters or all_catalog_letters
+        requested_labels = [self._letter_label(letter) for letter in letters_to_scrape]
+        pacing = self.session_stats["anti_ban_config"]
+        print(
+            "Cadence anti-ban: "
+            f"{pacing['delay_min']:g}-{pacing['delay_max']:g}s entre requetes, "
+            f"pause {pacing['batch_pause_min']:g}-{pacing['batch_pause_max']:g}s "
+            f"toutes les {pacing['batch_size']} requetes, "
+            f"{pacing['letter_pause_min']:g}-{pacing['letter_pause_max']:g}s entre lettres."
+        )
+        cooldown = self._active_access_cooldown()
+        if cooldown:
+            print(
+                "Diff refuse pendant la quarantaine anti-ban. Reprise autorisee apres "
+                f"{cooldown.get('resume_after')}."
+            )
+            result = RunResult(
+                status="failed",
+                reason="access_cooldown_active",
+                requested_letters=requested_labels,
+            )
+            self.mark_run_state("diff", result)
+            return result
+        all_catalog_requested = (
+            set(letters_to_scrape) == set(all_catalog_letters)
+            and len(letters_to_scrape) == len(all_catalog_letters)
+            and max_pages_per_letter is None
+            and max_series_per_letter is None
+        )
+        full_catalog_requested = all_catalog_requested and drop_missing
+        if all_catalog_requested and not drop_missing:
+            print(
+                "Diff complet refuse: NAUTILJON_DROP_MISSING=false est reserve aux controles "
+                "sur une liste explicite de lettres. Utilisez NAUTILJON_DROP_MISSING=true "
+                "pour les 27 lettres."
+            )
+            result = RunResult(
+                status="failed",
+                reason="full_catalog_requires_drop_missing",
+                requested_letters=requested_labels,
+            )
+            self.mark_run_state("diff", result)
+            return result
+        if letters is None and force:
+            print(
+                "Diff complet refuse: NAUTILJON_FORCE_SCRAPE=true ignorerait tous les "
+                "caches recents. Remettez NAUTILJON_FORCE_SCRAPE=false, ou indiquez "
+                "explicitement une liste limitee de lettres pour un controle force."
+            )
+            result = RunResult(
+                status="failed",
+                reason="full_catalog_force_refused",
+                requested_letters=requested_labels,
+            )
+            self.mark_run_state("diff", result)
+            return result
         should_skip, last_success, age = self.should_skip_recent_success("diff", min_days_between_diff_exports)
-        if should_skip and not force and last_success and age is not None:
+        if full_catalog_requested and should_skip and not force and last_success and age is not None:
             print(
                 "Diff ignore: dernier diff finalise le "
                 f"{last_success.get('completed_at')} ({age.days} jours)."
             )
-            return []
+            result = RunResult(
+                status="skipped",
+                reason="recent_complete_export",
+                rows_count=int(last_success.get("rows_count", 0) or 0),
+                requested_letters=requested_labels,
+                completed_letters=requested_labels,
+                export_paths=dict(last_success.get("export_paths", {})),
+            )
+            self.mark_run_state("diff", result)
+            return result
+
+        if self.backend == "flaresolverr":
+            try:
+                gluetun_ip, flaresolverr_ip = self._flaresolverr_public_ips()
+                print(f"IP Gluetun: {gluetun_ip} | IP FlareSolverr: {flaresolverr_ip}")
+                if gluetun_ip != flaresolverr_ip:
+                    raise RuntimeError("les IP publiques de Gluetun et FlareSolverr sont differentes")
+            except Exception as exc:
+                self.close_flaresolverr()
+                result = RunResult(
+                    status="failed",
+                    reason="flaresolverr_preflight_failed",
+                    requested_letters=requested_labels,
+                )
+                print(f"Diff refuse: preflight FlareSolverr en echec ({str(exc)[:300]}).")
+                self.mark_run_state("diff", result)
+                return result
 
         self.session_stats["start_time"] = datetime.now()
-        letters_to_scrape = letters or self.get_all_letters()
-        all_rows: List[Dict[str, str]] = []
+        config = self._diff_run_config(
+            letters_to_scrape,
+            max_pages_per_letter,
+            max_series_per_letter,
+            refresh_stale_days,
+            drop_missing,
+            max_missing_ratio,
+        )
+        completed_letters = self._load_diff_run_checkpoint(config, resume)
         fatal_error = False
         aborted_listing_failures = False
+        incomplete_reason = ""
         consecutive_listing_failures = 0
         try:
+            if self.backend == "selenium":
+                self.setup_browser()
             for index, letter in enumerate(letters_to_scrape, start=1):
+                label = self._letter_label(letter)
+                tag = self._letter_tag(letter)
+                if label in completed_letters:
+                    print(f"\nProgression: {index}/{len(letters_to_scrape)} - lettre {label} deja finalisee, ignoree")
+                    continue
                 print(f"\nProgression: {index}/{len(letters_to_scrape)}")
-                rows = self.scrape_letter_diff(
+                if full_catalog_requested and not force:
+                    cached = self._load_reusable_letter_cache(
+                        tag,
+                        min_days_between_diff_exports,
+                        max_missing_ratio,
+                    )
+                    if cached:
+                        cached_rows, marker, cache_age = cached
+                        self.save_letter_files(tag, cached_rows, partial=False)
+                        checkpoint_path = self._letter_checkpoint_path(tag)
+                        if os.path.isfile(checkpoint_path) or any(
+                            os.path.isfile(path) for path in self._letter_paths(tag)[2:]
+                        ):
+                            self._archive_letter_progress(
+                                tag,
+                                checkpoint_path,
+                                "remplace_par_cache_valide",
+                            )
+                            self._remove_partial_files(tag)
+                            self._remove_checkpoint(checkpoint_path)
+                        cached_stats = marker.get("stats")
+                        stats = dict(cached_stats) if isinstance(cached_stats, dict) else {}
+                        stats.update({
+                            "cache_reused": True,
+                            "cache_age_days": cache_age.total_seconds() / 86400,
+                            "cache_source_mode": marker.get("source_mode", "unknown"),
+                        })
+                        self.session_stats["series_by_letter"][label] = len(cached_rows)
+                        self.session_stats["total_series"] += len(cached_rows)
+                        self.session_stats["diff_by_letter"][label] = stats
+                        completed_letters.append(label)
+                        self._save_diff_run_checkpoint(config, completed_letters)
+                        print(
+                            f"  Lettre {label} reutilisee depuis son cache valide "
+                            f"({cache_age.total_seconds() / 86400:.1f} jour, {len(cached_rows)} series)."
+                        )
+                        continue
+                self.scrape_letter_diff(
                     letter,
                     max_pages=max_pages_per_letter,
                     max_series=max_series_per_letter,
                     refresh_stale_days=refresh_stale_days,
                     drop_missing=drop_missing,
+                    max_missing_ratio=max_missing_ratio,
+                    flush_every=flush_every,
+                    resume=resume,
                 )
-                all_rows.extend(rows)
-                label = self._letter_label(letter)
                 diff_stats = self.session_stats["diff_by_letter"].get(label, {})
+                letter_incomplete = bool(
+                    diff_stats.get("listing_failed")
+                    or diff_stats.get("access_blocked")
+                    or diff_stats.get("coverage_failed")
+                    or diff_stats.get("detail_failed")
+                    or diff_stats.get("limited")
+                )
+                if not letter_incomplete:
+                    completed_letters.append(label)
+                    self._save_diff_run_checkpoint(config, completed_letters)
+                if diff_stats.get("access_blocked"):
+                    aborted_listing_failures = True
+                    incomplete_reason = "access_blocked"
+                    self._record_access_cooldown("access_blocked")
+                    print(
+                        "Diff interrompu immediatement: IP de sortie bloquee par Nautiljon. "
+                        "Les donnees et le checkpoint sont conserves."
+                    )
+                    break
                 if diff_stats.get("listing_failed"):
+                    incomplete_reason = "listing_inaccessible"
                     consecutive_listing_failures += 1
                     if abort_after_listing_failures > 0 and consecutive_listing_failures >= abort_after_listing_failures:
                         aborted_listing_failures = True
+                        incomplete_reason = "listing_inaccessible"
                         print(
                             "Diff interrompu: "
                             f"{consecutive_listing_failures} listing(s) consecutif(s) inaccessible(s). "
@@ -1162,36 +2976,91 @@ class NautiljonScraper:
                         break
                 else:
                     consecutive_listing_failures = 0
+                if diff_stats.get("coverage_failed"):
+                    incomplete_reason = "coverage_incomplete"
+                    print("Diff interrompu: couverture du listing incoherente avec la base existante.")
+                    break
+                if diff_stats.get("detail_failed"):
+                    incomplete_reason = "detail_inaccessible"
+                    print("Diff interrompu: au moins une fiche detail est inaccessible.")
+                    break
+                if diff_stats.get("limited"):
+                    incomplete_reason = "execution_limited"
+                    break
                 if index < len(letters_to_scrape):
-                    pause = self._compute_delay(multiplier=3)
-                    print(f"Pause {pause:.1f}s avant la lettre suivante")
-                    time.sleep(pause)
+                    self._sleep_letter_pause()
+        except NautiljonAccessBlockedError as exc:
+            fatal_error = True
+            aborted_listing_failures = True
+            incomplete_reason = "access_blocked"
+            self.session_stats["errors"] += 1
+            self._record_access_cooldown(str(exc))
+            print(f"Acces Nautiljon bloque: {str(exc)[:240]}")
         except Exception as exc:
             fatal_error = True
+            incomplete_reason = "fatal_error"
+            self.session_stats["errors"] += 1
             print(f"Erreur fatale: {exc}")
         finally:
+            self.close_browser()
             self.session_stats["end_time"] = datetime.now()
             if self.session_stats["start_time"]:
                 self.session_stats["duration"] = str(self.session_stats["end_time"] - self.session_stats["start_time"])
-            if aborted_listing_failures and rss_fallback:
+        combined = self.concat_letters()
+        all_requested_completed = set(completed_letters) == set(requested_labels)
+        export_paths: Dict[str, str] = {}
+        status = "failed"
+        reason = incomplete_reason or "incomplete_run"
+
+        if all_requested_completed and full_catalog_requested and not fatal_error and self.session_stats.get("errors", 0) == 0:
+            if not self._validate_final_letter_files(letters_to_scrape):
+                reason = "final_letter_files_invalid"
+            else:
                 try:
-                    print("Decouverte RSS apres blocage des listings...")
-                    self.discover_rss_candidates(feed_urls=rss_feed_urls, merge_candidates=merge_rss_candidates)
+                    export_paths = self.export_all_data(
+                        combined,
+                        base_filename=f"nautiljon_diff_concat_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    )
+                    if combined and self._validate_final_exports(export_paths):
+                        status = "success"
+                        reason = "complete_catalog_exported"
+                    else:
+                        reason = "final_export_invalid"
                 except Exception as exc:
                     self.session_stats["errors"] += 1
-                    print(f"Erreur decouverte RSS: {str(exc)[:160]}")
-            combined = self.concat_letters()
-            export_paths: Dict[str, str] = {}
-            if combined and not aborted_listing_failures:
-                export_paths = self.export_all_data(combined, base_filename=f"nautiljon_diff_concat_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-            if combined and not fatal_error and self.session_stats.get("errors", 0) == 0:
-                self.mark_success("diff", len(combined), export_paths)
-        return all_rows
+                    reason = "final_export_failed"
+                    print(f"Erreur export final: {str(exc)[:180]}")
+        elif all_requested_completed and not full_catalog_requested:
+            status = "partial"
+            reason = "controlled_subset_complete"
+        elif completed_letters:
+            status = "partial"
+        elif aborted_listing_failures and reason != "access_blocked":
+            reason = "listing_inaccessible"
+
+        result = RunResult(
+            status=status,
+            reason=reason,
+            rows_count=len(combined),
+            requested_letters=requested_labels,
+            completed_letters=completed_letters,
+            export_paths=export_paths,
+        )
+        if status == "success":
+            self.mark_success("diff", len(combined), export_paths)
+            self._remove_checkpoint(self._state_path("diff_checkpoint"))
+            self._clear_access_cooldown()
+        elif all_requested_completed:
+            self._remove_checkpoint(self._state_path("diff_checkpoint"))
+        self.mark_run_state("diff", result)
+        return result
 
     def probe_discovery(self, letters: Optional[List[str]] = None, max_pages: int = 1) -> None:
         for letter in letters or ["a"]:
             for page_num in range(max_pages):
                 url, rows = self.fetch_listing_page(letter, page_num)
+                if not rows:
+                    raise RuntimeError(f"Listing accessible mais vide pour {self._letter_label(letter)} page {page_num + 1}")
                 print(f"{self._letter_label(letter)} page {page_num + 1}: {len(rows)} lignes via {url}")
 
 
@@ -1217,8 +3086,7 @@ def _parse_csv_list(raw: Optional[str]) -> Optional[List[str]]:
 
 def _new_scraper(args: argparse.Namespace) -> NautiljonScraper:
     out_dir = args.out_dir or os.environ.get("NAUTILJON_OUT_DIR", "./output")
-    os.makedirs(out_dir, exist_ok=True)
-    delay = args.delay if args.delay is not None else _env_float("NAUTILJON_DELAY", 2.0)
+    delay = args.delay if args.delay is not None else _env_float("NAUTILJON_DELAY", 8.0)
     delay_min = args.delay_min
     delay_max = args.delay_max
     if delay_min is None and os.environ.get("NAUTILJON_DELAY_MIN", "").strip():
@@ -1227,11 +3095,21 @@ def _new_scraper(args: argparse.Namespace) -> NautiljonScraper:
         delay_max = _env_float("NAUTILJON_DELAY_MAX", delay)
     if (delay_min is None) != (delay_max is None):
         raise ValueError("NAUTILJON_DELAY_MIN et NAUTILJON_DELAY_MAX doivent etre definis ensemble.")
-    return NautiljonScraper(out_dir=out_dir, delay=delay, delay_min=delay_min, delay_max=delay_max)
+    backend = os.environ.get("NAUTILJON_BACKEND", "selenium").strip().lower()
+    if backend not in {"selenium", "flaresolverr", "http"}:
+        raise ValueError("NAUTILJON_BACKEND doit valoir selenium, flaresolverr ou http.")
+    return NautiljonScraper(
+        out_dir=out_dir,
+        delay=delay,
+        delay_min=delay_min,
+        delay_max=delay_max,
+        backend=backend,
+        browser_headless=_env_bool("NAUTILJON_BROWSER_HEADLESS", False),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Scraper Nautiljon HTTP sans Selenium.")
+    parser = argparse.ArgumentParser(description="Scraper Nautiljon Selenium avec reprise securisee.")
     parser.add_argument("--out-dir", default=os.environ.get("NAUTILJON_OUT_DIR", "./output"))
     parser.add_argument("--delay", type=float, default=None)
     parser.add_argument("--delay-min", type=float, default=None)
@@ -1245,14 +3123,24 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--letters", default=os.environ.get("NAUTILJON_LETTERS"))
     diff.add_argument("--max-pages-per-letter", type=int, default=_env_optional_int("NAUTILJON_MAX_PAGES_PER_LETTER"))
     diff.add_argument("--max-series-per-letter", type=int, default=_env_optional_int("NAUTILJON_MAX_SERIES_PER_LETTER"))
-    diff.add_argument("--refresh-stale-days", type=int, default=_env_optional_int("NAUTILJON_REFRESH_STALE_DAYS"))
+    diff.add_argument(
+        "--refresh-stale-days",
+        type=int,
+        default=_env_optional_int("NAUTILJON_REFRESH_STALE_DAYS"),
+        help="Rafraichit uniquement les parutions des series dont la VF est en cours.",
+    )
     diff.add_argument("--keep-missing", action="store_true", default=not _env_bool("NAUTILJON_DROP_MISSING", True))
+    diff.add_argument(
+        "--max-missing-ratio",
+        type=float,
+        default=_env_float("NAUTILJON_MAX_MISSING_RATIO", 0.15),
+        help="Refuse la finalisation si la part de fiches historiques absentes depasse ce seuil.",
+    )
     diff.add_argument("--min-days-between-diff-exports", type=int, default=_env_int("NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS", 30))
     diff.add_argument("--abort-after-listing-failures", type=int, default=_env_int("NAUTILJON_ABORT_AFTER_LISTING_FAILURES", 1))
-    diff.add_argument("--rss-fallback", dest="rss_fallback", action="store_true", default=_env_bool("NAUTILJON_RSS_FALLBACK", True))
-    diff.add_argument("--no-rss-fallback", dest="rss_fallback", action="store_false")
-    diff.add_argument("--rss-feeds", default=os.environ.get("NAUTILJON_RSS_FEEDS"))
-    diff.add_argument("--merge-rss-candidates", action="store_true", default=_env_bool("NAUTILJON_MERGE_RSS_CANDIDATES", False))
+    diff.add_argument("--flush-every", type=int, default=_env_int("NAUTILJON_FLUSH_EVERY", 25))
+    diff.add_argument("--resume", dest="resume", action="store_true", default=_env_bool("NAUTILJON_RESUME", True))
+    diff.add_argument("--no-resume", dest="resume", action="store_false")
     diff.add_argument("--force", action="store_true", default=_env_bool("NAUTILJON_FORCE_SCRAPE", False))
 
     rss = sub.add_parser("discover-rss", help="Decouvre des candidats de nouvelles fiches depuis les flux RSS.")
@@ -1262,6 +3150,25 @@ def _build_parser() -> argparse.ArgumentParser:
     probe = sub.add_parser("probe-discovery", help="Teste la decouverte HTTP des listings sans Selenium.")
     probe.add_argument("--letters", default=os.environ.get("NAUTILJON_LETTERS", "a"))
     probe.add_argument("--max-pages", type=int, default=1)
+
+    diagnose = sub.add_parser("diagnose", help="Teste le reseau, les listings et une fiche sans ecrire de donnees.")
+    diagnose.add_argument("--letter", default=os.environ.get("NAUTILJON_DIAGNOSE_LETTER", "a"))
+    diagnose.add_argument(
+        "--detail-url",
+        default=os.environ.get("NAUTILJON_DIAGNOSE_DETAIL_URL", f"{BASE_URL}/mangas/one+piece.html"),
+    )
+    diagnose.add_argument("--rss-feeds", default=os.environ.get("NAUTILJON_RSS_FEEDS"))
+
+    browser_test = sub.add_parser("browser-test", help="Teste un listing et une fiche via Selenium sans exporter.")
+    browser_test.add_argument("--letter", default=os.environ.get("NAUTILJON_DIAGNOSE_LETTER", "a"))
+
+    flaresolverr_test = sub.add_parser(
+        "flaresolverr-test",
+        help="Teste IP, listing et fiche via FlareSolverr sans exporter.",
+    )
+    flaresolverr_test.add_argument("--letter", default=os.environ.get("NAUTILJON_DIAGNOSE_LETTER", "a"))
+
+    sub.add_parser("browser-smoke", help="Verifie uniquement le demarrage de Chromium et ChromeDriver.")
 
     sub.add_parser("selftest", help="Tests parser hors reseau.")
     return parser
@@ -1327,19 +3234,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         else:
             print("Aucune lettre JSON trouvee.")
     elif command == "diff":
-        scraper.scrape_all_letters_diff(
+        result = scraper.scrape_all_letters_diff(
             letters=_parse_letters(args.letters),
             max_pages_per_letter=args.max_pages_per_letter,
             max_series_per_letter=args.max_series_per_letter,
             refresh_stale_days=args.refresh_stale_days,
             drop_missing=not args.keep_missing,
+            max_missing_ratio=args.max_missing_ratio,
             min_days_between_diff_exports=args.min_days_between_diff_exports,
             abort_after_listing_failures=args.abort_after_listing_failures,
-            rss_fallback=args.rss_fallback,
-            rss_feed_urls=_parse_csv_list(args.rss_feeds),
-            merge_rss_candidates=args.merge_rss_candidates,
+            flush_every=args.flush_every,
+            resume=args.resume,
             force=args.force,
         )
+        raise SystemExit(result.exit_code)
     elif command == "discover-rss":
         scraper.discover_rss_candidates(
             feed_urls=_parse_csv_list(args.rss_feeds),
@@ -1347,6 +3255,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
     elif command == "probe-discovery":
         scraper.probe_discovery(letters=_parse_letters(args.letters), max_pages=args.max_pages)
+    elif command == "diagnose":
+        report = scraper.diagnose(
+            letter=args.letter,
+            detail_url=args.detail_url,
+            rss_feed_urls=_parse_csv_list(args.rss_feeds),
+        )
+        raise SystemExit(0 if report["ready_for_diff"] else 1)
+    elif command == "browser-test":
+        report = scraper.browser_test(letter="%23" if args.letter == "#" else args.letter.lower())
+        raise SystemExit(0 if report["ready_for_diff"] else 1)
+    elif command == "flaresolverr-test":
+        report = scraper.flaresolverr_test(letter="%23" if args.letter == "#" else args.letter.lower())
+        raise SystemExit(0 if report["ready_for_diff"] else 1)
+    elif command == "browser-smoke":
+        raise SystemExit(0 if scraper.browser_smoke() else 1)
     else:
         parser.error(f"Commande inconnue: {command}")
 

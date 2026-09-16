@@ -1,75 +1,227 @@
-# Deployment
+# Protocole Portainer FlareSolverr
 
-## Initial import
+Le conteneur execute une commande puis s'arrete. Les listings et les fiches sont
+charges dans une session FlareSolverr unique, sans fenetre ni intervention
+manuelle sur le NAS.
 
-Put your existing CSV files in:
+Le scraper reutilise le conteneur `flaresolverr` existant dans `search-stack`.
+Il ne lance aucune seconde instance. Sa session FlareSolverr recoit un proxy
+dedie vers Gluetun, sans changer les sessions de Prowlarr ou des autres clients.
 
-```text
-/media/nvme0n1p1/AppData/NautiljonScraper/output/letters/
+## 1. Reseau partage existant
+
+Gluetun est deja rattache au reseau externe avec l'alias suivant :
+
+```yaml
+services:
+  gluetun:
+    networks:
+      torrent_vpn_share:
+        aliases:
+          - gluetun-nord
+
+networks:
+  torrent_vpn_share:
+    external: true
 ```
 
-Deploy the Portainer service with:
+Le proxy et le mode stealth sont deja actifs dans Gluetun. Le port `8888` n'a
+pas besoin d'etre publie sur le LAN.
+
+Le service `flaresolverr` de `search-stack` doit conserver `media_net` et etre
+egalement rattache a `torrent_vpn_share`.
+
+## Variables communes
+
+```text
+NAUTILJON_IMAGE=ghcr.io/hitman47/nautiljon-scraper:test
+GLUETUN_CONTAINER=GlueTun-Nord_WG
+NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
+NAUTILJON_BACKEND=flaresolverr
+NAUTILJON_FLARESOLVERR_URL=http://flaresolverr:8191/v1
+NAUTILJON_FLARESOLVERR_PROXY_URL=http://gluetun-nord:8888
+NAUTILJON_FLARESOLVERR_PROXY_USERNAME=
+NAUTILJON_FLARESOLVERR_PROXY_PASSWORD=
+NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
+NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS=30
+NAUTILJON_FLARESOLVERR_STARTUP_DELAY=2
+NAUTILJON_CPUS=0.50
+NAUTILJON_MEM_LIMIT=768m
+NAUTILJON_MEMSWAP_LIMIT=768m
+NAUTILJON_SHM_SIZE=256m
+NAUTILJON_DELAY_MIN=8.0
+NAUTILJON_DELAY_MAX=20.0
+NAUTILJON_BATCH_SIZE=40
+NAUTILJON_BATCH_PAUSE_MIN=180
+NAUTILJON_BATCH_PAUSE_MAX=480
+NAUTILJON_LETTER_PAUSE_MIN=120
+NAUTILJON_LETTER_PAUSE_MAX=300
+NAUTILJON_FAILURE_PAUSE_MIN=300
+NAUTILJON_FAILURE_PAUSE_MAX=900
+NAUTILJON_BLOCK_COOLDOWN_HOURS=24
+NAUTILJON_PAGE_FAILURE_RETRIES=1
+NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
+NAUTILJON_MAX_MISSING_RATIO=0.15
+NAUTILJON_REFRESH_STALE_DAYS=30
+```
+
+Si le proxy Gluetun est protege par `HTTPPROXY_USER` et
+`HTTPPROXY_PASSWORD`, recopiez les memes valeurs dans les deux variables
+`NAUTILJON_FLARESOLVERR_PROXY_*` correspondantes.
+
+## 2. Test FlareSolverr
+
+```text
+NAUTILJON_COMMAND=flaresolverr-test
+NAUTILJON_DIAGNOSE_LETTER=a
+```
+
+Ce test ne modifie aucun export. Il verifie :
+
+1. l'acces a l'API FlareSolverr ;
+2. l'IP publique de Gluetun et celle de FlareSolverr ;
+3. la premiere page du listing A ;
+4. une fiche manga.
+
+Le seul resultat autorisant la suite est :
+
+```text
+VERDICT FLARESOLVERR: PRET POUR DIFF CONTROLE
+```
+
+Le scraper partage le namespace reseau de Gluetun :
+
+```yaml
+network_mode: "container:GlueTun-Nord_WG"
+```
+
+Ce namespace est rattache a `torrent_vpn_share`, ce qui rend l'API existante accessible
+par son nom Docker :
+
+```text
+NAUTILJON_FLARESOLVERR_URL=http://flaresolverr:8191/v1
+```
+
+La session Chromium creee dans FlareSolverr utilise quant a elle
+`http://gluetun-nord:8888`. Son trafic Nautiljon ressort donc par le VPN. Le
+test refuse le diff si son IP publique differe de celle du scraper derriere
+Gluetun.
+
+## 3. Diff controle sur A
+
+Cette etape n'est autorisee qu'apres un `flaresolverr-test` reussi :
+
+```text
+NAUTILJON_COMMAND=diff
+NAUTILJON_LETTERS=a
+NAUTILJON_FORCE_SCRAPE=true
+NAUTILJON_DROP_MISSING=false
+NAUTILJON_RESUME=true
+```
+
+Un sous-ensemble termine avec l'etat `PARTIAL` et ne produit jamais de marqueur
+mensuel complet. Son resultat est ecrit dans `output/control/`; les fichiers
+finaux de `output/letters/` restent inchanges. La lettre validee est aussi copiee
+dans `output/letter-cache/` avec un marqueur date.
+
+## 4. Diff mensuel complet
+
+Retirez `NAUTILJON_LETTERS` ou laissez cette variable vide :
+
+```text
+NAUTILJON_COMMAND=diff
+NAUTILJON_FORCE_SCRAPE=false
+NAUTILJON_DROP_MISSING=true
+NAUTILJON_RESUME=true
+NAUTILJON_FLUSH_EVERY=25
+NAUTILJON_DELAY_MIN=8.0
+NAUTILJON_DELAY_MAX=20.0
+NAUTILJON_BATCH_SIZE=40
+NAUTILJON_BATCH_PAUSE_MIN=180
+NAUTILJON_BATCH_PAUSE_MAX=480
+NAUTILJON_LETTER_PAUSE_MIN=120
+NAUTILJON_LETTER_PAUSE_MAX=300
+NAUTILJON_FAILURE_PAUSE_MIN=300
+NAUTILJON_FAILURE_PAUSE_MAX=900
+NAUTILJON_BLOCK_COOLDOWN_HOURS=24
+NAUTILJON_PAGE_FAILURE_RETRIES=1
+NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
+NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
+NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
+NAUTILJON_MAX_MISSING_RATIO=0.15
+NAUTILJON_REFRESH_STALE_DAYS=30
+```
+
+Les trois reglages importants doivent etre modifies ensemble apres un controle :
+`NAUTILJON_LETTERS=` (vide), `NAUTILJON_FORCE_SCRAPE=false` et
+`NAUTILJON_DROP_MISSING=true`. Le scraper refuse maintenant les 27 lettres si
+le mode controle `DROP_MISSING=false` est reste actif.
+Il refuse aussi un lancement global si `NAUTILJON_FORCE_SCRAPE=true` est reste
+actif ; le mode force est reserve a une liste explicite de lettres.
+
+Le succes exige les 27 lettres, aucune erreur de listing ou de fiche et des
+exports finaux valides. Une interruption conserve la page courante et les lettres
+deja terminees dans `output/checkpoints/`.
+
+Le scraper suit le lien de pagination exact fourni par Nautiljon et enregistre
+ce lien dans le checkpoint. Si plus de 15 % des fiches historiques d'une lettre
+disparaissent du listing, la lettre n'est pas remplacee et le diff s'arrete.
+Une page indiquant que l'IP est interdite pour abus provoque egalement un arret
+immediat, sans trois nouvelles tentatives, avec conservation du checkpoint.
+Un challenge Cloudflare non resolu est traite comme un blocage. Le fichier
+`output/state/access_cooldown.json` interdit alors un nouveau diff pendant 24
+heures, y compris avec `NAUTILJON_FORCE_SCRAPE=true`.
+Si le canari affiche une case interactive « Verifiez que vous etes humain »,
+considerez l'IP comme bloquee. Le projet n'automatise pas le clic et ne tente
+pas de contourner les CAPTCHA : attendez la quarantaine ou changez proprement
+l'IP de sortie, puis relancez uniquement `flaresolverr-test`.
+
+La cadence par defaut est volontairement lente. Les navigations sont
+sequentielles, une pause de 8 a 20 secondes les separe, une pause de 3 a 8
+minutes intervient toutes les 40 requetes et une pause de 2 a 5 minutes separe
+les lettres. Une page en erreur n'est tentee qu'une fois et deux erreurs de
+fiches consecutives interrompent la lettre. Un catalogue initial peut donc
+prendre un a plusieurs jours selon le nombre de fiches a ouvrir.
+
+Avec `NAUTILJON_FORCE_SCRAPE=false`, une lettre validee depuis moins de
+`NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS` jours est reutilisee sans requete et
+promue dans `output/letters/`. Une lettre expiree ou dont le cache est invalide
+est automatiquement rescrapee. `NAUTILJON_FORCE_SCRAPE=true` ignore ce cache.
+
+Apres l'ajout des colonnes de parutions VF, les caches crees par une ancienne
+version sont volontairement ignores une fois. Un checkpoint de lettre en cours
+reste reprenable et ne complete que les fiches VF `En cours` deja parcourues.
+Les reglages de delai, de couverture et de conservation des fiches absentes ne
+rendent plus un checkpoint incompatible. Tout checkpoint réellement inutilisable
+est copie dans `output/checkpoints/archive/` avant son remplacement.
+
+## Import initial
+
+Les CSV par lettre restent dans `output/letters/`. Pour regenerer les JSON :
 
 ```text
 NAUTILJON_COMMAND=import-csv
 ```
 
-This creates per-letter JSON files beside the CSV files and writes a consolidated
-export under `output/exports/`.
+## Selenium
 
-## Discovery probe
+`browser-smoke` et `browser-test` restent disponibles pour le diagnostic, mais
+ne sont plus le transport recommande pour le diff.
 
-Before enabling the monthly diff, test whether Nautiljon listings are reachable
-without Selenium:
+## Limites du conteneur FlareSolverr
 
-```text
-NAUTILJON_COMMAND=probe-discovery
-NAUTILJON_LETTERS=a
-```
-
-Expected result: logs show at least one discovered listing page and a non-zero
-number of rows.
-
-## Monthly diff
-
-Use:
-
-```text
-NAUTILJON_COMMAND=diff
-NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
-NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
-NAUTILJON_RSS_FALLBACK=true
-NAUTILJON_RSS_FEEDS=http://feeds.feedburner.com/nautiljon/NdFI
-NAUTILJON_MERGE_RSS_CANDIDATES=false
-NAUTILJON_REFRESH_STALE_DAYS=180
-```
-
-The diff:
-
-- reads existing per-letter JSON files,
-- discovers listing entries for each letter,
-- adds new fiches,
-- refreshes changed listing entries,
-- refreshes stale detail pages,
-- writes updated letter JSON/CSV,
-- writes a final export,
-- writes `output/state/last_diff_success.json`.
-
-Set `NAUTILJON_FORCE_SCRAPE=true` to ignore the 30-day protection once.
-Set `NAUTILJON_ABORT_AFTER_LISTING_FAILURES=0` only if you want the diff to
-continue through all letters even when listings are blocked.
-
-If listings are blocked, RSS fallback still writes probable new manga fiches to
-`output/discovery/nautiljon_rss_candidates.csv`. Keep
-`NAUTILJON_MERGE_RSS_CANDIDATES=false` unless you accept incomplete, unverified
-rows in the per-letter exports.
-
-## Same Gluetun as Bedetheque
-
-The service uses:
+Les limites de `portainer-stack.yml` ne s'appliquent qu'au scraper. Le Chromium
+qui traite les pages se trouve dans le conteneur FlareSolverr. Ajoutez dans le
+service FlareSolverr de `search-stack`, si sa charge partagee le permet :
 
 ```yaml
-network_mode: "container:${GLUETUN_CONTAINER:-GlueTun-Nord_WG}"
+cpus: "0.75"
+mem_limit: 768m
+memswap_limit: 768m
+shm_size: 256m
+pids_limit: 256
 ```
 
-No `ports:` or `networks:` should be added to this service.
+N'executez pas d'autres travaux FlareSolverr concurrents pendant le diff
+Nautiljon. Une session unique est conservee afin de reutiliser les cookies et
+de ne pas resoudre le challenge a chaque page.
