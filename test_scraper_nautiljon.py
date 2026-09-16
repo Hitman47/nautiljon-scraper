@@ -26,6 +26,98 @@ class DiffStateTests(unittest.TestCase):
         label = scraper._letter_label(letter)
         scraper.save_letter_files(scraper._letter_tag(letter), [make_row(label)], partial=False)
 
+    def test_pacer_serializes_requests_and_adds_batch_break(self):
+        env = {
+            "NAUTILJON_BATCH_SIZE": "2",
+            "NAUTILJON_BATCH_PAUSE_MIN": "30",
+            "NAUTILJON_BATCH_PAUSE_MAX": "30",
+        }
+        with mock.patch.dict(os.environ, env), mock.patch(
+            "scraper_nautiljon.time.monotonic", return_value=100.0
+        ), mock.patch("scraper_nautiljon.time.sleep") as sleep:
+            scraper = NautiljonScraper(delay=8, delay_min=8, delay_max=8, backend="http")
+            scraper._pace_remote_request("https://www.nautiljon.com/mangas/", "root")
+            scraper._pace_remote_request("https://www.nautiljon.com/mangas/?q=a", "listing")
+            scraper._pace_remote_request("https://www.nautiljon.com/mangas/test.html", "detail")
+
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [8.0, 30.0])
+        self.assertEqual(scraper.session_stats["remote_requests"], 3)
+        self.assertEqual(scraper.session_stats["anti_ban_sleep_seconds"], 38.0)
+
+    def test_pacer_ignores_non_nautiljon_services(self):
+        scraper = self.make_scraper("unused")
+        with mock.patch("scraper_nautiljon.time.sleep") as sleep:
+            scraper._pace_remote_request("https://api.ipify.org?format=json", "ip")
+
+        sleep.assert_not_called()
+        self.assertEqual(scraper.session_stats["remote_requests"], 0)
+
+    def test_http_challenge_aborts_without_retry(self):
+        scraper = self.make_scraper("unused")
+        response = mock.Mock()
+        response.status_code = 403
+        response.headers = {"cf-mitigated": "challenge"}
+        response.encoding = "utf-8"
+        response.text = "<title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/x'></script>"
+        scraper.session.get = mock.Mock(return_value=response)
+
+        with self.assertRaises(NautiljonAccessBlockedError):
+            scraper.fetch_html("https://www.nautiljon.com/mangas/")
+
+        scraper.session.get.assert_called_once()
+        response.raise_for_status.assert_not_called()
+
+    def test_access_cooldown_prevents_immediate_restart(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            scraper._record_access_cooldown("managed challenge")
+
+            second = self.make_scraper(out_dir)
+            result = second.scrape_all_letters_diff(
+                letters=["a"],
+                min_days_between_diff_exports=0,
+            )
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.reason, "access_cooldown_active")
+
+    def test_generic_listing_failure_is_not_hammered(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            attempts = []
+
+            def failed_fetch(this, letter, page_num):
+                attempts.append(page_num)
+                raise RuntimeError("temporary failure")
+
+            scraper.fetch_listing_page = types.MethodType(failed_fetch, scraper)
+            scraper.scrape_letter_diff("a", drop_missing=False)
+
+            self.assertEqual(attempts, [0])
+            self.assertTrue(scraper.session_stats["diff_by_letter"]["A"]["listing_failed"])
+
+    def test_repeated_detail_failures_stop_current_page(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            rows = [make_row("A") for _ in range(3)]
+            for index, row in enumerate(rows):
+                row["url_fiche"] = f"https://www.nautiljon.com/mangas/failure-{index}.html"
+            calls = []
+            scraper.fetch_listing_page = types.MethodType(
+                lambda this, letter, page_num: ("https://example.test/a", rows),
+                scraper,
+            )
+
+            def failed_detail(this, series):
+                calls.append(series["url_fiche"])
+                raise RuntimeError("detail unavailable")
+
+            scraper._fetch_full_series_data = types.MethodType(failed_detail, scraper)
+            scraper.scrape_letter_diff("a", max_pages=1, drop_missing=False)
+
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(scraper.session_stats["diff_by_letter"]["A"]["detail_failed"])
+
     def install_fake_letter_scrape(self, scraper: NautiljonScraper, outcomes, calls=None) -> None:
         def fake(this, letter, **kwargs):
             label = this._letter_label(letter)
@@ -424,7 +516,7 @@ class DiffStateTests(unittest.TestCase):
                 resume=True,
             )
             checkpoint = first._load_json_dict(first._letter_checkpoint_path("A"))
-            self.assertEqual(attempts, [0, 1, 1, 1])
+            self.assertEqual(attempts, [0, 1])
             self.assertEqual(checkpoint["page_num"], 1)
 
             second = self.make_scraper(out_dir)

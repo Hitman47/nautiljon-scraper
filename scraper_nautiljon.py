@@ -13,7 +13,6 @@ import subprocess
 import sys
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -218,6 +217,36 @@ class NautiljonScraper:
         self._flaresolverr_letter_urls: Dict[str, str] = {}
         self._flaresolverr_listing_urls: Dict[Tuple[str, int], str] = {}
         self._flaresolverr_page_has_next: Dict[Tuple[str, int], bool] = {}
+        conservative_defaults = delay > 0 or delay_min is not None or delay_max is not None
+        self.batch_size = max(0, _env_int("NAUTILJON_BATCH_SIZE", 40 if conservative_defaults else 0))
+        self.batch_pause_min = max(
+            0.0,
+            _env_float("NAUTILJON_BATCH_PAUSE_MIN", 180.0 if conservative_defaults else 0.0),
+        )
+        self.batch_pause_max = max(
+            self.batch_pause_min,
+            _env_float("NAUTILJON_BATCH_PAUSE_MAX", 480.0 if conservative_defaults else 0.0),
+        )
+        self.letter_pause_min = max(
+            0.0,
+            _env_float("NAUTILJON_LETTER_PAUSE_MIN", 120.0 if conservative_defaults else 0.0),
+        )
+        self.letter_pause_max = max(
+            self.letter_pause_min,
+            _env_float("NAUTILJON_LETTER_PAUSE_MAX", 300.0 if conservative_defaults else 0.0),
+        )
+        self.failure_pause_min = max(
+            0.0,
+            _env_float("NAUTILJON_FAILURE_PAUSE_MIN", 300.0 if conservative_defaults else 0.0),
+        )
+        self.failure_pause_max = max(
+            self.failure_pause_min,
+            _env_float("NAUTILJON_FAILURE_PAUSE_MAX", 900.0 if conservative_defaults else 0.0),
+        )
+        self.block_cooldown_hours = max(0.0, _env_float("NAUTILJON_BLOCK_COOLDOWN_HOURS", 24.0))
+        self._remote_request_count = 0
+        self._last_remote_request_at = 0.0
+        self._anti_ban_sleep_seconds = 0.0
         self.session = self._build_session()
         self.session_stats = {
             "total_series": 0,
@@ -228,17 +257,32 @@ class NautiljonScraper:
             "start_time": None,
             "end_time": None,
             "duration": None,
+            "remote_requests": 0,
+            "anti_ban_sleep_seconds": 0.0,
+            "anti_ban_config": {
+                "delay_min": self.delay_min if self.delay_min is not None else self.delay,
+                "delay_max": self.delay_max if self.delay_max is not None else self.delay,
+                "batch_size": self.batch_size,
+                "batch_pause_min": self.batch_pause_min,
+                "batch_pause_max": self.batch_pause_max,
+                "letter_pause_min": self.letter_pause_min,
+                "letter_pause_max": self.letter_pause_max,
+                "failure_pause_min": self.failure_pause_min,
+                "failure_pause_max": self.failure_pause_max,
+                "block_cooldown_hours": self.block_cooldown_hours,
+            },
         }
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
         retry = Retry(
-            total=5,
-            connect=5,
-            read=5,
-            backoff_factor=1.0,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET", "HEAD", "POST"),
+            total=2,
+            connect=2,
+            read=2,
+            backoff_factor=2.0,
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=("GET", "HEAD"),
+            respect_retry_after_header=True,
         )
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("http://", adapter)
@@ -256,9 +300,61 @@ class NautiljonScraper:
 
     def _sleep_delay(self, multiplier: float = 1.0) -> float:
         delay = self._compute_delay(multiplier=multiplier)
-        if delay > 0:
-            time.sleep(delay)
+        self._sleep_for(delay, "temporisation standard", announce=False)
         return delay
+
+    @staticmethod
+    def _is_nautiljon_url(url: str) -> bool:
+        host = (urlsplit(_ensure_abs_url(url)).hostname or "").lower()
+        return host == "nautiljon.com" or host.endswith(".nautiljon.com")
+
+    def _sleep_for(self, seconds: float, reason: str, announce: bool = True) -> float:
+        seconds = max(0.0, float(seconds))
+        if seconds <= 0:
+            return 0.0
+        if announce:
+            print(f"Pause anti-ban {seconds:.1f}s: {reason}")
+        time.sleep(seconds)
+        self._anti_ban_sleep_seconds += seconds
+        self.session_stats["anti_ban_sleep_seconds"] = round(self._anti_ban_sleep_seconds, 3)
+        return seconds
+
+    def _pace_remote_request(self, url: str, context: str) -> float:
+        """Serialize and pace every Nautiljon navigation from every backend."""
+        if not self._is_nautiljon_url(url):
+            return 0.0
+
+        wait_seconds = 0.0
+        wait_reason = f"avant {context}"
+        now = time.monotonic()
+        if self._last_remote_request_at > 0:
+            target_delay = self._compute_delay()
+            elapsed = max(0.0, now - self._last_remote_request_at)
+            wait_seconds = max(0.0, target_delay - elapsed)
+
+        if (
+            self.batch_size > 0
+            and self._remote_request_count > 0
+            and self._remote_request_count % self.batch_size == 0
+        ):
+            batch_pause = random.uniform(self.batch_pause_min, self.batch_pause_max)
+            if batch_pause > wait_seconds:
+                wait_seconds = batch_pause
+                wait_reason = f"repos apres {self._remote_request_count} requetes"
+
+        self._sleep_for(wait_seconds, wait_reason, announce=wait_seconds >= 5)
+        self._last_remote_request_at = time.monotonic()
+        self._remote_request_count += 1
+        self.session_stats["remote_requests"] = self._remote_request_count
+        return wait_seconds
+
+    def _sleep_letter_pause(self) -> float:
+        pause = random.uniform(self.letter_pause_min, self.letter_pause_max)
+        return self._sleep_for(pause, "repos entre deux lettres", announce=True)
+
+    def _sleep_failure_pause(self) -> float:
+        pause = random.uniform(self.failure_pause_min, self.failure_pause_max)
+        return self._sleep_for(pause, "erreur reseau avant nouvelle tentative", announce=True)
 
     def _ensure_dirs(self) -> Tuple[str, str, str, str]:
         exports_dir = os.path.join(self.out_dir, "exports")
@@ -351,6 +447,45 @@ class NautiljonScraper:
             return os.path.join(checkpoints_dir, "diff_run.json")
         safe_name = re.sub(r"[^a-z0-9_.-]+", "_", name.lower()).strip("_") or "run"
         return os.path.join(state_dir, f"{safe_name}.json")
+
+    def _record_access_cooldown(self, reason: str) -> str:
+        blocked_at = datetime.now()
+        resume_after = blocked_at + timedelta(hours=self.block_cooldown_hours)
+        payload = {
+            "blocked_at": blocked_at.isoformat(timespec="seconds"),
+            "resume_after": resume_after.isoformat(timespec="seconds"),
+            "cooldown_hours": self.block_cooldown_hours,
+            "reason": reason,
+        }
+        path = self._state_path("access_cooldown")
+        self._write_json_atomic(path, payload)
+        print(
+            "Quarantaine anti-ban active jusqu'au "
+            f"{payload['resume_after']} ({self.block_cooldown_hours:g} h)."
+        )
+        return path
+
+    def _active_access_cooldown(self) -> Optional[Dict[str, object]]:
+        path = self._state_path("access_cooldown")
+        payload = self._load_json_dict(path)
+        if not payload:
+            return None
+        try:
+            resume_after = datetime.fromisoformat(str(payload.get("resume_after", "")))
+        except ValueError:
+            return None
+        if datetime.now() >= resume_after:
+            return None
+        payload["path"] = path
+        return payload
+
+    def _clear_access_cooldown(self) -> None:
+        path = self._state_path("access_cooldown")
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError as exc:
+            print(f"Avertissement: quarantaine anti-ban non supprimee ({str(exc)[:160]}).")
 
     def mark_run_state(self, mode: str, result: RunResult) -> str:
         payload = {
@@ -1032,7 +1167,7 @@ class NautiljonScraper:
 
         common_args = [
             "--no-sandbox",
-            "--window-size=1365,900",
+            "--window-size=1280,800",
             "--lang=fr-FR",
             "--no-first-run",
             "--no-default-browser-check",
@@ -1041,6 +1176,13 @@ class NautiljonScraper:
             "--disable-extensions",
             "--disable-gpu",
             "--disable-sync",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-breakpad",
+            "--renderer-process-limit=2",
+            "--disk-cache-size=67108864",
+            "--media-cache-size=16777216",
             "--remote-allow-origins=*",
         ]
 
@@ -1077,7 +1219,7 @@ class NautiljonScraper:
         try:
             self.driver = webdriver.Chrome(service=service, options=options)
             self.driver.set_page_load_timeout(60)
-            self.driver.set_window_size(1365, 900)
+            self.driver.set_window_size(1280, 800)
             self.driver.get("about:blank")
             version = self.driver.capabilities.get("browserVersion", "inconnue")
             print(f"Session Selenium active, Chromium {version}")
@@ -1255,6 +1397,7 @@ class NautiljonScraper:
     def _fetch_html_flaresolverr(self, url: str) -> str:
         timeout_ms = max(1000, _env_int("NAUTILJON_FLARESOLVERR_TIMEOUT_MS", 120000))
         target_url = _ensure_abs_url(url)
+        self._pace_remote_request(target_url, "navigation FlareSolverr")
         payload: Dict[str, object] = {
             "cmd": "request.get",
             "url": target_url,
@@ -1275,8 +1418,8 @@ class NautiljonScraper:
         status_code = int(solution.get("status", 0) or 0)
         html = solution.get("response", "")
         self._last_flaresolverr_url = str(solution.get("url", url))
-        if status_code >= 400:
-            raise RuntimeError(f"FlareSolverr: HTTP {status_code} pour {url}")
+        if status_code in {403, 429} and (not isinstance(html, str) or not html):
+            raise NautiljonAccessBlockedError(f"FlareSolverr: HTTP {status_code} pour {url}")
         if not isinstance(html, str) or not html:
             raise RuntimeError(f"FlareSolverr: reponse vide pour {url}")
         if self._nautiljon_access_blocked(html):
@@ -1284,7 +1427,13 @@ class NautiljonScraper:
                 "Nautiljon a interdit l'IP de sortie pour abus; arret immediat sans nouvelle tentative"
             )
         if self._blocked_by_waf(html):
-            raise RuntimeError(f"FlareSolverr n'a pas resolu Cloudflare pour {url}")
+            raise NautiljonAccessBlockedError(
+                f"FlareSolverr n'a pas resolu Cloudflare pour {url}"
+            )
+        if status_code in {403, 429}:
+            raise NautiljonAccessBlockedError(f"FlareSolverr: HTTP {status_code} pour {url}")
+        if status_code >= 400:
+            raise RuntimeError(f"FlareSolverr: HTTP {status_code} pour {url}")
         return html
 
     def _save_browser_debug(self, context: str) -> Dict[str, str]:
@@ -1377,7 +1526,7 @@ class NautiljonScraper:
                     announced = True
                 if time.time() >= challenge_deadline:
                     debug = self._save_browser_debug(context)
-                    raise RuntimeError(
+                    raise NautiljonAccessBlockedError(
                         f"La verification Cloudflare ne s'est pas terminee apres {wait_seconds}s "
                         f"({context}). Debug: {debug}"
                     )
@@ -1385,7 +1534,9 @@ class NautiljonScraper:
                 continue
             if self._blocked_by_waf(html):
                 debug = self._save_browser_debug(context)
-                raise RuntimeError(f"Cloudflare bloque le navigateur Selenium ({context}). Debug: {debug}")
+                raise NautiljonAccessBlockedError(
+                    f"Cloudflare bloque le navigateur Selenium ({context}). Debug: {debug}"
+                )
             break
         if announced:
             print("Verification Cloudflare terminee.")
@@ -1393,8 +1544,10 @@ class NautiljonScraper:
 
     def _browser_get(self, url: str, context: str) -> str:
         driver = self.setup_browser()
+        target_url = _ensure_abs_url(url)
+        self._pace_remote_request(target_url, f"navigation Selenium {context}")
         try:
-            driver.get(_ensure_abs_url(url))
+            driver.get(target_url)
         except WebDriverException as exc:
             debug = self._save_browser_debug(context)
             raise RuntimeError(f"Navigation Selenium impossible ({context}): {str(exc)[:300]}. Debug: {debug}") from exc
@@ -1426,6 +1579,7 @@ class NautiljonScraper:
             search_input.send_keys(query)
             form = search_input.find_element(By.XPATH, "./ancestor::form[1]")
             buttons = form.find_elements(By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], button")
+            self._pace_remote_request(self.driver.current_url, "soumission du formulaire mangas")
             if buttons:
                 self.driver.execute_script("arguments[0].click();", buttons[0])
             else:
@@ -1452,6 +1606,7 @@ class NautiljonScraper:
                     continue
                 try:
                     self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", link)
+                    self._pace_remote_request(self.driver.current_url, f"clic lettre {target}")
                     self.driver.execute_script("arguments[0].click();", link)
                     self._sleep_delay()
                     self._wait_browser_page("mangas_letter_click")
@@ -1668,8 +1823,9 @@ class NautiljonScraper:
             return self._browser_get(url, "fiche_detail")
         if self.backend == "flaresolverr":
             return self._fetch_html_flaresolverr(url)
-        response = self.session.get(_ensure_abs_url(url), timeout=DEFAULT_TIMEOUT)
-        response.raise_for_status()
+        target_url = _ensure_abs_url(url)
+        self._pace_remote_request(target_url, "requete HTTP")
+        response = self.session.get(target_url, timeout=DEFAULT_TIMEOUT)
         response.encoding = response.encoding or "utf-8"
         html = response.text
         if self._nautiljon_access_blocked(html):
@@ -1677,7 +1833,12 @@ class NautiljonScraper:
                 "Nautiljon a interdit l'IP de sortie pour abus; arret immediat sans nouvelle tentative"
             )
         if self._blocked_by_waf(html):
-            raise RuntimeError("Nautiljon a renvoye une page de blocage/WAF.")
+            raise NautiljonAccessBlockedError("Nautiljon a renvoye une page de blocage/WAF.")
+        if response.status_code in {403, 429} or response.headers.get("cf-mitigated") == "challenge":
+            raise NautiljonAccessBlockedError(
+                f"Nautiljon refuse la requete HTTP {response.status_code}; arret sans nouvelle tentative."
+            )
+        response.raise_for_status()
         return html
 
     def _nautiljon_access_blocked(self, html: str) -> bool:
@@ -1889,6 +2050,7 @@ class NautiljonScraper:
             "waf_blocked": False,
         }
         try:
+            self._pace_remote_request(url, f"diagnostic {label}")
             response = requests.get(
                 url,
                 headers=dict(self.session.headers),
@@ -1965,12 +2127,10 @@ class NautiljonScraper:
         for index, feed_url in enumerate(rss_feed_urls or DEFAULT_RSS_FEEDS, start=1):
             checks.append((f"rss_{index}", feed_url, "rss", None))
 
-        with ThreadPoolExecutor(max_workers=min(6, len(checks))) as executor:
-            futures = [
-                executor.submit(self._diagnose_endpoint, label, url, kind, expected_letter)
-                for label, url, kind, expected_letter in checks
-            ]
-            endpoints = [future.result() for future in futures]
+        endpoints = [
+            self._diagnose_endpoint(label, url, kind, expected_letter)
+            for label, url, kind, expected_letter in checks
+        ]
 
         egress_ok = any(item["label"] == "ip_sortie" and item["ok"] for item in endpoints)
         listing_ok = any(str(item["label"]).startswith("listing_") and item["ok"] for item in endpoints)
@@ -2250,6 +2410,11 @@ class NautiljonScraper:
         successful_listing_pages = 0
         listing_failed = False
         access_blocked = False
+        detail_abort = False
+        consecutive_detail_failures = 0
+        consecutive_page_failures = 0
+        max_detail_failures = max(1, _env_int("NAUTILJON_ABORT_AFTER_DETAIL_FAILURES", 2))
+        max_page_failures = max(1, _env_int("NAUTILJON_PAGE_FAILURE_RETRIES", 1))
         since_flush = 0
         counters = {"new": 0, "changed": 0, "parutions": 0, "reused": 0, "removed": 0}
         errors_before_letter = self.session_stats["errors"]
@@ -2327,18 +2492,36 @@ class NautiljonScraper:
                     if refreshed:
                         updated_rows[index] = refreshed
                         counters["parutions"] += 1
+                        consecutive_detail_failures = 0
                         self._sleep_delay()
+                except NautiljonAccessBlockedError as exc:
+                    self.session_stats["errors"] += 1
+                    access_blocked = True
+                    listing_failed = True
+                    print(f"    ACCES BLOQUE pendant la reprise des parutions: {str(exc)[:220]}")
+                    break
                 except Exception as exc:
                     self.session_stats["errors"] += 1
+                    consecutive_detail_failures += 1
                     print(f"    Erreur migration parutions: {str(exc)[:140]}")
+                    if consecutive_detail_failures >= max_detail_failures:
+                        detail_abort = True
+                        print(
+                            "    Trop d'erreurs de fiches consecutives; arret prudent de la lettre "
+                            f"({consecutive_detail_failures}/{max_detail_failures})."
+                        )
+                        break
             save_checkpoint(page_num)
 
         while True:
+            if access_blocked or detail_abort:
+                break
             if max_pages is not None and page_num >= max_pages:
                 break
             try:
                 page_url, page_series = self.fetch_listing_page(letter, page_num)
                 accessible_listing_pages += 1
+                consecutive_page_failures = 0
                 print(f"  Page {page_num + 1}: {len(page_series)} entrees ({page_url})")
             except NautiljonAccessBlockedError as exc:
                 access_blocked = True
@@ -2347,13 +2530,16 @@ class NautiljonScraper:
                 save_checkpoint(page_num)
                 break
             except Exception as exc:
-                empty_pages += 1
-                print(f"  Page {page_num + 1} indisponible, tentative {empty_pages}/3: {str(exc)[:160]}")
+                consecutive_page_failures += 1
+                print(
+                    f"  Page {page_num + 1} indisponible, tentative "
+                    f"{consecutive_page_failures}/{max_page_failures}: {str(exc)[:160]}"
+                )
                 save_checkpoint(page_num)
-                if empty_pages >= 3:
+                if consecutive_page_failures >= max_page_failures:
                     listing_failed = True
                     break
-                self._sleep_delay()
+                self._sleep_failure_pause()
                 continue
 
             if not page_series:
@@ -2401,6 +2587,7 @@ class NautiljonScraper:
                             if full:
                                 updated_rows.append(full)
                                 counters[action] += 1
+                                consecutive_detail_failures = 0
                                 self._sleep_delay()
                         except NautiljonAccessBlockedError as exc:
                             self.session_stats["errors"] += 1
@@ -2413,9 +2600,17 @@ class NautiljonScraper:
                             break
                         except Exception as exc:
                             self.session_stats["errors"] += 1
+                            consecutive_detail_failures += 1
                             print(f"    Erreur detail: {str(exc)[:140]}")
                             if existing:
                                 updated_rows.append(existing)
+                            if consecutive_detail_failures >= max_detail_failures:
+                                detail_abort = True
+                                print(
+                                    "    Trop d'erreurs de fiches consecutives; arret prudent de la lettre "
+                                    f"({consecutive_detail_failures}/{max_detail_failures})."
+                                )
+                                break
                             continue
                     else:
                         updated_rows.append(existing)
@@ -2426,7 +2621,7 @@ class NautiljonScraper:
                         save_checkpoint(page_num)
                         since_flush = 0
 
-                if access_blocked:
+                if access_blocked or detail_abort:
                     save_checkpoint(page_num)
                     break
                 save_checkpoint(page_num + 1)
@@ -2588,6 +2783,27 @@ class NautiljonScraper:
         all_catalog_letters = self.get_all_letters()
         letters_to_scrape = letters or all_catalog_letters
         requested_labels = [self._letter_label(letter) for letter in letters_to_scrape]
+        pacing = self.session_stats["anti_ban_config"]
+        print(
+            "Cadence anti-ban: "
+            f"{pacing['delay_min']:g}-{pacing['delay_max']:g}s entre requetes, "
+            f"pause {pacing['batch_pause_min']:g}-{pacing['batch_pause_max']:g}s "
+            f"toutes les {pacing['batch_size']} requetes, "
+            f"{pacing['letter_pause_min']:g}-{pacing['letter_pause_max']:g}s entre lettres."
+        )
+        cooldown = self._active_access_cooldown()
+        if cooldown:
+            print(
+                "Diff refuse pendant la quarantaine anti-ban. Reprise autorisee apres "
+                f"{cooldown.get('resume_after')}."
+            )
+            result = RunResult(
+                status="failed",
+                reason="access_cooldown_active",
+                requested_letters=requested_labels,
+            )
+            self.mark_run_state("diff", result)
+            return result
         all_catalog_requested = (
             set(letters_to_scrape) == set(all_catalog_letters)
             and len(letters_to_scrape) == len(all_catalog_letters)
@@ -2740,6 +2956,7 @@ class NautiljonScraper:
                 if diff_stats.get("access_blocked"):
                     aborted_listing_failures = True
                     incomplete_reason = "access_blocked"
+                    self._record_access_cooldown("access_blocked")
                     print(
                         "Diff interrompu immediatement: IP de sortie bloquee par Nautiljon. "
                         "Les donnees et le checkpoint sont conserves."
@@ -2771,9 +2988,14 @@ class NautiljonScraper:
                     incomplete_reason = "execution_limited"
                     break
                 if index < len(letters_to_scrape):
-                    pause = self._compute_delay(multiplier=3)
-                    print(f"Pause {pause:.1f}s avant la lettre suivante")
-                    time.sleep(pause)
+                    self._sleep_letter_pause()
+        except NautiljonAccessBlockedError as exc:
+            fatal_error = True
+            aborted_listing_failures = True
+            incomplete_reason = "access_blocked"
+            self.session_stats["errors"] += 1
+            self._record_access_cooldown(str(exc))
+            print(f"Acces Nautiljon bloque: {str(exc)[:240]}")
         except Exception as exc:
             fatal_error = True
             incomplete_reason = "fatal_error"
@@ -2827,6 +3049,7 @@ class NautiljonScraper:
         if status == "success":
             self.mark_success("diff", len(combined), export_paths)
             self._remove_checkpoint(self._state_path("diff_checkpoint"))
+            self._clear_access_cooldown()
         elif all_requested_completed:
             self._remove_checkpoint(self._state_path("diff_checkpoint"))
         self.mark_run_state("diff", result)
@@ -2863,7 +3086,7 @@ def _parse_csv_list(raw: Optional[str]) -> Optional[List[str]]:
 
 def _new_scraper(args: argparse.Namespace) -> NautiljonScraper:
     out_dir = args.out_dir or os.environ.get("NAUTILJON_OUT_DIR", "./output")
-    delay = args.delay if args.delay is not None else _env_float("NAUTILJON_DELAY", 2.0)
+    delay = args.delay if args.delay is not None else _env_float("NAUTILJON_DELAY", 8.0)
     delay_min = args.delay_min
     delay_max = args.delay_max
     if delay_min is None and os.environ.get("NAUTILJON_DELAY_MIN", "").strip():

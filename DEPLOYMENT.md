@@ -45,9 +45,22 @@ NAUTILJON_FLARESOLVERR_PROXY_PASSWORD=
 NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
 NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS=30
 NAUTILJON_FLARESOLVERR_STARTUP_DELAY=2
-NAUTILJON_CPUS=1.0
-NAUTILJON_MEM_LIMIT=1g
-NAUTILJON_MEMSWAP_LIMIT=1g
+NAUTILJON_CPUS=0.50
+NAUTILJON_MEM_LIMIT=768m
+NAUTILJON_MEMSWAP_LIMIT=768m
+NAUTILJON_SHM_SIZE=256m
+NAUTILJON_DELAY_MIN=8.0
+NAUTILJON_DELAY_MAX=20.0
+NAUTILJON_BATCH_SIZE=40
+NAUTILJON_BATCH_PAUSE_MIN=180
+NAUTILJON_BATCH_PAUSE_MAX=480
+NAUTILJON_LETTER_PAUSE_MIN=120
+NAUTILJON_LETTER_PAUSE_MAX=300
+NAUTILJON_FAILURE_PAUSE_MIN=300
+NAUTILJON_FAILURE_PAUSE_MAX=900
+NAUTILJON_BLOCK_COOLDOWN_HOURS=24
+NAUTILJON_PAGE_FAILURE_RETRIES=1
+NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
 NAUTILJON_MAX_MISSING_RATIO=0.15
 NAUTILJON_REFRESH_STALE_DAYS=30
 ```
@@ -121,8 +134,18 @@ NAUTILJON_FORCE_SCRAPE=false
 NAUTILJON_DROP_MISSING=true
 NAUTILJON_RESUME=true
 NAUTILJON_FLUSH_EVERY=25
-NAUTILJON_DELAY_MIN=2.0
-NAUTILJON_DELAY_MAX=5.0
+NAUTILJON_DELAY_MIN=8.0
+NAUTILJON_DELAY_MAX=20.0
+NAUTILJON_BATCH_SIZE=40
+NAUTILJON_BATCH_PAUSE_MIN=180
+NAUTILJON_BATCH_PAUSE_MAX=480
+NAUTILJON_LETTER_PAUSE_MIN=120
+NAUTILJON_LETTER_PAUSE_MAX=300
+NAUTILJON_FAILURE_PAUSE_MIN=300
+NAUTILJON_FAILURE_PAUSE_MAX=900
+NAUTILJON_BLOCK_COOLDOWN_HOURS=24
+NAUTILJON_PAGE_FAILURE_RETRIES=1
+NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
 NAUTILJON_MAX_MISSING_RATIO=0.15
@@ -145,6 +168,20 @@ ce lien dans le checkpoint. Si plus de 15 % des fiches historiques d'une lettre
 disparaissent du listing, la lettre n'est pas remplacee et le diff s'arrete.
 Une page indiquant que l'IP est interdite pour abus provoque egalement un arret
 immediat, sans trois nouvelles tentatives, avec conservation du checkpoint.
+Un challenge Cloudflare non resolu est traite comme un blocage. Le fichier
+`output/state/access_cooldown.json` interdit alors un nouveau diff pendant 24
+heures, y compris avec `NAUTILJON_FORCE_SCRAPE=true`.
+Si le canari affiche une case interactive « Verifiez que vous etes humain »,
+considerez l'IP comme bloquee. Le projet n'automatise pas le clic et ne tente
+pas de contourner les CAPTCHA : attendez la quarantaine ou changez proprement
+l'IP de sortie, puis relancez uniquement `flaresolverr-test`.
+
+La cadence par defaut est volontairement lente. Les navigations sont
+sequentielles, une pause de 8 a 20 secondes les separe, une pause de 3 a 8
+minutes intervient toutes les 40 requetes et une pause de 2 a 5 minutes separe
+les lettres. Une page en erreur n'est tentee qu'une fois et deux erreurs de
+fiches consecutives interrompent la lettre. Un catalogue initial peut donc
+prendre un a plusieurs jours selon le nombre de fiches a ouvrir.
 
 Avec `NAUTILJON_FORCE_SCRAPE=false`, une lettre validee depuis moins de
 `NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS` jours est reutilisee sans requete et
@@ -170,3 +207,21 @@ NAUTILJON_COMMAND=import-csv
 
 `browser-smoke` et `browser-test` restent disponibles pour le diagnostic, mais
 ne sont plus le transport recommande pour le diff.
+
+## Limites du conteneur FlareSolverr
+
+Les limites de `portainer-stack.yml` ne s'appliquent qu'au scraper. Le Chromium
+qui traite les pages se trouve dans le conteneur FlareSolverr. Ajoutez dans le
+service FlareSolverr de `search-stack`, si sa charge partagee le permet :
+
+```yaml
+cpus: "0.75"
+mem_limit: 768m
+memswap_limit: 768m
+shm_size: 256m
+pids_limit: 256
+```
+
+N'executez pas d'autres travaux FlareSolverr concurrents pendant le diff
+Nautiljon. Une session unique est conservee afin de reutiliser les cookies et
+de ne pas resoudre le challenge a chaque page.

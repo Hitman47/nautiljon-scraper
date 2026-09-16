@@ -1,9 +1,10 @@
 # Nautiljon Scraper
 
-Scraper des fiches manga Nautiljon utilisant FlareSolverr pour franchir la
-verification Cloudflare sans intervention manuelle. Selenium reste disponible
-comme outil de diagnostic. Le scraper importe les CSV existants et produit un
-diff mensuel avec reprise apres interruption.
+Scraper prudent des fiches manga Nautiljon. FlareSolverr est le transport
+principal et Selenium/Chromium reste disponible pour le diagnostic. Aucun
+transport ne garantit le passage de Cloudflare : un challenge non resolu arrete
+immediatement le run et place le scraper en quarantaine. Le scraper importe les
+CSV existants et produit un diff mensuel avec reprise apres interruption.
 
 ## Commandes
 
@@ -66,18 +67,28 @@ NAUTILJON_FLARESOLVERR_PROXY_PASSWORD=
 NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
 NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS=30
 NAUTILJON_FLARESOLVERR_STARTUP_DELAY=2
-NAUTILJON_DELAY_MIN=2.0
-NAUTILJON_DELAY_MAX=5.0
+NAUTILJON_DELAY_MIN=8.0
+NAUTILJON_DELAY_MAX=20.0
+NAUTILJON_BATCH_SIZE=40
+NAUTILJON_BATCH_PAUSE_MIN=180
+NAUTILJON_BATCH_PAUSE_MAX=480
+NAUTILJON_LETTER_PAUSE_MIN=120
+NAUTILJON_LETTER_PAUSE_MAX=300
+NAUTILJON_FAILURE_PAUSE_MIN=300
+NAUTILJON_FAILURE_PAUSE_MAX=900
+NAUTILJON_BLOCK_COOLDOWN_HOURS=24
+NAUTILJON_PAGE_FAILURE_RETRIES=1
+NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
 NAUTILJON_RESUME=true
 NAUTILJON_FLUSH_EVERY=25
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_MAX_MISSING_RATIO=0.15
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
 NAUTILJON_REFRESH_STALE_DAYS=30
-NAUTILJON_CPUS=1.0
-NAUTILJON_MEM_LIMIT=1g
-NAUTILJON_MEMSWAP_LIMIT=1g
-NAUTILJON_SHM_SIZE=512m
+NAUTILJON_CPUS=0.50
+NAUTILJON_MEM_LIMIT=768m
+NAUTILJON_MEMSWAP_LIMIT=768m
+NAUTILJON_SHM_SIZE=256m
 ```
 
 ## Garanties
@@ -86,6 +97,15 @@ NAUTILJON_SHM_SIZE=512m
 - Un diff est refuse si FlareSolverr et Gluetun n'utilisent pas la meme IP publique.
 - Une IP explicitement interdite par Nautiljon arrete le diff sans nouvelle tentative,
   y compris si le blocage apparait pendant une fiche detail.
+- Un challenge Cloudflare non resolu a le meme effet et interdit tout nouveau diff
+  pendant 24 heures. `--force` ne contourne pas cette quarantaine.
+- Une case interactive « Verifiez que vous etes humain » est un verdict de blocage :
+  le scraper ne tente ni de la cliquer ni de contourner un CAPTCHA. Changez
+  d'IP de sortie ou attendez la fin de la quarantaine avant un nouveau canari.
+- Les acces Nautiljon sont strictement sequentiels : 8 a 20 secondes entre deux
+  navigations, 3 a 8 minutes toutes les 40 requetes et 2 a 5 minutes entre lettres.
+- Une page inaccessible n'est pas rechargee en boucle. Deux echecs de fiches
+  consecutifs interrompent la lettre en conservant son checkpoint.
 - Selenium reste disponible avec `browser-test` pour le diagnostic.
 - Les CSV utilisent `;` et `utf-8-sig`.
 - Seuls `yaoi` et `yuri` sont exclus.
@@ -107,4 +127,11 @@ NAUTILJON_SHM_SIZE=512m
   directement de la fiche serie, sans ouvrir les fiches des tomes.
 - Un diff complet reutilise les lettres validees depuis moins de 30 jours si `FORCE=false`.
 - Le RSS reste separe du diff et ne peut pas valider un export mensuel.
-- Le conteneur est limite par le compose a 1 CPU et 1 Gio de RAM.
+- Le conteneur est limite par le compose a 0,5 CPU, 768 Mio de RAM, 256 Mio de
+  memoire partagee et 256 processus. Le navigateur reste mono-session.
+
+Les limites ci-dessus concernent le conteneur du scraper. Lorsque le backend
+`flaresolverr` est utilise, le conteneur FlareSolverr execute son propre Chromium
+et doit recevoir des limites equivalentes dans son stack (`cpus: 0.75`,
+`mem_limit: 768m`, `memswap_limit: 768m`, `shm_size: 256m`). Ne lancez pas de
+requete FlareSolverr concurrente pendant le diff Nautiljon.
