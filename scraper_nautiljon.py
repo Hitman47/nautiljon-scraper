@@ -1699,7 +1699,10 @@ class NautiljonScraper:
             label = _clean_spaces(anchor.get_text(" ", strip=True)).upper()
             if label == "#" or re.fullmatch(r"[A-Z]", label):
                 href = str(anchor.get("href", ""))
-                if "/mangas/" in href and "q=" in href and "st=" in href:
+                parsed = urlsplit(urljoin(BASE_URL, href))
+                query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                expected_query = "#" if label == "#" else label.lower()
+                if "/mangas/" in parsed.path and query.get("q", "").lower() == expected_query:
                     self._flaresolverr_letter_urls[label] = _ensure_abs_url(href)
         missing = [self._letter_label(letter) for letter in self.get_all_letters() if self._letter_label(letter) not in self._flaresolverr_letter_urls]
         if missing:

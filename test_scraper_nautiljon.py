@@ -863,7 +863,7 @@ class DiffStateTests(unittest.TestCase):
         scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
         labels = ["#"] + [chr(code) for code in range(ord("A"), ord("Z") + 1)]
         root_html = "".join(
-            f'<a href="/mangas/?q={label.lower()}&st=token">{label}</a>'
+            f'<a href="/mangas/?q={"%23" if label == "#" else label.lower()}">{label}</a>'
             for label in labels
         )
         calls = []
@@ -888,14 +888,14 @@ class DiffStateTests(unittest.TestCase):
         self.assertEqual(a_rows[0]["titre"], "A Test")
         self.assertEqual(b_rows[0]["titre"], "B Test")
         self.assertEqual(calls.count("https://www.nautiljon.com/mangas/"), 1)
-        self.assertIn("q=a&st=token", calls[1])
-        self.assertIn("q=b&st=token", calls[2])
+        self.assertIn("q=a", calls[1])
+        self.assertIn("q=b", calls[2])
 
     def test_flaresolverr_listing_follows_exact_next_token(self):
         scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
         labels = ["#"] + [chr(code) for code in range(ord("A"), ord("Z") + 1)]
         root_html = "".join(
-            f'<a href="/mangas/?q={label.lower()}&st=token-1">{label}</a>'
+            f'<a href="/mangas/?q={"%23" if label == "#" else label.lower()}&st=token-1">{label}</a>'
             for label in labels
         )
         first_page = """
