@@ -175,6 +175,10 @@ Si le canari affiche une case interactive « Verifiez que vous etes humain »,
 considerez l'IP comme bloquee. Le projet n'automatise pas le clic et ne tente
 pas de contourner les CAPTCHA : attendez la quarantaine ou changez proprement
 l'IP de sortie, puis relancez uniquement `flaresolverr-test`.
+Si FlareSolverr ne renvoie plus l'index alphabetique, le HTML et ses metadonnees
+sont sauvegardes dans `output/debug/flaresolverr_mangas_index_missing_*`. Ne
+supprimez pas les exports : l'URL exacte d'une page en cours reste dans le
+checkpoint et est prioritaire lors de la reprise.
 
 La cadence par defaut est volontairement lente. Les navigations sont
 sequentielles, une pause de 8 a 20 secondes les separe, une pause de 3 a 8

@@ -99,6 +99,9 @@ NAUTILJON_SHM_SIZE=256m
   y compris si le blocage apparait pendant une fiche detail.
 - Un challenge Cloudflare non resolu a le meme effet et interdit tout nouveau diff
   pendant 24 heures. `--force` ne contourne pas cette quarantaine.
+- Une page FlareSolverr sans index alphabetique est conservee dans
+  `output/debug/flaresolverr_mangas_index_missing_*.html` puis traitee comme un
+  blocage. Une reprise utilise d'abord l'URL exacte stockee dans son checkpoint.
 - Une case interactive « Verifiez que vous etes humain » est un verdict de blocage :
   le scraper ne tente ni de la cliquer ni de contourner un CAPTCHA. Changez
   d'IP de sortie ou attendez la fin de la quarantaine avant un nouveau canari.

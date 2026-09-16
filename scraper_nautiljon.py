@@ -217,6 +217,7 @@ class NautiljonScraper:
         self._flaresolverr_letter_urls: Dict[str, str] = {}
         self._flaresolverr_listing_urls: Dict[Tuple[str, int], str] = {}
         self._flaresolverr_page_has_next: Dict[Tuple[str, int], bool] = {}
+        self._last_flaresolverr_debug: Dict[str, str] = {}
         conservative_defaults = delay > 0 or delay_min is not None or delay_max is not None
         self.batch_size = max(0, _env_int("NAUTILJON_BATCH_SIZE", 40 if conservative_defaults else 0))
         self.batch_pause_min = max(
@@ -1459,6 +1460,40 @@ class NautiljonScraper:
             pass
         return paths
 
+    def _save_flaresolverr_debug(self, context: str, html: str, requested_url: str) -> Dict[str, str]:
+        debug_dir = os.path.join(self.out_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        safe_context = re.sub(r"[^a-zA-Z0-9_.-]+", "_", context).strip("_") or "page"
+        base = os.path.join(
+            debug_dir,
+            f"flaresolverr_{safe_context}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        )
+        paths: Dict[str, str] = {}
+        try:
+            html_path = base + ".html"
+            with open(html_path, "w", encoding="utf-8") as handle:
+                handle.write(html)
+            paths["html"] = html_path
+        except OSError:
+            pass
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            metadata_path = base + ".json"
+            metadata = {
+                "captured_at": datetime.now().isoformat(timespec="seconds"),
+                "requested_url": requested_url,
+                "final_url": self._last_flaresolverr_url or requested_url,
+                "title": _clean_spaces(soup.title.get_text(" ", strip=True)) if soup.title else "",
+                "html_bytes": len(html.encode("utf-8", errors="replace")),
+            }
+            with open(metadata_path, "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, ensure_ascii=False, indent=2)
+            paths["metadata"] = metadata_path
+        except OSError:
+            pass
+        self._last_flaresolverr_debug = paths
+        return paths
+
     def _dismiss_cookie_consent(self) -> bool:
         if not self.driver:
             return False
@@ -1668,7 +1703,15 @@ class NautiljonScraper:
                     self._flaresolverr_letter_urls[label] = _ensure_abs_url(href)
         missing = [self._letter_label(letter) for letter in self.get_all_letters() if self._letter_label(letter) not in self._flaresolverr_letter_urls]
         if missing:
-            raise RuntimeError(f"FlareSolverr: liens alphabetiques introuvables: {', '.join(missing)}")
+            debug = self._save_flaresolverr_debug(
+                "mangas_index_missing",
+                html,
+                f"{BASE_URL}/mangas/",
+            )
+            raise NautiljonAccessBlockedError(
+                "FlareSolverr: index Nautiljon non exploitable; liens alphabetiques "
+                f"introuvables: {', '.join(missing)}. Debug: {debug}"
+            )
         print(f"Index Nautiljon initialise via FlareSolverr: {len(self._flaresolverr_letter_urls)} lettres")
 
     @staticmethod
@@ -1697,11 +1740,11 @@ class NautiljonScraper:
         return self._flaresolverr_page_has_next.get((self._letter_tag(letter), page_num), False)
 
     def _fetch_listing_page_flaresolverr(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
-        self._load_flaresolverr_letter_urls()
         label = self._letter_label(letter)
         key = (self._letter_tag(letter), page_num)
         page_url = self._flaresolverr_listing_urls.get(key)
         if not page_url:
+            self._load_flaresolverr_letter_urls()
             page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
         html = self._fetch_html_flaresolverr(page_url)
         if self._search_session_expired(html):
@@ -1806,6 +1849,8 @@ class NautiljonScraper:
                 report["sample_title"] = rows[0].get("titre", "N/A")
         except Exception as exc:
             report["error"] = str(exc)
+            if self._last_flaresolverr_debug:
+                report["debug"] = dict(self._last_flaresolverr_debug)
         finally:
             self.close_flaresolverr()
         report["ready_for_diff"] = bool(

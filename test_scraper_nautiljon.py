@@ -571,6 +571,40 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(resumed_urls, [exact_next_url])
             self.assertFalse(os.path.exists(second._letter_checkpoint_path("A")))
 
+    def test_flaresolverr_exact_resume_url_bypasses_alphabet_index(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+        exact_url = "https://www.nautiljon.com/mangas/?q=b&st=saved-token&dbt=100"
+        scraper._set_flaresolverr_listing_url("b", 2, exact_url)
+        scraper._fetch_html_flaresolverr = mock.Mock(return_value="<html><body></body></html>")
+        scraper._last_flaresolverr_url = exact_url
+        scraper._load_flaresolverr_letter_urls = mock.Mock(
+            side_effect=AssertionError("alphabet index must not be loaded during exact resume")
+        )
+
+        final_url, rows = scraper._fetch_listing_page_flaresolverr("b", 2)
+
+        self.assertEqual(final_url, exact_url)
+        self.assertEqual(rows, [])
+        scraper._load_flaresolverr_letter_urls.assert_not_called()
+        scraper._fetch_html_flaresolverr.assert_called_once_with(exact_url)
+
+    def test_missing_flaresolverr_alphabet_saves_debug_and_blocks(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            scraper._last_flaresolverr_url = "https://www.nautiljon.com/mangas/"
+            scraper._fetch_html_flaresolverr = mock.Mock(
+                return_value="<html><head><title>Page inattendue</title></head><body>vide</body></html>"
+            )
+
+            with self.assertRaises(NautiljonAccessBlockedError):
+                scraper._load_flaresolverr_letter_urls()
+
+            self.assertIn("html", scraper._last_flaresolverr_debug)
+            self.assertIn("metadata", scraper._last_flaresolverr_debug)
+            self.assertTrue(os.path.isfile(scraper._last_flaresolverr_debug["html"]))
+            metadata = scraper._load_json_dict(scraper._last_flaresolverr_debug["metadata"])
+            self.assertEqual(metadata["title"], "Page inattendue")
+
     def test_controlled_diff_does_not_replace_final_letter(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = self.make_scraper(out_dir)
