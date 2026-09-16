@@ -605,6 +605,26 @@ class DiffStateTests(unittest.TestCase):
             metadata = scraper._load_json_dict(scraper._last_flaresolverr_debug["metadata"])
             self.assertEqual(metadata["title"], "Page inattendue")
 
+    def test_flaresolverr_test_saves_empty_listing_debug(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            listing_url = "https://www.nautiljon.com/mangas/?q=a"
+            scraper._flaresolverr_public_ips = mock.Mock(return_value=("203.0.113.1", "203.0.113.1"))
+            scraper.fetch_listing_page = mock.Mock(return_value=(listing_url, []))
+            scraper._last_flaresolverr_url = listing_url
+            scraper._last_flaresolverr_html = (
+                "<html><head><title>Liste vide</title></head>"
+                "<body>Votre session de recherche a expire.</body></html>"
+            )
+            scraper.close_flaresolverr = mock.Mock()
+
+            report = scraper.flaresolverr_test("a")
+
+            self.assertFalse(report["ready_for_diff"])
+            self.assertTrue(report["search_session_expired"])
+            self.assertEqual(report["listing_final_url"], listing_url)
+            self.assertTrue(os.path.isfile(report["debug"]["html"]))
+
     def test_controlled_diff_does_not_replace_final_letter(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = self.make_scraper(out_dir)

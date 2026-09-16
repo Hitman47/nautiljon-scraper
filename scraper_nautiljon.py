@@ -214,6 +214,7 @@ class NautiljonScraper:
         self._browser_letter_urls: Dict[str, str] = {}
         self.flaresolverr_session_id: Optional[str] = None
         self._last_flaresolverr_url = ""
+        self._last_flaresolverr_html = ""
         self._flaresolverr_letter_urls: Dict[str, str] = {}
         self._flaresolverr_listing_urls: Dict[Tuple[str, int], str] = {}
         self._flaresolverr_page_has_next: Dict[Tuple[str, int], bool] = {}
@@ -1423,6 +1424,7 @@ class NautiljonScraper:
             raise NautiljonAccessBlockedError(f"FlareSolverr: HTTP {status_code} pour {url}")
         if not isinstance(html, str) or not html:
             raise RuntimeError(f"FlareSolverr: reponse vide pour {url}")
+        self._last_flaresolverr_html = html
         if self._nautiljon_access_blocked(html):
             raise NautiljonAccessBlockedError(
                 "Nautiljon a interdit l'IP de sortie pour abus; arret immediat sans nouvelle tentative"
@@ -1840,9 +1842,19 @@ class NautiljonScraper:
             report["flaresolverr_public_ip"] = flaresolverr_ip
             report["same_public_ip"] = direct_ip == flaresolverr_ip
 
-            _, rows = self.fetch_listing_page(letter, 0)
+            listing_url, rows = self.fetch_listing_page(letter, 0)
             report["listing_rows"] = len(rows)
             report["listing_ok"] = len(rows) > 0
+            report["listing_final_url"] = listing_url
+            if not rows and self._last_flaresolverr_html:
+                report["search_session_expired"] = self._search_session_expired(
+                    self._last_flaresolverr_html
+                )
+                report["debug"] = self._save_flaresolverr_debug(
+                    f"listing_{self._letter_tag(letter).lower()}_empty",
+                    self._last_flaresolverr_html,
+                    listing_url,
+                )
             if rows:
                 html = self.fetch_html(rows[0]["url_fiche"])
                 detail = self.extract_series_detail_from_html(html)
