@@ -6,7 +6,7 @@ display_number="${display#:}"
 socket="/tmp/.X11-unix/X${display_number}"
 
 mkdir -p /tmp/.X11-unix
-Xvfb "$display" -screen 0 1365x900x24 -nolisten tcp &
+Xvfb "$display" -screen 0 1280x800x24 -nolisten tcp &
 xvfb_pid=$!
 
 cleanup() {
