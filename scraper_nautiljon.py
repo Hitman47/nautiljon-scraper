@@ -52,6 +52,7 @@ DEFAULT_HEADERS = {
 }
 BANNED_TYPE_KEYWORDS = ["yaoi", "yuri"]
 DATA_SCHEMA_VERSION = 2
+LETTER_CHECKPOINT_VERSION = 2
 VF_RELEASE_FIELDS = [
     "dernier_tome_vf_numero", "dernier_tome_vf_date",
     "dernier_tome_vf_url", "dernier_tome_vf_couverture",
@@ -609,7 +610,15 @@ class NautiljonScraper:
         if not isinstance(settings, dict):
             return False
         saved_letter = str(settings.get("letter", "") or "")
-        return bool(saved_letter) and self._letter_tag(saved_letter) == letter_tag
+        try:
+            checkpoint_version = int(settings.get("checkpoint_version", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return (
+            bool(saved_letter)
+            and self._letter_tag(saved_letter) == letter_tag
+            and checkpoint_version == LETTER_CHECKPOINT_VERSION
+        )
 
     def _remove_checkpoint(self, path: str) -> None:
         try:
@@ -2566,6 +2575,7 @@ class NautiljonScraper:
         checkpoint_path = self._letter_checkpoint_path(tag)
         resumed_from_checkpoint = False
         letter_settings = {
+            "checkpoint_version": LETTER_CHECKPOINT_VERSION,
             "letter": letter,
             "max_pages": max_pages,
             "max_series": max_series,
@@ -2707,6 +2717,7 @@ class NautiljonScraper:
                     new_on_page += 1
                     series["url_fiche"] = url
                     if self.is_banned_type(series.get("type_liste", "")):
+                        existing_by_url.pop(url, None)
                         self.session_stats["skipped_by_type"] += 1
                         continue
                     if max_series is not None and len(updated_rows) >= max_series:

@@ -7,7 +7,12 @@ import urllib.parse
 from datetime import datetime, timedelta
 from unittest import mock
 
-from scraper_nautiljon import DATA_SCHEMA_VERSION, NautiljonAccessBlockedError, NautiljonScraper
+from scraper_nautiljon import (
+    DATA_SCHEMA_VERSION,
+    LETTER_CHECKPOINT_VERSION,
+    NautiljonAccessBlockedError,
+    NautiljonScraper,
+)
 
 
 def make_row(label: str):
@@ -571,6 +576,67 @@ class DiffStateTests(unittest.TestCase):
 
             self.assertEqual(resumed_urls, [exact_next_url])
             self.assertFalse(os.path.exists(second._letter_checkpoint_path("A")))
+
+    def test_legacy_letter_checkpoint_is_archived_and_restarted(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            self.seed_letter(scraper, "e")
+            scraper.save_letter_files("E", [make_row("E")], partial=True)
+            scraper._write_json_atomic(
+                scraper._letter_checkpoint_path("E"),
+                {"settings": {"letter": "e"}, "page_num": 10},
+            )
+            calls = []
+
+            def fetch(this, letter, page_num):
+                calls.append(page_num)
+                this._flaresolverr_page_has_next[(this._letter_tag(letter), page_num)] = False
+                return "https://example.test/e", [make_row("E")]
+
+            scraper.fetch_listing_page = types.MethodType(fetch, scraper)
+            scraper.scrape_letter_diff("e", drop_missing=True, resume=True)
+
+            self.assertEqual(calls, [0])
+            archive_root = os.path.join(out_dir, "checkpoints", "archive")
+            self.assertTrue(os.path.isdir(archive_root))
+
+    def test_current_letter_checkpoint_version_is_compatible(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0)
+        checkpoint = {
+            "settings": {
+                "letter": "e",
+                "checkpoint_version": LETTER_CHECKPOINT_VERSION,
+            }
+        }
+
+        self.assertTrue(scraper._letter_checkpoint_is_compatible("E", checkpoint))
+
+    def test_seen_banned_series_does_not_count_as_missing_coverage(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            existing = []
+            listing = []
+            for index in range(20):
+                row = make_row("E")
+                row["titre"] = f"Example E {index}"
+                row["url_fiche"] = f"https://www.nautiljon.com/mangas/example-e-{index}.html"
+                row["type_liste"] = "Yaoi" if index == 0 else "Seinen"
+                existing.append(dict(row))
+                listing.append(dict(row))
+            scraper.save_letter_files("E", existing, partial=False)
+
+            def fetch(this, letter, page_num):
+                this._flaresolverr_page_has_next[(this._letter_tag(letter), page_num)] = False
+                return "https://example.test/e", listing
+
+            scraper.fetch_listing_page = types.MethodType(fetch, scraper)
+            result = scraper.scrape_letter_diff("e", drop_missing=True, resume=True)
+
+            self.assertEqual(len(result), 19)
+            stats = scraper.session_stats["diff_by_letter"]["E"]
+            self.assertFalse(stats["coverage_failed"])
+            self.assertEqual(stats["missing_count"], 0)
+            self.assertEqual(scraper.session_stats["skipped_by_type"], 1)
 
     def test_flaresolverr_exact_resume_url_bypasses_alphabet_index(self):
         scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
