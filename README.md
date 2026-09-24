@@ -121,6 +121,8 @@ NAUTILJON_SHM_SIZE=256m
 - Une valeur absente (`N/A`) dans un listing ne remplace jamais une valeur connue
   et ne declenche pas de consultation de fiche. Une vraie nouvelle valeur reste
   comparee normalement, notamment pour detecter un changement du nombre de tomes.
+- Une variation de note est copiee directement depuis le listing sans recharger
+  la fiche. Les valeurs du listing ne sont jamais ecrasees par les champs detail.
 - Une page inaccessible n'est pas rechargee en boucle. Deux echecs de fiches
   consecutifs interrompent la lettre en conservant son checkpoint.
 - Selenium reste disponible avec `browser-test` pour le diagnostic.

@@ -126,6 +126,22 @@ class DiffStateTests(unittest.TestCase):
         current["nb_vol_vf_liste"] = "21"
 
         self.assertTrue(scraper._series_changed_on_list(existing, current))
+        self.assertEqual(
+            scraper._series_change_reasons(existing, current),
+            {"nb_vol_vf_liste": ("20", "21")},
+        )
+
+    def test_note_only_change_is_merged_without_detail_refresh(self):
+        scraper = self.make_scraper("unused")
+        existing = make_row("F")
+        existing.update({"note_liste": "8.39/10", "nb_vol_vf_liste": "20"})
+        current = dict(existing)
+        current.update({"note_liste": "8.40/10", "nb_vol_vf_liste": "N/A"})
+
+        self.assertFalse(scraper._series_changed_on_list(existing, current))
+        merged = scraper._merge_observed_list_fields(existing, current)
+        self.assertEqual(merged["note_liste"], "8.40/10")
+        self.assertEqual(merged["nb_vol_vf_liste"], "20")
 
     def test_known_listing_values_are_preserved_when_current_parse_is_missing(self):
         current = {
@@ -359,6 +375,9 @@ class DiffStateTests(unittest.TestCase):
 
         detail = scraper.extract_series_detail_from_html(html)
 
+        self.assertNotIn("note_liste", detail)
+        self.assertNotIn("nb_vol_vf_liste", detail)
+        self.assertNotIn("type_liste", detail)
         self.assertEqual(detail["dernier_tome_vf_numero"], "6")
         self.assertEqual(detail["dernier_tome_vf_date"], "15/05/2026")
         self.assertEqual(

@@ -208,6 +208,8 @@ lettres. Les fiches detail attendent 10 a 15 secondes apres chaque lecture et
 font une pause de 45 a 75 secondes toutes les 15 fiches. Une valeur `N/A` issue
 du listing n'est jamais consideree comme un changement, tandis qu'une nouvelle
 valeur exploitable (par exemple un nombre de tomes different) reste detectee.
+Une variation de note est actualisee depuis le listing sans ouvrir la fiche et
+les champs detail ne peuvent pas ecraser les valeurs fiables du listing.
 Une page en erreur n'est tentee qu'une fois et deux erreurs de fiches consecutives
 interrompent la lettre.
 

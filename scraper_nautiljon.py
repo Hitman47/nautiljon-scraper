@@ -2652,7 +2652,8 @@ class NautiljonScraper:
 
     def extract_series_detail_from_html(self, html: str) -> Dict[str, str]:
         soup = BeautifulSoup(html, "html.parser")
-        detail = {field: "N/A" for field in PREFERRED_FIELDS if field not in {"url_fiche", "titre", "titre_alternatif", "extraction_time"}}
+        list_fields = set(ListRow.__dataclass_fields__)
+        detail = {field: "N/A" for field in PREFERRED_FIELDS if field not in list_fields}
         detail["_titre_fr_fallback"] = self._extract_title_fr(soup)
         detail.update(self._extract_vf_releases(soup))
         detail["parutions_vf_verifiees_le"] = _now_str()
@@ -2728,6 +2729,17 @@ class NautiljonScraper:
             if _is_na(current.get(field)) and not _is_na(existing.get(field)):
                 current[field] = existing[field]
 
+    @staticmethod
+    def _merge_observed_list_fields(existing: Dict[str, str], current: Dict[str, str]) -> Dict[str, str]:
+        merged = dict(existing)
+        for field in ListRow.__dataclass_fields__:
+            if field in {"extraction_time", "url_fiche"}:
+                continue
+            observed = current.get(field)
+            if not _is_na(observed):
+                merged[field] = observed
+        return merged
+
     def _fetch_full_series_data(self, series: Dict[str, str]) -> Optional[Dict[str, str]]:
         if self.is_banned_type(series.get("type_liste", "")):
             self.session_stats["skipped_by_type"] += 1
@@ -2743,8 +2755,24 @@ class NautiljonScraper:
         detail.pop("_titre_fr_fallback", None)
         return self._normalize_row({**series, **detail})
 
-    def _series_changed_on_list(self, existing: Dict[str, str], current: Dict[str, str]) -> bool:
-        fields = [field for field in ListRow.__dataclass_fields__.keys() if field != "extraction_time"]
+    def _series_change_reasons(
+        self,
+        existing: Dict[str, str],
+        current: Dict[str, str],
+    ) -> Dict[str, Tuple[str, str]]:
+        # La note varie au fil des votes et peut etre actualisee depuis le listing
+        # sans recharger toute la fiche. L'URL sert deja de cle de rapprochement.
+        fields = (
+            "titre",
+            "titre_alternatif",
+            "type_liste",
+            "nb_vol_vo_liste",
+            "nb_vol_vf_liste",
+            "age_liste",
+            "date_vf_liste",
+            "date_vo_liste",
+        )
+        reasons: Dict[str, Tuple[str, str]] = {}
         for field in fields:
             previous = _clean_spaces(existing.get(field, "N/A"))
             observed = _clean_spaces(current.get(field, "N/A"))
@@ -2754,8 +2782,11 @@ class NautiljonScraper:
             if _is_na(observed):
                 continue
             if previous != observed:
-                return True
-        return False
+                reasons[field] = (previous, observed)
+        return reasons
+
+    def _series_changed_on_list(self, existing: Dict[str, str], current: Dict[str, str]) -> bool:
+        return bool(self._series_change_reasons(existing, current))
 
     def _series_vf_is_ongoing(self, existing: Dict[str, str]) -> bool:
         return "en cours" in _norm(existing.get("nb_vol_vf_detail", ""))
@@ -2837,6 +2868,7 @@ class NautiljonScraper:
             if checkpoint and self._letter_checkpoint_is_compatible(tag, checkpoint) and partial_rows:
                 updated_rows = [self._normalize_row(row) for row in partial_rows]
                 for row in updated_rows:
+                    self._backfill_list_fields_from_detail(row, row)
                     url = _ensure_abs_url(row.get("url_fiche", ""))
                     previous = existing_by_url.get(url)
                     if previous:
@@ -3027,7 +3059,19 @@ class NautiljonScraper:
                         needs_detail = True
 
                     if needs_detail:
-                        print(f"    MAJ {action}: {(series.get('titre') or 'N/A')[:60]}")
+                        change_suffix = ""
+                        if action == "changed" and existing:
+                            reasons = self._series_change_reasons(existing, series)
+                            summary = ", ".join(
+                                f"{field}: {before} -> {after}"
+                                for field, (before, after) in reasons.items()
+                            )
+                            if summary:
+                                change_suffix = f" [{summary[:180]}]"
+                        print(
+                            f"    MAJ {action}: {(series.get('titre') or 'N/A')[:60]}"
+                            f"{change_suffix}"
+                        )
                         try:
                             if existing:
                                 self._preserve_known_list_fields(series, existing)
@@ -3061,7 +3105,7 @@ class NautiljonScraper:
                                 break
                             continue
                     else:
-                        updated_rows.append(existing)
+                        updated_rows.append(self._merge_observed_list_fields(existing, series))
                         counters["reused"] += 1
 
                     since_flush += 1
