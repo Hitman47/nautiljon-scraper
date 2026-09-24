@@ -54,6 +54,11 @@ NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
 NAUTILJON_BATCH_PAUSE_MIN=45
 NAUTILJON_BATCH_PAUSE_MAX=90
+NAUTILJON_DETAIL_DELAY_MIN=10
+NAUTILJON_DETAIL_DELAY_MAX=15
+NAUTILJON_DETAIL_BATCH_SIZE=15
+NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
+NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -141,6 +146,11 @@ NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
 NAUTILJON_BATCH_PAUSE_MIN=45
 NAUTILJON_BATCH_PAUSE_MAX=90
+NAUTILJON_DETAIL_DELAY_MIN=10
+NAUTILJON_DETAIL_DELAY_MAX=15
+NAUTILJON_DETAIL_BATCH_SIZE=15
+NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
+NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -194,8 +204,12 @@ checkpoint et est prioritaire lors de la reprise.
 La cadence par defaut reste prudente sans pauses disproportionnees. Les
 navigations sont sequentielles, 4 a 7 secondes les separent, une pause de 45 a
 90 secondes intervient toutes les 80 requetes et 20 a 45 secondes separent les
-lettres. Une page en erreur n'est tentee qu'une fois et deux erreurs de fiches
-consecutives interrompent la lettre.
+lettres. Les fiches detail attendent 10 a 15 secondes apres chaque lecture et
+font une pause de 45 a 75 secondes toutes les 15 fiches. Une valeur `N/A` issue
+du listing n'est jamais consideree comme un changement, tandis qu'une nouvelle
+valeur exploitable (par exemple un nombre de tomes different) reste detectee.
+Une page en erreur n'est tentee qu'une fois et deux erreurs de fiches consecutives
+interrompent la lettre.
 
 Avec `NAUTILJON_FORCE_SCRAPE=false`, une lettre validee depuis moins de
 `NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS` jours est reutilisee sans requete et

@@ -37,6 +37,11 @@ class DiffStateTests(unittest.TestCase):
             "NAUTILJON_BATCH_SIZE",
             "NAUTILJON_BATCH_PAUSE_MIN",
             "NAUTILJON_BATCH_PAUSE_MAX",
+            "NAUTILJON_DETAIL_DELAY_MIN",
+            "NAUTILJON_DETAIL_DELAY_MAX",
+            "NAUTILJON_DETAIL_BATCH_SIZE",
+            "NAUTILJON_DETAIL_BATCH_PAUSE_MIN",
+            "NAUTILJON_DETAIL_BATCH_PAUSE_MAX",
             "NAUTILJON_LETTER_PAUSE_MIN",
             "NAUTILJON_LETTER_PAUSE_MAX",
             "NAUTILJON_FAILURE_PAUSE_MIN",
@@ -48,6 +53,9 @@ class DiffStateTests(unittest.TestCase):
 
         self.assertEqual(scraper.batch_size, 80)
         self.assertEqual((scraper.batch_pause_min, scraper.batch_pause_max), (45.0, 90.0))
+        self.assertEqual((scraper.detail_delay_min, scraper.detail_delay_max), (10.0, 15.0))
+        self.assertEqual(scraper.detail_batch_size, 15)
+        self.assertEqual((scraper.detail_batch_pause_min, scraper.detail_batch_pause_max), (45.0, 75.0))
         self.assertEqual((scraper.letter_pause_min, scraper.letter_pause_max), (20.0, 45.0))
         self.assertEqual((scraper.failure_pause_min, scraper.failure_pause_max), (120.0, 300.0))
 
@@ -76,6 +84,67 @@ class DiffStateTests(unittest.TestCase):
 
         sleep.assert_not_called()
         self.assertEqual(scraper.session_stats["remote_requests"], 0)
+
+    def test_detail_pacer_adds_a_break_before_sixteenth_detail(self):
+        env = {
+            "NAUTILJON_DETAIL_BATCH_SIZE": "15",
+            "NAUTILJON_DETAIL_BATCH_PAUSE_MIN": "45",
+            "NAUTILJON_DETAIL_BATCH_PAUSE_MAX": "45",
+        }
+        with mock.patch.dict(os.environ, env), mock.patch("scraper_nautiljon.time.sleep") as sleep:
+            scraper = NautiljonScraper(delay=0, backend="http")
+            for _ in range(16):
+                scraper._pace_detail_request()
+
+        sleep.assert_called_once_with(45.0)
+        self.assertEqual(scraper.session_stats["detail_requests"], 16)
+
+    def test_missing_listing_values_do_not_trigger_detail_refresh(self):
+        scraper = self.make_scraper("unused")
+        existing = {
+            "titre": "Fairy Tail",
+            "titre_alternatif": "N/A",
+            "url_fiche": "https://www.nautiljon.com/mangas/fairy+tail.html",
+            "type_liste": "Shonen",
+            "nb_vol_vo_liste": "63",
+            "nb_vol_vf_liste": "63",
+            "age_liste": "12 ans et +",
+            "date_vf_liste": "2008",
+            "date_vo_liste": "2006",
+            "note_liste": "8.39/10",
+        }
+        current = {key: "N/A" for key in existing}
+        current.update({"titre": existing["titre"], "url_fiche": existing["url_fiche"]})
+
+        self.assertFalse(scraper._series_changed_on_list(existing, current))
+
+    def test_real_listing_value_change_still_triggers_detail_refresh(self):
+        scraper = self.make_scraper("unused")
+        existing = make_row("F")
+        existing["nb_vol_vf_liste"] = "20"
+        current = dict(existing)
+        current["nb_vol_vf_liste"] = "21"
+
+        self.assertTrue(scraper._series_changed_on_list(existing, current))
+
+    def test_known_listing_values_are_preserved_when_current_parse_is_missing(self):
+        current = {
+            "titre": "Fairy Tail",
+            "url_fiche": "https://www.nautiljon.com/mangas/fairy+tail.html",
+            "type_liste": "N/A",
+            "nb_vol_vf_liste": "N/A",
+        }
+        existing = {
+            "titre": "Fairy Tail",
+            "url_fiche": current["url_fiche"],
+            "type_liste": "Shonen",
+            "nb_vol_vf_liste": "63",
+        }
+
+        NautiljonScraper._preserve_known_list_fields(current, existing)
+
+        self.assertEqual(current["type_liste"], "Shonen")
+        self.assertEqual(current["nb_vol_vf_liste"], "63")
 
     def test_http_challenge_aborts_without_retry(self):
         scraper = self.make_scraper("unused")

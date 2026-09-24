@@ -230,6 +230,26 @@ class NautiljonScraper:
             self.batch_pause_min,
             _env_float("NAUTILJON_BATCH_PAUSE_MAX", 90.0 if conservative_defaults else 0.0),
         )
+        self.detail_delay_min = max(
+            0.0,
+            _env_float("NAUTILJON_DETAIL_DELAY_MIN", 10.0 if conservative_defaults else 0.0),
+        )
+        self.detail_delay_max = max(
+            self.detail_delay_min,
+            _env_float("NAUTILJON_DETAIL_DELAY_MAX", 15.0 if conservative_defaults else 0.0),
+        )
+        self.detail_batch_size = max(
+            0,
+            _env_int("NAUTILJON_DETAIL_BATCH_SIZE", 15 if conservative_defaults else 0),
+        )
+        self.detail_batch_pause_min = max(
+            0.0,
+            _env_float("NAUTILJON_DETAIL_BATCH_PAUSE_MIN", 45.0 if conservative_defaults else 0.0),
+        )
+        self.detail_batch_pause_max = max(
+            self.detail_batch_pause_min,
+            _env_float("NAUTILJON_DETAIL_BATCH_PAUSE_MAX", 75.0 if conservative_defaults else 0.0),
+        )
         self.letter_pause_min = max(
             0.0,
             _env_float("NAUTILJON_LETTER_PAUSE_MIN", 20.0 if conservative_defaults else 0.0),
@@ -248,6 +268,7 @@ class NautiljonScraper:
         )
         self.block_cooldown_hours = max(0.0, _env_float("NAUTILJON_BLOCK_COOLDOWN_HOURS", 24.0))
         self._remote_request_count = 0
+        self._detail_request_count = 0
         self._last_remote_request_at = 0.0
         self._anti_ban_sleep_seconds = 0.0
         self._verified_public_ips: Optional[Tuple[str, str]] = None
@@ -262,6 +283,7 @@ class NautiljonScraper:
             "end_time": None,
             "duration": None,
             "remote_requests": 0,
+            "detail_requests": 0,
             "anti_ban_sleep_seconds": 0.0,
             "anti_ban_config": {
                 "delay_min": self.delay_min if self.delay_min is not None else self.delay,
@@ -269,6 +291,11 @@ class NautiljonScraper:
                 "batch_size": self.batch_size,
                 "batch_pause_min": self.batch_pause_min,
                 "batch_pause_max": self.batch_pause_max,
+                "detail_delay_min": self.detail_delay_min,
+                "detail_delay_max": self.detail_delay_max,
+                "detail_batch_size": self.detail_batch_size,
+                "detail_batch_pause_min": self.detail_batch_pause_min,
+                "detail_batch_pause_max": self.detail_batch_pause_max,
                 "letter_pause_min": self.letter_pause_min,
                 "letter_pause_max": self.letter_pause_max,
                 "failure_pause_min": self.failure_pause_min,
@@ -306,6 +333,26 @@ class NautiljonScraper:
         delay = self._compute_delay(multiplier=multiplier)
         self._sleep_for(delay, "temporisation standard", announce=False)
         return delay
+
+    def _sleep_detail_delay(self) -> float:
+        delay = random.uniform(self.detail_delay_min, self.detail_delay_max)
+        self._sleep_for(delay, "temporisation apres fiche detail", announce=False)
+        return delay
+
+    def _pace_detail_request(self) -> None:
+        if (
+            self.detail_batch_size > 0
+            and self._detail_request_count > 0
+            and self._detail_request_count % self.detail_batch_size == 0
+        ):
+            pause = random.uniform(self.detail_batch_pause_min, self.detail_batch_pause_max)
+            self._sleep_for(
+                pause,
+                f"repos apres {self._detail_request_count} fiches detail",
+                announce=True,
+            )
+        self._detail_request_count += 1
+        self.session_stats["detail_requests"] = self._detail_request_count
 
     @staticmethod
     def _is_nautiljon_url(url: str) -> bool:
@@ -2673,10 +2720,19 @@ class NautiljonScraper:
             if _is_na(series.get(dst)) and not _is_na(detail.get(src)):
                 series[dst] = detail[src]
 
+    @staticmethod
+    def _preserve_known_list_fields(current: Dict[str, str], existing: Dict[str, str]) -> None:
+        for field in ListRow.__dataclass_fields__:
+            if field in {"extraction_time", "url_fiche"}:
+                continue
+            if _is_na(current.get(field)) and not _is_na(existing.get(field)):
+                current[field] = existing[field]
+
     def _fetch_full_series_data(self, series: Dict[str, str]) -> Optional[Dict[str, str]]:
         if self.is_banned_type(series.get("type_liste", "")):
             self.session_stats["skipped_by_type"] += 1
             return None
+        self._pace_detail_request()
         html = self.fetch_html(series["url_fiche"])
         detail = self.extract_series_detail_from_html(html)
         probe = " ".join([series.get("type_liste", ""), detail.get("type_detail", ""), detail.get("genres", ""), detail.get("themes", "")])
@@ -2689,7 +2745,17 @@ class NautiljonScraper:
 
     def _series_changed_on_list(self, existing: Dict[str, str], current: Dict[str, str]) -> bool:
         fields = [field for field in ListRow.__dataclass_fields__.keys() if field != "extraction_time"]
-        return any(_clean_spaces(existing.get(field, "N/A")) != _clean_spaces(current.get(field, "N/A")) for field in fields)
+        for field in fields:
+            previous = _clean_spaces(existing.get(field, "N/A"))
+            observed = _clean_spaces(current.get(field, "N/A"))
+            # Une cellule absente du listing n'est pas une information nouvelle.
+            # La traiter comme un changement transformait les erreurs de parsing en
+            # rafales de consultations des fiches detail.
+            if _is_na(observed):
+                continue
+            if previous != observed:
+                return True
+        return False
 
     def _series_vf_is_ongoing(self, existing: Dict[str, str]) -> bool:
         return "en cours" in _norm(existing.get("nb_vol_vf_detail", ""))
@@ -2770,6 +2836,11 @@ class NautiljonScraper:
         if resume:
             if checkpoint and self._letter_checkpoint_is_compatible(tag, checkpoint) and partial_rows:
                 updated_rows = [self._normalize_row(row) for row in partial_rows]
+                for row in updated_rows:
+                    url = _ensure_abs_url(row.get("url_fiche", ""))
+                    previous = existing_by_url.get(url)
+                    if previous:
+                        self._preserve_known_list_fields(row, previous)
                 seen_urls = {
                     _ensure_abs_url(row.get("url_fiche", ""))
                     for row in updated_rows
@@ -2867,7 +2938,7 @@ class NautiljonScraper:
                         updated_rows[index] = refreshed
                         counters["parutions"] += 1
                         consecutive_detail_failures = 0
-                        self._sleep_delay()
+                        self._sleep_detail_delay()
                 except NautiljonAccessBlockedError as exc:
                     self.session_stats["errors"] += 1
                     access_blocked = True
@@ -2958,12 +3029,14 @@ class NautiljonScraper:
                     if needs_detail:
                         print(f"    MAJ {action}: {(series.get('titre') or 'N/A')[:60]}")
                         try:
+                            if existing:
+                                self._preserve_known_list_fields(series, existing)
                             full = self._fetch_full_series_data(series)
                             if full:
                                 updated_rows.append(full)
                                 counters[action] += 1
                                 consecutive_detail_failures = 0
-                                self._sleep_delay()
+                                self._sleep_detail_delay()
                         except NautiljonAccessBlockedError as exc:
                             self.session_stats["errors"] += 1
                             access_blocked = True
@@ -3181,6 +3254,12 @@ class NautiljonScraper:
             f"pause {pacing['batch_pause_min']:g}-{pacing['batch_pause_max']:g}s "
             f"toutes les {pacing['batch_size']} requetes, "
             f"{pacing['letter_pause_min']:g}-{pacing['letter_pause_max']:g}s entre lettres."
+        )
+        print(
+            "Cadence fiches detail: "
+            f"{pacing['detail_delay_min']:g}-{pacing['detail_delay_max']:g}s apres chaque fiche, "
+            f"pause {pacing['detail_batch_pause_min']:g}-{pacing['detail_batch_pause_max']:g}s "
+            f"toutes les {pacing['detail_batch_size']} fiches."
         )
         cooldown = self._resolve_access_cooldown()
         if cooldown:

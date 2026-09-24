@@ -73,6 +73,11 @@ NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
 NAUTILJON_BATCH_PAUSE_MIN=45
 NAUTILJON_BATCH_PAUSE_MAX=90
+NAUTILJON_DETAIL_DELAY_MIN=10
+NAUTILJON_DETAIL_DELAY_MAX=15
+NAUTILJON_DETAIL_BATCH_SIZE=15
+NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
+NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -111,6 +116,11 @@ NAUTILJON_SHM_SIZE=256m
   d'IP de sortie ou attendez la fin de la quarantaine avant un nouveau canari.
 - Les acces Nautiljon sont strictement sequentiels : 4 a 7 secondes entre deux
   navigations, 45 a 90 secondes toutes les 80 requetes et 20 a 45 secondes entre lettres.
+  Les fiches detail, plus sensibles, attendent 10 a 15 secondes et font une pause
+  de 45 a 75 secondes toutes les 15 fiches.
+- Une valeur absente (`N/A`) dans un listing ne remplace jamais une valeur connue
+  et ne declenche pas de consultation de fiche. Une vraie nouvelle valeur reste
+  comparee normalement, notamment pour detecter un changement du nombre de tomes.
 - Une page inaccessible n'est pas rechargee en boucle. Deux echecs de fiches
   consecutifs interrompent la lettre en conservant son checkpoint.
 - Selenium reste disponible avec `browser-test` pour le diagnostic.
