@@ -95,9 +95,10 @@ class DiffStateTests(unittest.TestCase):
     def test_access_cooldown_prevents_immediate_restart(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = self.make_scraper(out_dir)
-            scraper._record_access_cooldown("managed challenge")
+            scraper._record_access_cooldown("managed challenge", "203.0.113.10")
 
             second = self.make_scraper(out_dir)
+            second._current_egress_public_ip = mock.Mock(return_value="203.0.113.10")
             result = second.scrape_all_letters_diff(
                 letters=["a"],
                 min_days_between_diff_exports=0,
@@ -105,6 +106,36 @@ class DiffStateTests(unittest.TestCase):
 
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.reason, "access_cooldown_active")
+
+    def test_access_cooldown_is_cleared_when_public_ip_changes(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            scraper._record_access_cooldown("access_blocked", "203.0.113.10")
+
+            second = self.make_scraper(out_dir)
+            second._current_egress_public_ip = mock.Mock(return_value="198.51.100.42")
+
+            self.assertIsNone(second._resolve_access_cooldown())
+            self.assertFalse(os.path.exists(second._state_path("access_cooldown")))
+
+    def test_legacy_cooldown_uses_one_canary_then_clears(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            scraper._write_json_atomic(
+                scraper._state_path("access_cooldown"),
+                {
+                    "blocked_at": datetime.now().isoformat(timespec="seconds"),
+                    "resume_after": (datetime.now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+                    "cooldown_hours": 24,
+                    "reason": "access_blocked",
+                },
+            )
+            scraper._current_egress_public_ip = mock.Mock(return_value="198.51.100.42")
+            scraper.fetch_html = mock.Mock(return_value="<html><title>Mangas</title></html>")
+
+            self.assertIsNone(scraper._resolve_access_cooldown())
+            scraper.fetch_html.assert_called_once_with("https://www.nautiljon.com/mangas/")
+            self.assertFalse(os.path.exists(scraper._state_path("access_cooldown")))
 
     def test_generic_listing_failure_is_not_hammered(self):
         with tempfile.TemporaryDirectory() as out_dir:

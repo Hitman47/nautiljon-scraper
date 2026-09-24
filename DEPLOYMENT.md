@@ -177,7 +177,11 @@ Une page indiquant que l'IP est interdite pour abus provoque egalement un arret
 immediat, sans trois nouvelles tentatives, avec conservation du checkpoint.
 Un challenge Cloudflare non resolu est traite comme un blocage. Le fichier
 `output/state/access_cooldown.json` interdit alors un nouveau diff pendant 24
-heures, y compris avec `NAUTILJON_FORCE_SCRAPE=true`.
+heures sur l'IP publique concernee, y compris avec
+`NAUTILJON_FORCE_SCRAPE=true`. Apres un changement de sortie Gluetun, le scraper
+compare les IP de Gluetun et FlareSolverr puis leve automatiquement la
+quarantaine. Les anciens marqueurs sans IP effectuent un unique canari de
+migration avant d'etre leves.
 Si le canari affiche une case interactive « Verifiez que vous etes humain »,
 considerez l'IP comme bloquee. Le projet n'automatise pas le clic et ne tente
 pas de contourner les CAPTCHA : attendez la quarantaine ou changez proprement

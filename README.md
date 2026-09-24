@@ -101,7 +101,8 @@ NAUTILJON_SHM_SIZE=256m
 - Une IP explicitement interdite par Nautiljon arrete le diff sans nouvelle tentative,
   y compris si le blocage apparait pendant une fiche detail.
 - Un challenge Cloudflare non resolu a le meme effet et interdit tout nouveau diff
-  pendant 24 heures. `--force` ne contourne pas cette quarantaine.
+  pendant 24 heures sur la meme IP. La quarantaine est levee automatiquement si
+  Gluetun et FlareSolverr confirment une nouvelle IP publique. `--force` ne la contourne pas.
 - Une page FlareSolverr sans index alphabetique est conservee dans
   `output/debug/flaresolverr_mangas_index_missing_*.html` puis traitee comme un
   blocage. Une reprise utilise d'abord l'URL exacte stockee dans son checkpoint.

@@ -250,6 +250,7 @@ class NautiljonScraper:
         self._remote_request_count = 0
         self._last_remote_request_at = 0.0
         self._anti_ban_sleep_seconds = 0.0
+        self._verified_public_ips: Optional[Tuple[str, str]] = None
         self.session = self._build_session()
         self.session_stats = {
             "total_series": 0,
@@ -451,14 +452,24 @@ class NautiljonScraper:
         safe_name = re.sub(r"[^a-z0-9_.-]+", "_", name.lower()).strip("_") or "run"
         return os.path.join(state_dir, f"{safe_name}.json")
 
-    def _record_access_cooldown(self, reason: str) -> str:
+    def _record_access_cooldown(self, reason: str, blocked_public_ip: str = "") -> str:
         blocked_at = datetime.now()
         resume_after = blocked_at + timedelta(hours=self.block_cooldown_hours)
+        if not blocked_public_ip and self._verified_public_ips:
+            direct_ip, flaresolverr_ip = self._verified_public_ips
+            if direct_ip == flaresolverr_ip:
+                blocked_public_ip = direct_ip
+        if not blocked_public_ip:
+            try:
+                blocked_public_ip = self._current_egress_public_ip()
+            except Exception:
+                blocked_public_ip = ""
         payload = {
             "blocked_at": blocked_at.isoformat(timespec="seconds"),
             "resume_after": resume_after.isoformat(timespec="seconds"),
             "cooldown_hours": self.block_cooldown_hours,
             "reason": reason,
+            "blocked_public_ip": blocked_public_ip,
         }
         path = self._state_path("access_cooldown")
         self._write_json_atomic(path, payload)
@@ -481,6 +492,72 @@ class NautiljonScraper:
             return None
         payload["path"] = path
         return payload
+
+    def _current_egress_public_ip(self) -> str:
+        if self._verified_public_ips:
+            direct_ip, flaresolverr_ip = self._verified_public_ips
+        elif self.backend == "flaresolverr":
+            direct_ip, flaresolverr_ip = self._flaresolverr_public_ips()
+            self._verified_public_ips = (direct_ip, flaresolverr_ip)
+        else:
+            response = requests.get("http://api.ipify.org?format=json", timeout=15)
+            response.raise_for_status()
+            direct_ip = str(ipaddress.ip_address(response.json().get("ip", "")))
+            flaresolverr_ip = direct_ip
+            self._verified_public_ips = (direct_ip, flaresolverr_ip)
+        if direct_ip != flaresolverr_ip:
+            raise RuntimeError("les IP publiques de Gluetun et FlareSolverr sont differentes")
+        return direct_ip
+
+    def _resolve_access_cooldown(self) -> Optional[Dict[str, object]]:
+        cooldown = self._active_access_cooldown()
+        if not cooldown:
+            return None
+        try:
+            current_ip = self._current_egress_public_ip()
+        except Exception as exc:
+            print(
+                "Quarantaine conservee: IP publique actuelle impossible a verifier "
+                f"({str(exc)[:180]})."
+            )
+            return cooldown
+
+        blocked_ip = str(cooldown.get("blocked_public_ip", "") or "").strip()
+        if blocked_ip:
+            if current_ip != blocked_ip:
+                self._clear_access_cooldown()
+                print(
+                    f"IP de sortie changee ({blocked_ip} -> {current_ip}): "
+                    "quarantaine anti-ban levee automatiquement."
+                )
+                return None
+            return cooldown
+
+        # Compatibilite avec les marqueurs crees avant l'enregistrement de l'IP.
+        # Un unique canari permet de migrer sans lever aveuglement une interdiction.
+        print(
+            "Ancienne quarantaine sans IP enregistree: verification unique de la "
+            f"nouvelle sortie {current_ip}."
+        )
+        try:
+            self.fetch_html(f"{BASE_URL}/mangas/")
+        except NautiljonAccessBlockedError:
+            cooldown.pop("path", None)
+            cooldown["blocked_public_ip"] = current_ip
+            self._write_json_atomic(self._state_path("access_cooldown"), cooldown)
+            return cooldown
+        except Exception as exc:
+            print(
+                "Quarantaine conservee: canari de migration non concluant "
+                f"({str(exc)[:180]})."
+            )
+            return cooldown
+
+        self._clear_access_cooldown()
+        print(
+            f"Canari reussi depuis {current_ip}: ancienne quarantaine anti-ban levee automatiquement."
+        )
+        return None
 
     def _clear_access_cooldown(self) -> None:
         path = self._state_path("access_cooldown")
@@ -2015,7 +2092,9 @@ class NautiljonScraper:
         ip_match = re.search(r'"ip"\s*:\s*"([^"]+)"', flaresolverr_ip_html)
         if not ip_match:
             raise RuntimeError("IP de sortie FlareSolverr introuvable dans la reponse ipify")
-        return direct_ip, str(ipaddress.ip_address(ip_match.group(1)))
+        result = (direct_ip, str(ipaddress.ip_address(ip_match.group(1))))
+        self._verified_public_ips = result
+        return result
 
     def flaresolverr_test(self, letter: str = "a") -> Dict[str, object]:
         print("=" * 60)
@@ -3103,7 +3182,7 @@ class NautiljonScraper:
             f"toutes les {pacing['batch_size']} requetes, "
             f"{pacing['letter_pause_min']:g}-{pacing['letter_pause_max']:g}s entre lettres."
         )
-        cooldown = self._active_access_cooldown()
+        cooldown = self._resolve_access_cooldown()
         if cooldown:
             print(
                 "Diff refuse pendant la quarantaine anti-ban. Reprise autorisee apres "
@@ -3168,7 +3247,10 @@ class NautiljonScraper:
 
         if self.backend == "flaresolverr":
             try:
-                gluetun_ip, flaresolverr_ip = self._flaresolverr_public_ips()
+                if self._verified_public_ips:
+                    gluetun_ip, flaresolverr_ip = self._verified_public_ips
+                else:
+                    gluetun_ip, flaresolverr_ip = self._flaresolverr_public_ips()
                 print(f"IP Gluetun: {gluetun_ip} | IP FlareSolverr: {flaresolverr_ip}")
                 if gluetun_ip != flaresolverr_ip:
                     raise RuntimeError("les IP publiques de Gluetun et FlareSolverr sont differentes")
