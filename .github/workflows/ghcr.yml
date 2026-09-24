@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - main
-      - "codex/**"
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -52,11 +49,6 @@ jobs:
         run: |
           image_name="ghcr.io/${GITHUB_REPOSITORY}"
           echo "IMAGE_NAME=${image_name,,}" >> "$GITHUB_ENV"
-          if [[ "$GITHUB_REF_NAME" == "main" || "$GITHUB_REF" == refs/tags/* ]]; then
-            echo "CHANNEL_TAG=latest" >> "$GITHUB_ENV"
-          else
-            echo "CHANNEL_TAG=test" >> "$GITHUB_ENV"
-          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -86,9 +78,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ env.CHANNEL_TAG }}
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          tags: ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

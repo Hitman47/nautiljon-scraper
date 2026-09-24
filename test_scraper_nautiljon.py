@@ -44,11 +44,11 @@ class DiffStateTests(unittest.TestCase):
         }
         clean_env = {key: value for key, value in os.environ.items() if key not in pacing_keys}
         with mock.patch.dict(os.environ, clean_env, clear=True):
-            scraper = NautiljonScraper(delay=5, delay_min=5, delay_max=10, backend="http")
+            scraper = NautiljonScraper(delay=4, delay_min=4, delay_max=7, backend="http")
 
         self.assertEqual(scraper.batch_size, 80)
-        self.assertEqual((scraper.batch_pause_min, scraper.batch_pause_max), (60.0, 120.0))
-        self.assertEqual((scraper.letter_pause_min, scraper.letter_pause_max), (30.0, 60.0))
+        self.assertEqual((scraper.batch_pause_min, scraper.batch_pause_max), (45.0, 90.0))
+        self.assertEqual((scraper.letter_pause_min, scraper.letter_pause_max), (20.0, 45.0))
         self.assertEqual((scraper.failure_pause_min, scraper.failure_pause_max), (120.0, 300.0))
 
     def test_pacer_serializes_requests_and_adds_batch_break(self):

@@ -34,7 +34,7 @@ egalement rattache a `torrent_vpn_share`.
 ## Variables communes
 
 ```text
-NAUTILJON_IMAGE=ghcr.io/hitman47/nautiljon-scraper:test
+NAUTILJON_IMAGE=ghcr.io/hitman47/nautiljon-scraper:latest
 GLUETUN_CONTAINER=GlueTun-Nord_WG
 NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
 NAUTILJON_BACKEND=flaresolverr
@@ -49,19 +49,21 @@ NAUTILJON_CPUS=0.50
 NAUTILJON_MEM_LIMIT=768m
 NAUTILJON_MEMSWAP_LIMIT=768m
 NAUTILJON_SHM_SIZE=256m
-NAUTILJON_DELAY_MIN=8.0
-NAUTILJON_DELAY_MAX=20.0
-NAUTILJON_BATCH_SIZE=40
-NAUTILJON_BATCH_PAUSE_MIN=180
-NAUTILJON_BATCH_PAUSE_MAX=480
-NAUTILJON_LETTER_PAUSE_MIN=120
-NAUTILJON_LETTER_PAUSE_MAX=300
-NAUTILJON_FAILURE_PAUSE_MIN=300
-NAUTILJON_FAILURE_PAUSE_MAX=900
+NAUTILJON_DELAY_MIN=4.0
+NAUTILJON_DELAY_MAX=7.0
+NAUTILJON_BATCH_SIZE=80
+NAUTILJON_BATCH_PAUSE_MIN=45
+NAUTILJON_BATCH_PAUSE_MAX=90
+NAUTILJON_LETTER_PAUSE_MIN=20
+NAUTILJON_LETTER_PAUSE_MAX=45
+NAUTILJON_FAILURE_PAUSE_MIN=120
+NAUTILJON_FAILURE_PAUSE_MAX=300
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
 NAUTILJON_PAGE_FAILURE_RETRIES=1
 NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
 NAUTILJON_MAX_MISSING_RATIO=0.15
+NAUTILJON_MAX_CONFIRMED_MISSING_RATIO=0.35
+NAUTILJON_COVERAGE_CONFIRMATION_MIN_SECONDS=3600
 NAUTILJON_REFRESH_STALE_DAYS=30
 ```
 
@@ -134,21 +136,23 @@ NAUTILJON_FORCE_SCRAPE=false
 NAUTILJON_DROP_MISSING=true
 NAUTILJON_RESUME=true
 NAUTILJON_FLUSH_EVERY=25
-NAUTILJON_DELAY_MIN=8.0
-NAUTILJON_DELAY_MAX=20.0
-NAUTILJON_BATCH_SIZE=40
-NAUTILJON_BATCH_PAUSE_MIN=180
-NAUTILJON_BATCH_PAUSE_MAX=480
-NAUTILJON_LETTER_PAUSE_MIN=120
-NAUTILJON_LETTER_PAUSE_MAX=300
-NAUTILJON_FAILURE_PAUSE_MIN=300
-NAUTILJON_FAILURE_PAUSE_MAX=900
+NAUTILJON_DELAY_MIN=4.0
+NAUTILJON_DELAY_MAX=7.0
+NAUTILJON_BATCH_SIZE=80
+NAUTILJON_BATCH_PAUSE_MIN=45
+NAUTILJON_BATCH_PAUSE_MAX=90
+NAUTILJON_LETTER_PAUSE_MIN=20
+NAUTILJON_LETTER_PAUSE_MAX=45
+NAUTILJON_FAILURE_PAUSE_MIN=120
+NAUTILJON_FAILURE_PAUSE_MAX=300
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
 NAUTILJON_PAGE_FAILURE_RETRIES=1
 NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
 NAUTILJON_MAX_MISSING_RATIO=0.15
+NAUTILJON_MAX_CONFIRMED_MISSING_RATIO=0.35
+NAUTILJON_COVERAGE_CONFIRMATION_MIN_SECONDS=3600
 NAUTILJON_REFRESH_STALE_DAYS=30
 ```
 
@@ -165,7 +169,10 @@ deja terminees dans `output/checkpoints/`.
 
 Le scraper suit le lien de pagination exact fourni par Nautiljon et enregistre
 ce lien dans le checkpoint. Si plus de 15 % des fiches historiques d'une lettre
-disparaissent du listing, la lettre n'est pas remplacee et le diff s'arrete.
+disparaissent du listing, la premiere observation bloque la finalisation. La
+suppression n'est acceptee qu'apres un second listing complet, espace d'au moins
+une heure, qui retrouve exactement les memes absences. Un ecart superieur a 35 %
+reste toujours bloque.
 Une page indiquant que l'IP est interdite pour abus provoque egalement un arret
 immediat, sans trois nouvelles tentatives, avec conservation du checkpoint.
 Un challenge Cloudflare non resolu est traite comme un blocage. Le fichier
@@ -180,12 +187,11 @@ sont sauvegardes dans `output/debug/flaresolverr_mangas_index_missing_*`. Ne
 supprimez pas les exports : l'URL exacte d'une page en cours reste dans le
 checkpoint et est prioritaire lors de la reprise.
 
-La cadence par defaut est volontairement lente. Les navigations sont
-sequentielles, une pause de 8 a 20 secondes les separe, une pause de 3 a 8
-minutes intervient toutes les 40 requetes et une pause de 2 a 5 minutes separe
-les lettres. Une page en erreur n'est tentee qu'une fois et deux erreurs de
-fiches consecutives interrompent la lettre. Un catalogue initial peut donc
-prendre un a plusieurs jours selon le nombre de fiches a ouvrir.
+La cadence par defaut reste prudente sans pauses disproportionnees. Les
+navigations sont sequentielles, 4 a 7 secondes les separent, une pause de 45 a
+90 secondes intervient toutes les 80 requetes et 20 a 45 secondes separent les
+lettres. Une page en erreur n'est tentee qu'une fois et deux erreurs de fiches
+consecutives interrompent la lettre.
 
 Avec `NAUTILJON_FORCE_SCRAPE=false`, une lettre validee depuis moins de
 `NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS` jours est reutilisee sans requete et

@@ -197,7 +197,7 @@ class NautiljonScraper:
     def __init__(
         self,
         out_dir: str = ".",
-        delay: float = 5.0,
+        delay: float = 4.0,
         delay_min: Optional[float] = None,
         delay_max: Optional[float] = None,
         backend: str = "selenium",
@@ -224,19 +224,19 @@ class NautiljonScraper:
         self.batch_size = max(0, _env_int("NAUTILJON_BATCH_SIZE", 80 if conservative_defaults else 0))
         self.batch_pause_min = max(
             0.0,
-            _env_float("NAUTILJON_BATCH_PAUSE_MIN", 60.0 if conservative_defaults else 0.0),
+            _env_float("NAUTILJON_BATCH_PAUSE_MIN", 45.0 if conservative_defaults else 0.0),
         )
         self.batch_pause_max = max(
             self.batch_pause_min,
-            _env_float("NAUTILJON_BATCH_PAUSE_MAX", 120.0 if conservative_defaults else 0.0),
+            _env_float("NAUTILJON_BATCH_PAUSE_MAX", 90.0 if conservative_defaults else 0.0),
         )
         self.letter_pause_min = max(
             0.0,
-            _env_float("NAUTILJON_LETTER_PAUSE_MIN", 30.0 if conservative_defaults else 0.0),
+            _env_float("NAUTILJON_LETTER_PAUSE_MIN", 20.0 if conservative_defaults else 0.0),
         )
         self.letter_pause_max = max(
             self.letter_pause_min,
-            _env_float("NAUTILJON_LETTER_PAUSE_MAX", 60.0 if conservative_defaults else 0.0),
+            _env_float("NAUTILJON_LETTER_PAUSE_MAX", 45.0 if conservative_defaults else 0.0),
         )
         self.failure_pause_min = max(
             0.0,
@@ -3398,7 +3398,7 @@ def _parse_csv_list(raw: Optional[str]) -> Optional[List[str]]:
 
 def _new_scraper(args: argparse.Namespace) -> NautiljonScraper:
     out_dir = args.out_dir or os.environ.get("NAUTILJON_OUT_DIR", "./output")
-    delay = args.delay if args.delay is not None else _env_float("NAUTILJON_DELAY", 5.0)
+    delay = args.delay if args.delay is not None else _env_float("NAUTILJON_DELAY", 4.0)
     delay_min = args.delay_min
     delay_max = args.delay_max
     if delay_min is None and os.environ.get("NAUTILJON_DELAY_MIN", "").strip():

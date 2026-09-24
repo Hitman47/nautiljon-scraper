@@ -21,12 +21,13 @@ python scraper_nautiljon.py concat
 ```
 
 Consultez [DEPLOYMENT.md](DEPLOYMENT.md) pour le protocole Portainer complet.
+Le fichier [portainer.env.example](portainer.env.example) contient le profil
+Portainer de production pret a copier.
 
 ## Images GHCR
 
 ```text
 ghcr.io/hitman47/nautiljon-scraper:latest  # production, branche main
-ghcr.io/hitman47/nautiljon-scraper:test    # validation, branches codex/*
 ```
 
 ## Organisation des donnees
@@ -67,13 +68,13 @@ NAUTILJON_FLARESOLVERR_PROXY_PASSWORD=
 NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
 NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS=30
 NAUTILJON_FLARESOLVERR_STARTUP_DELAY=2
-NAUTILJON_DELAY_MIN=5.0
-NAUTILJON_DELAY_MAX=10.0
+NAUTILJON_DELAY_MIN=4.0
+NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
-NAUTILJON_BATCH_PAUSE_MIN=60
-NAUTILJON_BATCH_PAUSE_MAX=120
-NAUTILJON_LETTER_PAUSE_MIN=30
-NAUTILJON_LETTER_PAUSE_MAX=60
+NAUTILJON_BATCH_PAUSE_MIN=45
+NAUTILJON_BATCH_PAUSE_MAX=90
+NAUTILJON_LETTER_PAUSE_MIN=20
+NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
 NAUTILJON_FAILURE_PAUSE_MAX=300
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
@@ -107,8 +108,8 @@ NAUTILJON_SHM_SIZE=256m
 - Une case interactive « Verifiez que vous etes humain » est un verdict de blocage :
   le scraper ne tente ni de la cliquer ni de contourner un CAPTCHA. Changez
   d'IP de sortie ou attendez la fin de la quarantaine avant un nouveau canari.
-- Les acces Nautiljon sont strictement sequentiels : 5 a 10 secondes entre deux
-  navigations, 1 a 2 minutes toutes les 80 requetes et 30 a 60 secondes entre lettres.
+- Les acces Nautiljon sont strictement sequentiels : 4 a 7 secondes entre deux
+  navigations, 45 a 90 secondes toutes les 80 requetes et 20 a 45 secondes entre lettres.
 - Une page inaccessible n'est pas rechargee en boucle. Deux echecs de fiches
   consecutifs interrompent la lettre en conservant son checkpoint.
 - Selenium reste disponible avec `browser-test` pour le diagnostic.
