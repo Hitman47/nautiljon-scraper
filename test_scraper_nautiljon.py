@@ -346,6 +346,37 @@ class DiffStateTests(unittest.TestCase):
             scraper.fetch_html.assert_called_once_with("https://www.nautiljon.com/mangas/")
             self.assertFalse(os.path.exists(scraper._state_path("access_cooldown")))
 
+    def test_legacy_cooldown_uses_spaced_flaresolverr_recovery_before_binding_ip(self):
+        env = {
+            "NAUTILJON_BLOCK_RECOVERY_ATTEMPTS": "1",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN": "0",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX": "0",
+        }
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.dict(os.environ, env):
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            scraper._write_json_atomic(
+                scraper._state_path("access_cooldown"),
+                {
+                    "blocked_at": datetime.now().isoformat(timespec="seconds"),
+                    "resume_after": (datetime.now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+                    "cooldown_hours": 24,
+                    "reason": "access_blocked",
+                },
+            )
+            scraper._current_egress_public_ip = mock.Mock(return_value="198.51.100.42")
+            scraper.fetch_html = mock.Mock(
+                side_effect=NautiljonAccessBlockedError("toujours bloque")
+            )
+            scraper.close_flaresolverr = mock.Mock()
+
+            cooldown = scraper._resolve_access_cooldown()
+
+            self.assertEqual(scraper.fetch_html.call_count, 2)
+            scraper.close_flaresolverr.assert_called_once_with()
+            self.assertEqual(cooldown["blocked_public_ip"], "198.51.100.42")
+            saved = scraper._load_json_dict(scraper._state_path("access_cooldown"))
+            self.assertEqual(saved["blocked_public_ip"], "198.51.100.42")
+
     def test_generic_listing_failure_is_not_hammered(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = self.make_scraper(out_dir)

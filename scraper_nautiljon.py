@@ -605,11 +605,18 @@ class NautiljonScraper:
             f"nouvelle sortie {current_ip}."
         )
         try:
-            self.fetch_html(f"{BASE_URL}/mangas/")
+            self._with_flaresolverr_block_recovery(
+                lambda: self.fetch_html(f"{BASE_URL}/mangas/"),
+                "canari de migration de quarantaine",
+            )
         except NautiljonAccessBlockedError:
             cooldown.pop("path", None)
             cooldown["blocked_public_ip"] = current_ip
             self._write_json_atomic(self._state_path("access_cooldown"), cooldown)
+            print(
+                f"Canari refuse depuis {current_ip} apres controle espace: "
+                "quarantaine conservee et associee a cette IP."
+            )
             return cooldown
         except Exception as exc:
             print(
