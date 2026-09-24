@@ -32,6 +32,25 @@ class DiffStateTests(unittest.TestCase):
         label = scraper._letter_label(letter)
         scraper.save_letter_files(scraper._letter_tag(letter), [make_row(label)], partial=False)
 
+    def test_default_pacing_profile_is_prudent_without_excessive_breaks(self):
+        pacing_keys = {
+            "NAUTILJON_BATCH_SIZE",
+            "NAUTILJON_BATCH_PAUSE_MIN",
+            "NAUTILJON_BATCH_PAUSE_MAX",
+            "NAUTILJON_LETTER_PAUSE_MIN",
+            "NAUTILJON_LETTER_PAUSE_MAX",
+            "NAUTILJON_FAILURE_PAUSE_MIN",
+            "NAUTILJON_FAILURE_PAUSE_MAX",
+        }
+        clean_env = {key: value for key, value in os.environ.items() if key not in pacing_keys}
+        with mock.patch.dict(os.environ, clean_env, clear=True):
+            scraper = NautiljonScraper(delay=5, delay_min=5, delay_max=10, backend="http")
+
+        self.assertEqual(scraper.batch_size, 80)
+        self.assertEqual((scraper.batch_pause_min, scraper.batch_pause_max), (60.0, 120.0))
+        self.assertEqual((scraper.letter_pause_min, scraper.letter_pause_max), (30.0, 60.0))
+        self.assertEqual((scraper.failure_pause_min, scraper.failure_pause_max), (120.0, 300.0))
+
     def test_pacer_serializes_requests_and_adds_batch_break(self):
         env = {
             "NAUTILJON_BATCH_SIZE": "2",

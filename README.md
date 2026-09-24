@@ -67,15 +67,15 @@ NAUTILJON_FLARESOLVERR_PROXY_PASSWORD=
 NAUTILJON_FLARESOLVERR_TIMEOUT_MS=120000
 NAUTILJON_FLARESOLVERR_STARTUP_ATTEMPTS=30
 NAUTILJON_FLARESOLVERR_STARTUP_DELAY=2
-NAUTILJON_DELAY_MIN=8.0
-NAUTILJON_DELAY_MAX=20.0
-NAUTILJON_BATCH_SIZE=40
-NAUTILJON_BATCH_PAUSE_MIN=180
-NAUTILJON_BATCH_PAUSE_MAX=480
-NAUTILJON_LETTER_PAUSE_MIN=120
-NAUTILJON_LETTER_PAUSE_MAX=300
-NAUTILJON_FAILURE_PAUSE_MIN=300
-NAUTILJON_FAILURE_PAUSE_MAX=900
+NAUTILJON_DELAY_MIN=5.0
+NAUTILJON_DELAY_MAX=10.0
+NAUTILJON_BATCH_SIZE=80
+NAUTILJON_BATCH_PAUSE_MIN=60
+NAUTILJON_BATCH_PAUSE_MAX=120
+NAUTILJON_LETTER_PAUSE_MIN=30
+NAUTILJON_LETTER_PAUSE_MAX=60
+NAUTILJON_FAILURE_PAUSE_MIN=120
+NAUTILJON_FAILURE_PAUSE_MAX=300
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
 NAUTILJON_PAGE_FAILURE_RETRIES=1
 NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
@@ -107,8 +107,8 @@ NAUTILJON_SHM_SIZE=256m
 - Une case interactive « Verifiez que vous etes humain » est un verdict de blocage :
   le scraper ne tente ni de la cliquer ni de contourner un CAPTCHA. Changez
   d'IP de sortie ou attendez la fin de la quarantaine avant un nouveau canari.
-- Les acces Nautiljon sont strictement sequentiels : 8 a 20 secondes entre deux
-  navigations, 3 a 8 minutes toutes les 40 requetes et 2 a 5 minutes entre lettres.
+- Les acces Nautiljon sont strictement sequentiels : 5 a 10 secondes entre deux
+  navigations, 1 a 2 minutes toutes les 80 requetes et 30 a 60 secondes entre lettres.
 - Une page inaccessible n'est pas rechargee en boucle. Deux echecs de fiches
   consecutifs interrompent la lettre en conservant son checkpoint.
 - Selenium reste disponible avec `browser-test` pour le diagnostic.
