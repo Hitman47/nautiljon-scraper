@@ -250,14 +250,6 @@ class NautiljonScraper:
             self.detail_batch_pause_min,
             _env_float("NAUTILJON_DETAIL_BATCH_PAUSE_MAX", 75.0 if conservative_defaults else 0.0),
         )
-        self.detail_window_size = max(
-            0,
-            _env_int("NAUTILJON_DETAIL_WINDOW_SIZE", 5 if conservative_defaults else 0),
-        )
-        self.detail_window_seconds = max(
-            0.0,
-            _env_float("NAUTILJON_DETAIL_WINDOW_SECONDS", 900.0 if conservative_defaults else 0.0),
-        )
         self.letter_pause_min = max(
             0.0,
             _env_float("NAUTILJON_LETTER_PAUSE_MIN", 20.0 if conservative_defaults else 0.0),
@@ -273,6 +265,18 @@ class NautiljonScraper:
         self.failure_pause_max = max(
             self.failure_pause_min,
             _env_float("NAUTILJON_FAILURE_PAUSE_MAX", 300.0 if conservative_defaults else 0.0),
+        )
+        self.block_recovery_attempts = max(
+            0,
+            _env_int("NAUTILJON_BLOCK_RECOVERY_ATTEMPTS", 1),
+        )
+        self.block_recovery_pause_min = max(
+            0.0,
+            _env_float("NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN", 60.0),
+        )
+        self.block_recovery_pause_max = max(
+            self.block_recovery_pause_min,
+            _env_float("NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX", 120.0),
         )
         self.block_cooldown_hours = max(0.0, _env_float("NAUTILJON_BLOCK_COOLDOWN_HOURS", 24.0))
         self._remote_request_count = 0
@@ -292,6 +296,9 @@ class NautiljonScraper:
             "duration": None,
             "remote_requests": 0,
             "detail_requests": 0,
+            "transient_blocks": 0,
+            "transient_recoveries": 0,
+            "confirmed_blocks": 0,
             "anti_ban_sleep_seconds": 0.0,
             "anti_ban_config": {
                 "delay_min": self.delay_min if self.delay_min is not None else self.delay,
@@ -304,12 +311,13 @@ class NautiljonScraper:
                 "detail_batch_size": self.detail_batch_size,
                 "detail_batch_pause_min": self.detail_batch_pause_min,
                 "detail_batch_pause_max": self.detail_batch_pause_max,
-                "detail_window_size": self.detail_window_size,
-                "detail_window_seconds": self.detail_window_seconds,
                 "letter_pause_min": self.letter_pause_min,
                 "letter_pause_max": self.letter_pause_max,
                 "failure_pause_min": self.failure_pause_min,
                 "failure_pause_max": self.failure_pause_max,
+                "block_recovery_attempts": self.block_recovery_attempts,
+                "block_recovery_pause_min": self.block_recovery_pause_min,
+                "block_recovery_pause_max": self.block_recovery_pause_max,
                 "block_cooldown_hours": self.block_cooldown_hours,
             },
         }
@@ -350,7 +358,6 @@ class NautiljonScraper:
         return delay
 
     def _pace_detail_request(self) -> None:
-        self._pace_detail_window()
         if (
             self.detail_batch_size > 0
             and self._detail_request_count > 0
@@ -364,60 +371,6 @@ class NautiljonScraper:
             )
         self._detail_request_count += 1
         self.session_stats["detail_requests"] = self._detail_request_count
-
-    def _pace_detail_window(self) -> None:
-        """Apply a restart-safe rolling limit to expensive browser detail pages."""
-        if self.detail_window_size <= 0 or self.detail_window_seconds <= 0:
-            return
-
-        path = self._state_path("detail_rate_limit")
-        payload = self._load_json_dict(path)
-        now = time.time()
-        raw_requests = payload.get("requests", []) if payload else []
-        requests_in_window: List[float] = []
-        if isinstance(raw_requests, list):
-            for value in raw_requests:
-                try:
-                    timestamp = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= now - timestamp < self.detail_window_seconds:
-                    requests_in_window.append(timestamp)
-
-        requests_in_window.sort()
-        if len(requests_in_window) >= self.detail_window_size:
-            wait_seconds = max(
-                0.0,
-                requests_in_window[-self.detail_window_size]
-                + self.detail_window_seconds
-                - now,
-            )
-            if wait_seconds > 0:
-                self._sleep_for(
-                    wait_seconds,
-                    (
-                        f"limite glissante: {self.detail_window_size} fiches detail "
-                        f"par {self.detail_window_seconds / 60:g} min"
-                    ),
-                    announce=True,
-                )
-                now = time.time()
-                requests_in_window = [
-                    timestamp
-                    for timestamp in requests_in_window
-                    if 0 <= now - timestamp < self.detail_window_seconds
-                ]
-
-        requests_in_window.append(now)
-        self._write_json_atomic(
-            path,
-            {
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-                "window_size": self.detail_window_size,
-                "window_seconds": self.detail_window_seconds,
-                "requests": requests_in_window,
-            },
-        )
 
     @staticmethod
     def _is_nautiljon_url(url: str) -> bool:
@@ -1693,6 +1646,52 @@ class NautiljonScraper:
         except Exception as exc:
             print(f"Avertissement: fermeture FlareSolverr impossible: {str(exc)[:180]}")
 
+    def _with_flaresolverr_block_recovery(self, operation, context: str):
+        """Retry a transient Nautiljon refusal once from a fresh browser session."""
+        if self.backend != "flaresolverr" or self.block_recovery_attempts <= 0:
+            return operation()
+
+        first_error: Optional[NautiljonAccessBlockedError] = None
+        for attempt in range(self.block_recovery_attempts + 1):
+            try:
+                result = operation()
+                if attempt > 0:
+                    self.session_stats["transient_recoveries"] += 1
+                    print(f"Acces retabli apres renouvellement FlareSolverr: {context}.")
+                return result
+            except NautiljonAccessBlockedError as exc:
+                if first_error is None:
+                    first_error = exc
+                if attempt >= self.block_recovery_attempts:
+                    self.session_stats["confirmed_blocks"] += 1
+                    raise NautiljonAccessBlockedError(
+                        f"Blocage confirme apres {attempt + 1} controle(s) espace(s): {exc}"
+                    ) from exc
+
+                self.session_stats["transient_blocks"] += 1
+                pause = random.uniform(
+                    self.block_recovery_pause_min,
+                    self.block_recovery_pause_max,
+                )
+                pagination_hints = dict(self._flaresolverr_page_has_next)
+                print(
+                    f"Refus temporaire pendant {context}; renouvellement de la session "
+                    f"FlareSolverr puis nouvel essai unique dans {pause:.1f}s."
+                )
+                self.close_flaresolverr()
+                # The signed listing URLs belong to the old session, but the fact
+                # that the current page had a successor remains valid.
+                self._flaresolverr_page_has_next.update(pagination_hints)
+                self._sleep_for(
+                    pause,
+                    "refus Nautiljon temporaire avant controle",
+                    announce=True,
+                )
+
+        raise first_error or NautiljonAccessBlockedError(
+            f"Blocage Nautiljon confirme pendant {context}"
+        )
+
     def _fetch_html_flaresolverr(self, url: str) -> str:
         timeout_ms = max(1000, _env_int("NAUTILJON_FLARESOLVERR_TIMEOUT_MS", 120000))
         target_url = _ensure_abs_url(url)
@@ -1724,7 +1723,7 @@ class NautiljonScraper:
         self._last_flaresolverr_html = html
         if self._nautiljon_access_blocked(html):
             raise NautiljonAccessBlockedError(
-                "Nautiljon a interdit l'IP de sortie pour abus; arret immediat sans nouvelle tentative"
+                "Nautiljon a temporairement refuse cette navigation pour abus"
             )
         if self._blocked_by_waf(html):
             raise NautiljonAccessBlockedError(
@@ -2451,7 +2450,10 @@ class NautiljonScraper:
         if self.backend == "selenium":
             return self._fetch_listing_page_selenium(letter, page_num)
         if self.backend == "flaresolverr":
-            return self._fetch_listing_page_flaresolverr(letter, page_num)
+            return self._with_flaresolverr_block_recovery(
+                lambda: self._fetch_listing_page_flaresolverr(letter, page_num),
+                f"listing {self._letter_label(letter)} page {page_num + 1}",
+            )
         last_error = ""
         accessible_empty_url = ""
         for url in self._listing_candidate_urls(letter, page_num):
@@ -2805,7 +2807,7 @@ class NautiljonScraper:
                 merged[field] = observed
         return merged
 
-    def _fetch_full_series_data(self, series: Dict[str, str]) -> Optional[Dict[str, str]]:
+    def _fetch_full_series_data_once(self, series: Dict[str, str]) -> Optional[Dict[str, str]]:
         if self.is_banned_type(series.get("type_liste", "")):
             self.session_stats["skipped_by_type"] += 1
             return None
@@ -2819,6 +2821,13 @@ class NautiljonScraper:
         self._backfill_list_fields_from_detail(series, detail)
         detail.pop("_titre_fr_fallback", None)
         return self._normalize_row({**series, **detail})
+
+    def _fetch_full_series_data(self, series: Dict[str, str]) -> Optional[Dict[str, str]]:
+        title = (series.get("titre") or series.get("url_fiche") or "fiche detail")[:80]
+        return self._with_flaresolverr_block_recovery(
+            lambda: self._fetch_full_series_data_once(series),
+            f"fiche detail {title}",
+        )
 
     def _series_change_reasons(
         self,
@@ -3410,9 +3419,13 @@ class NautiljonScraper:
             "Cadence fiches detail: "
             f"{pacing['detail_delay_min']:g}-{pacing['detail_delay_max']:g}s apres chaque fiche, "
             f"pause {pacing['detail_batch_pause_min']:g}-{pacing['detail_batch_pause_max']:g}s "
-            f"toutes les {pacing['detail_batch_size']} fiches, "
-            f"limite persistante {pacing['detail_window_size']} fiches par "
-            f"{pacing['detail_window_seconds'] / 60:g} min."
+            f"toutes les {pacing['detail_batch_size']} fiches."
+        )
+        print(
+            "Recuperation refus temporaire: "
+            f"{pacing['block_recovery_attempts']} nouvel essai apres "
+            f"{pacing['block_recovery_pause_min']:g}-{pacing['block_recovery_pause_max']:g}s "
+            "et renouvellement de session."
         )
         cooldown = self._resolve_access_cooldown()
         if cooldown:
@@ -3584,7 +3597,7 @@ class NautiljonScraper:
                     incomplete_reason = "access_blocked"
                     self._record_access_cooldown("access_blocked")
                     print(
-                        "Diff interrompu immediatement: IP de sortie bloquee par Nautiljon. "
+                        "Diff interrompu: blocage Nautiljon confirme apres recuperation. "
                         "Les donnees et le checkpoint sont conserves."
                     )
                     break

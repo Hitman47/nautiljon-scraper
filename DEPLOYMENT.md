@@ -59,12 +59,13 @@ NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
 NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
 NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
-NAUTILJON_DETAIL_WINDOW_SIZE=5
-NAUTILJON_DETAIL_WINDOW_SECONDS=900
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
 NAUTILJON_FAILURE_PAUSE_MAX=300
+NAUTILJON_BLOCK_RECOVERY_ATTEMPTS=1
+NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN=60
+NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX=120
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
 NAUTILJON_PAGE_FAILURE_RETRIES=1
 NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
@@ -153,12 +154,13 @@ NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
 NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
 NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
-NAUTILJON_DETAIL_WINDOW_SIZE=5
-NAUTILJON_DETAIL_WINDOW_SECONDS=900
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
 NAUTILJON_FAILURE_PAUSE_MAX=300
+NAUTILJON_BLOCK_RECOVERY_ATTEMPTS=1
+NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN=60
+NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX=120
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
 NAUTILJON_PAGE_FAILURE_RETRIES=1
 NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
@@ -209,9 +211,10 @@ La cadence par defaut reste prudente sans pauses disproportionnees. Les
 navigations sont sequentielles, 4 a 7 secondes les separent, une pause de 45 a
 90 secondes intervient toutes les 80 requetes et 20 a 45 secondes separent les
 lettres. Les fiches detail attendent 10 a 15 secondes apres chaque lecture et
-font une pause de 45 a 75 secondes toutes les 15 fiches. Elles sont en plus
-limitees a 5 visites par fenetre glissante de 15 minutes; cette fenetre est
-persistee dans `output/state/detail_rate_limit.json` et survit aux redemarrages.
+font une pause de 45 a 75 secondes toutes les 15 fiches. Un refus Nautiljon
+ferme la session FlareSolverr, attend 60 a 120 secondes, puis controle une seule
+fois la meme navigation dans une session neuve. La quarantaine longue n'est
+activee que si ce controle espace echoue aussi.
 Une valeur `N/A` issue
 du listing n'est jamais consideree comme un changement, tandis qu'une nouvelle
 valeur exploitable (par exemple un nombre de tomes different) reste detectee.

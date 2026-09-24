@@ -42,12 +42,13 @@ class DiffStateTests(unittest.TestCase):
             "NAUTILJON_DETAIL_BATCH_SIZE",
             "NAUTILJON_DETAIL_BATCH_PAUSE_MIN",
             "NAUTILJON_DETAIL_BATCH_PAUSE_MAX",
-            "NAUTILJON_DETAIL_WINDOW_SIZE",
-            "NAUTILJON_DETAIL_WINDOW_SECONDS",
             "NAUTILJON_LETTER_PAUSE_MIN",
             "NAUTILJON_LETTER_PAUSE_MAX",
             "NAUTILJON_FAILURE_PAUSE_MIN",
             "NAUTILJON_FAILURE_PAUSE_MAX",
+            "NAUTILJON_BLOCK_RECOVERY_ATTEMPTS",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX",
         }
         clean_env = {key: value for key, value in os.environ.items() if key not in pacing_keys}
         with mock.patch.dict(os.environ, clean_env, clear=True):
@@ -58,9 +59,13 @@ class DiffStateTests(unittest.TestCase):
         self.assertEqual((scraper.detail_delay_min, scraper.detail_delay_max), (10.0, 15.0))
         self.assertEqual(scraper.detail_batch_size, 15)
         self.assertEqual((scraper.detail_batch_pause_min, scraper.detail_batch_pause_max), (45.0, 75.0))
-        self.assertEqual((scraper.detail_window_size, scraper.detail_window_seconds), (5, 900.0))
         self.assertEqual((scraper.letter_pause_min, scraper.letter_pause_max), (20.0, 45.0))
         self.assertEqual((scraper.failure_pause_min, scraper.failure_pause_max), (120.0, 300.0))
+        self.assertEqual(scraper.block_recovery_attempts, 1)
+        self.assertEqual(
+            (scraper.block_recovery_pause_min, scraper.block_recovery_pause_max),
+            (60.0, 120.0),
+        )
 
     def test_pacer_serializes_requests_and_adds_batch_break(self):
         env = {
@@ -102,25 +107,100 @@ class DiffStateTests(unittest.TestCase):
         sleep.assert_called_once_with(45.0)
         self.assertEqual(scraper.session_stats["detail_requests"], 16)
 
-    def test_detail_rolling_limit_survives_process_restarts(self):
+    def test_detail_block_rotates_flaresolverr_session_and_recovers_once(self):
         env = {
-            "NAUTILJON_DETAIL_WINDOW_SIZE": "2",
-            "NAUTILJON_DETAIL_WINDOW_SECONDS": "100",
-            "NAUTILJON_DETAIL_BATCH_SIZE": "0",
+            "NAUTILJON_BLOCK_RECOVERY_ATTEMPTS": "1",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN": "60",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX": "60",
         }
-        with tempfile.TemporaryDirectory() as out_dir, mock.patch.dict(os.environ, env), mock.patch(
-            "scraper_nautiljon.time.time",
-            side_effect=[1000.0, 1001.0, 1002.0, 1100.0],
-        ), mock.patch("scraper_nautiljon.time.sleep") as sleep:
-            first = NautiljonScraper(out_dir=out_dir, delay=1, backend="http")
-            first._pace_detail_request()
-            first._pace_detail_request()
+        with mock.patch.dict(os.environ, env), mock.patch("scraper_nautiljon.time.sleep") as sleep:
+            scraper = NautiljonScraper(delay=0, backend="flaresolverr")
+            scraper.fetch_html = mock.Mock(
+                side_effect=[
+                    NautiljonAccessBlockedError("refus temporaire"),
+                    "<html>detail valide</html>",
+                ]
+            )
+            scraper.extract_series_detail_from_html = mock.Mock(return_value={"type_detail": "Shonen"})
+            scraper.close_flaresolverr = mock.Mock()
 
-            restarted = NautiljonScraper(out_dir=out_dir, delay=1, backend="http")
-            restarted._pace_detail_request()
+            result = scraper._fetch_full_series_data(make_row("F"))
 
-        sleep.assert_called_once_with(98.0)
-        self.assertEqual(restarted.session_stats["detail_requests"], 1)
+        self.assertIsNotNone(result)
+        self.assertEqual(scraper.fetch_html.call_count, 2)
+        scraper.close_flaresolverr.assert_called_once_with()
+        sleep.assert_called_once_with(60.0)
+        self.assertEqual(scraper.session_stats["transient_blocks"], 1)
+        self.assertEqual(scraper.session_stats["transient_recoveries"], 1)
+        self.assertEqual(scraper.session_stats["confirmed_blocks"], 0)
+
+    def test_repeated_detail_block_is_confirmed_after_spaced_retry(self):
+        env = {
+            "NAUTILJON_BLOCK_RECOVERY_ATTEMPTS": "1",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN": "60",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX": "60",
+        }
+        with mock.patch.dict(os.environ, env), mock.patch("scraper_nautiljon.time.sleep") as sleep:
+            scraper = NautiljonScraper(delay=0, backend="flaresolverr")
+            scraper.fetch_html = mock.Mock(side_effect=NautiljonAccessBlockedError("toujours bloque"))
+            scraper.close_flaresolverr = mock.Mock()
+
+            with self.assertRaisesRegex(NautiljonAccessBlockedError, "Blocage confirme"):
+                scraper._fetch_full_series_data(make_row("F"))
+
+        self.assertEqual(scraper.fetch_html.call_count, 2)
+        scraper.close_flaresolverr.assert_called_once_with()
+        sleep.assert_called_once_with(60.0)
+        self.assertEqual(scraper.session_stats["transient_blocks"], 1)
+        self.assertEqual(scraper.session_stats["transient_recoveries"], 0)
+        self.assertEqual(scraper.session_stats["confirmed_blocks"], 1)
+
+    def test_listing_block_is_retried_with_a_fresh_flaresolverr_session(self):
+        env = {
+            "NAUTILJON_BLOCK_RECOVERY_ATTEMPTS": "1",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN": "0",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX": "0",
+        }
+        with mock.patch.dict(os.environ, env):
+            scraper = NautiljonScraper(delay=0, backend="flaresolverr")
+            scraper._fetch_listing_page_flaresolverr = mock.Mock(
+                side_effect=[
+                    NautiljonAccessBlockedError("listing temporairement refuse"),
+                    ("https://www.nautiljon.com/mangas/?q=f", [make_row("F")]),
+                ]
+            )
+            scraper.close_flaresolverr = mock.Mock()
+
+            url, rows = scraper.fetch_listing_page("f", 0)
+
+        self.assertEqual(url, "https://www.nautiljon.com/mangas/?q=f")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(scraper._fetch_listing_page_flaresolverr.call_count, 2)
+        scraper.close_flaresolverr.assert_called_once_with()
+
+    def test_session_rotation_preserves_current_page_pagination_hint(self):
+        env = {
+            "NAUTILJON_BLOCK_RECOVERY_ATTEMPTS": "1",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN": "0",
+            "NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX": "0",
+        }
+        with mock.patch.dict(os.environ, env):
+            scraper = NautiljonScraper(delay=0, backend="flaresolverr")
+            key = ("F", 3)
+            scraper._flaresolverr_page_has_next[key] = True
+            operation = mock.Mock(
+                side_effect=[NautiljonAccessBlockedError("temporaire"), "ok"]
+            )
+
+            def clear_session_state():
+                scraper._flaresolverr_page_has_next.clear()
+
+            scraper.close_flaresolverr = mock.Mock(side_effect=clear_session_state)
+
+            result = scraper._with_flaresolverr_block_recovery(operation, "fiche test")
+
+        self.assertEqual(result, "ok")
+        self.assertTrue(scraper._flaresolverr_page_has_next[key])
 
     def test_missing_listing_values_do_not_trigger_detail_refresh(self):
         scraper = self.make_scraper("unused")

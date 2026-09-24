@@ -78,12 +78,13 @@ NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
 NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
 NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
-NAUTILJON_DETAIL_WINDOW_SIZE=5
-NAUTILJON_DETAIL_WINDOW_SECONDS=900
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
 NAUTILJON_FAILURE_PAUSE_MAX=300
+NAUTILJON_BLOCK_RECOVERY_ATTEMPTS=1
+NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN=60
+NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX=120
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
 NAUTILJON_PAGE_FAILURE_RETRIES=1
 NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
@@ -107,9 +108,11 @@ NAUTILJON_SHM_SIZE=256m
 - Un diff est refuse si FlareSolverr et Gluetun n'utilisent pas la meme IP publique.
 - Une IP explicitement interdite par Nautiljon arrete le diff sans nouvelle tentative,
   y compris si le blocage apparait pendant une fiche detail.
-- Un challenge Cloudflare non resolu a le meme effet et interdit tout nouveau diff
-  pendant 24 heures sur la meme IP. La quarantaine est levee automatiquement si
-  Gluetun et FlareSolverr confirment une nouvelle IP publique. `--force` ne la contourne pas.
+- Un refus Nautiljon ou un challenge Cloudflare provoque d'abord la fermeture de
+  la session FlareSolverr, une pause de 60 a 120 secondes et un unique controle
+  dans une session neuve. La quarantaine de 24 heures n'est creee que si ce
+  second controle echoue. Elle est levee automatiquement si Gluetun et
+  FlareSolverr confirment une nouvelle IP publique. `--force` ne la contourne pas.
 - Une page FlareSolverr sans index alphabetique est conservee dans
   `output/debug/flaresolverr_mangas_index_missing_*.html` puis traitee comme un
   blocage. Une reprise utilise d'abord l'URL exacte stockee dans son checkpoint.
@@ -119,8 +122,8 @@ NAUTILJON_SHM_SIZE=256m
 - Les acces Nautiljon sont strictement sequentiels : 4 a 7 secondes entre deux
   navigations, 45 a 90 secondes toutes les 80 requetes et 20 a 45 secondes entre lettres.
   Les fiches detail, plus sensibles, attendent 10 a 15 secondes et font une pause
-  de 45 a 75 secondes toutes les 15 fiches. Une limite glissante, conservee sur
-  disque entre les redemarrages, autorise au plus 5 fiches toutes les 15 minutes.
+  de 45 a 75 secondes toutes les 15 fiches. Il n'existe plus de limite glissante
+  persistante qui ralentirait artificiellement les reprises.
 - Une valeur absente (`N/A`) dans un listing ne remplace jamais une valeur connue
   et ne declenche pas de consultation de fiche. Une vraie nouvelle valeur reste
   comparee normalement, notamment pour detecter un changement du nombre de tomes.
