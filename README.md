@@ -83,6 +83,8 @@ NAUTILJON_RESUME=true
 NAUTILJON_FLUSH_EVERY=25
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
 NAUTILJON_MAX_MISSING_RATIO=0.15
+NAUTILJON_MAX_CONFIRMED_MISSING_RATIO=0.35
+NAUTILJON_COVERAGE_CONFIRMATION_MIN_SECONDS=3600
 NAUTILJON_ABORT_AFTER_LISTING_FAILURES=1
 NAUTILJON_REFRESH_STALE_DAYS=30
 NAUTILJON_CPUS=0.50
@@ -118,7 +120,10 @@ NAUTILJON_SHM_SIZE=256m
 - Une progression reste reprenable si le delai de rafraichissement, le seuil de
   couverture ou le mode controle/final change. Un checkpoint inutilisable est
   archive dans `output/checkpoints/archive/` avant tout remplacement.
-- Une disparition superieure a 15 % de la base bloque la finalisation.
+- Une disparition superieure a 15 % de la base bloque le premier listing. Elle
+  n'est acceptee qu'apres un second listing complet, espace d'au moins une heure,
+  qui retrouve exactement les memes absences. Au-dela de 35 %, la finalisation
+  reste toujours bloquee.
 - Un controle avec `NAUTILJON_DROP_MISSING=false` ecrit dans `output/control/`.
 - Un lancement des 27 lettres avec `NAUTILJON_DROP_MISSING=false` est refuse :
   le mode controle doit toujours utiliser une liste explicite de lettres.

@@ -638,6 +638,124 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(stats["missing_count"], 0)
             self.assertEqual(scraper.session_stats["skipped_by_type"], 1)
 
+    def test_stable_complete_coverage_gap_is_finalized_without_network_retry(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            baseline = []
+            for index in range(20):
+                row = make_row("E")
+                row["titre"] = f"Example E {index}"
+                row["url_fiche"] = f"https://www.nautiljon.com/mangas/example-e-{index}.html"
+                baseline.append(scraper._normalize_row(row))
+            current = baseline[:15]
+            scraper.save_letter_files("E", baseline, partial=False)
+            scraper.save_letter_files("E", current, partial=True)
+
+            current_checkpoint = {
+                "updated_at": "2026-09-18T12:00:00",
+                "settings": {
+                    "checkpoint_version": LETTER_CHECKPOINT_VERSION,
+                    "letter": "e",
+                },
+                "page_num": 1,
+                "accessible_listing_pages": 1,
+                "successful_listing_pages": 1,
+                "next_listing_url": "",
+                "counters": {"new": 0, "changed": 0, "parutions": 0, "reused": 15, "removed": 0},
+            }
+            scraper._write_json_atomic(scraper._letter_checkpoint_path("E"), current_checkpoint)
+            scraper._write_json_atomic(
+                scraper._state_path("last_diff_run"),
+                {
+                    "reason": "coverage_incomplete",
+                    "session_stats": {
+                        "diff_by_letter": {
+                            "E": {
+                                "coverage_failed": True,
+                                "listing_failed": False,
+                                "detail_failed": False,
+                                "limited": False,
+                            }
+                        }
+                    },
+                },
+            )
+
+            archive_dir = os.path.join(out_dir, "checkpoints", "archive", "stable_E")
+            os.makedirs(archive_dir)
+            archived_checkpoint = dict(current_checkpoint)
+            archived_checkpoint["updated_at"] = "2026-09-18T10:00:00"
+            scraper._write_json_atomic(
+                os.path.join(archive_dir, "nautiljon_lettre_E.json"),
+                archived_checkpoint,
+            )
+            scraper._write_json_atomic(
+                os.path.join(archive_dir, "nautiljon_lettre_E.partial.json"),
+                current,
+            )
+            scraper.fetch_listing_page = mock.Mock(
+                side_effect=AssertionError("a confirmed complete listing must not be fetched again")
+            )
+
+            result = scraper.scrape_letter_diff(
+                "e",
+                drop_missing=True,
+                max_missing_ratio=0.15,
+                resume=True,
+            )
+
+            self.assertEqual(len(result), 15)
+            scraper.fetch_listing_page.assert_not_called()
+            stats = scraper.session_stats["diff_by_letter"]["E"]
+            self.assertFalse(stats["coverage_failed"])
+            self.assertEqual(stats["missing_count"], 5)
+            self.assertEqual(stats["removed"], 5)
+            self.assertFalse(os.path.exists(scraper._letter_checkpoint_path("E")))
+            self.assertEqual(len(scraper._load_json_list(scraper._letter_paths("E")[0])), 15)
+
+    def test_stable_coverage_gap_above_hard_cap_is_rejected(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            baseline_urls = {
+                f"https://www.nautiljon.com/mangas/example-e-{index}.html"
+                for index in range(20)
+            }
+            current_urls = set(sorted(baseline_urls)[:10])
+            missing_urls = baseline_urls - current_urls
+            current_rows = [
+                {"url_fiche": url, "titre": url.rsplit("/", 1)[-1]}
+                for url in current_urls
+            ]
+            checkpoint = {
+                "updated_at": "2026-09-18T12:00:00",
+                "page_num": 1,
+                "accessible_listing_pages": 1,
+                "successful_listing_pages": 1,
+                "listing_complete": True,
+            }
+            archive_dir = os.path.join(out_dir, "checkpoints", "archive", "stable_E")
+            os.makedirs(archive_dir)
+            archived_checkpoint = dict(checkpoint)
+            archived_checkpoint["updated_at"] = "2026-09-18T10:00:00"
+            scraper._write_json_atomic(
+                os.path.join(archive_dir, "nautiljon_lettre_E.json"),
+                archived_checkpoint,
+            )
+            scraper._write_json_atomic(
+                os.path.join(archive_dir, "nautiljon_lettre_E.partial.json"),
+                current_rows,
+            )
+
+            self.assertFalse(
+                scraper._coverage_gap_confirmed_by_archive(
+                    "E",
+                    baseline_urls,
+                    missing_urls,
+                    len(current_rows),
+                    checkpoint,
+                )
+            )
+
     def test_flaresolverr_exact_resume_url_bypasses_alphabet_index(self):
         scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
         exact_url = "https://www.nautiljon.com/mangas/?q=b&st=saved-token&dbt=100"

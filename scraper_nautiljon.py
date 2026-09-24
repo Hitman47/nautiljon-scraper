@@ -620,6 +620,105 @@ class NautiljonScraper:
             and checkpoint_version == LETTER_CHECKPOINT_VERSION
         )
 
+    @staticmethod
+    def _checkpoint_listing_is_complete(checkpoint: Dict[str, object]) -> bool:
+        if checkpoint.get("listing_complete") is True:
+            return True
+        try:
+            page_num = int(checkpoint.get("page_num", 0) or 0)
+            accessible = int(checkpoint.get("accessible_listing_pages", 0) or 0)
+            successful = int(checkpoint.get("successful_listing_pages", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return (
+            page_num > 0
+            and page_num == accessible == successful
+            and not str(checkpoint.get("next_listing_url", "") or "")
+        )
+
+    def _coverage_checkpoint_is_complete(
+        self,
+        letter_tag: str,
+        checkpoint: Dict[str, object],
+    ) -> bool:
+        if checkpoint.get("listing_complete") is True:
+            return True
+        if not self._checkpoint_listing_is_complete(checkpoint):
+            return False
+        report = self._load_json_dict(self._state_path("last_diff_run"))
+        if not report or report.get("reason") != "coverage_incomplete":
+            return False
+        session_stats = report.get("session_stats")
+        diff_by_letter = session_stats.get("diff_by_letter") if isinstance(session_stats, dict) else None
+        counters = diff_by_letter.get(letter_tag) if isinstance(diff_by_letter, dict) else None
+        return bool(
+            isinstance(counters, dict)
+            and counters.get("coverage_failed")
+            and not counters.get("listing_failed")
+            and not counters.get("detail_failed")
+            and not counters.get("limited")
+        )
+
+    def _coverage_gap_confirmed_by_archive(
+        self,
+        letter_tag: str,
+        baseline_urls: set,
+        current_missing_urls: set,
+        current_rows_count: int,
+        current_checkpoint: Dict[str, object],
+    ) -> bool:
+        if not current_missing_urls or not baseline_urls:
+            return False
+        ratio = len(current_missing_urls) / len(baseline_urls)
+        max_confirmed_ratio = max(
+            0.0,
+            _env_float("NAUTILJON_MAX_CONFIRMED_MISSING_RATIO", 0.35),
+        )
+        if ratio > max_confirmed_ratio:
+            return False
+        try:
+            current_time = datetime.fromisoformat(str(current_checkpoint.get("updated_at", "")))
+        except ValueError:
+            return False
+        min_age_seconds = max(
+            0.0,
+            _env_float("NAUTILJON_COVERAGE_CONFIRMATION_MIN_SECONDS", 3600.0),
+        )
+        _, checkpoints_dir, _, _ = self._ensure_dirs()
+        archive_root = os.path.join(checkpoints_dir, "archive")
+        if not os.path.isdir(archive_root):
+            return False
+        checkpoint_name = f"nautiljon_lettre_{letter_tag}.json"
+        partial_name = f"nautiljon_lettre_{letter_tag}.partial.json"
+        with os.scandir(archive_root) as entries:
+            for entry in entries:
+                if not entry.is_dir():
+                    continue
+                archived_checkpoint = self._load_json_dict(os.path.join(entry.path, checkpoint_name))
+                archived_rows = self._load_json_list(os.path.join(entry.path, partial_name))
+                if not archived_checkpoint or not archived_rows:
+                    continue
+                if not self._checkpoint_listing_is_complete(archived_checkpoint):
+                    continue
+                try:
+                    archived_time = datetime.fromisoformat(str(archived_checkpoint.get("updated_at", "")))
+                except ValueError:
+                    continue
+                if abs((current_time - archived_time).total_seconds()) < min_age_seconds:
+                    continue
+                archived_urls = {
+                    _ensure_abs_url(row.get("url_fiche", ""))
+                    for row in archived_rows
+                    if row.get("url_fiche")
+                }
+                if baseline_urls - archived_urls != current_missing_urls:
+                    continue
+                stable_margin = max(2, int(max(current_rows_count, len(archived_rows)) * 0.02))
+                if abs(current_rows_count - len(archived_rows)) > stable_margin:
+                    continue
+                return True
+        return False
+
     def _remove_checkpoint(self, path: str) -> None:
         try:
             if os.path.exists(path):
@@ -2554,6 +2653,7 @@ class NautiljonScraper:
             if row.get("url_fiche")
         }
         initial_existing_count = len(existing_by_url)
+        initial_existing_urls = set(existing_by_url)
         print(f"  Base existante: {len(existing_by_url)} series")
 
         updated_rows: List[Dict[str, str]] = []
@@ -2574,6 +2674,8 @@ class NautiljonScraper:
         errors_before_letter = self.session_stats["errors"]
         checkpoint_path = self._letter_checkpoint_path(tag)
         resumed_from_checkpoint = False
+        listing_complete = False
+        coverage_confirmed = False
         letter_settings = {
             "checkpoint_version": LETTER_CHECKPOINT_VERSION,
             "letter": letter,
@@ -2606,9 +2708,46 @@ class NautiljonScraper:
                 if isinstance(saved_counters, dict):
                     counters.update({key: int(saved_counters.get(key, value) or 0) for key, value in counters.items()})
                 resumed_from_checkpoint = True
+                listing_complete = self._coverage_checkpoint_is_complete(tag, checkpoint)
+                if listing_complete:
+                    coverage_confirmed = self._coverage_gap_confirmed_by_archive(
+                        tag,
+                        initial_existing_urls,
+                        set(existing_by_url),
+                        len(updated_rows),
+                        checkpoint,
+                    )
+                    if coverage_confirmed:
+                        print(
+                            f"  Couverture {label} confirmee par deux listings complets et stables; "
+                            "finalisation depuis le checkpoint sans nouvelle requete."
+                        )
+                    else:
+                        self._archive_letter_progress(
+                            tag,
+                            checkpoint_path,
+                            "couverture_a_reconfirmer",
+                        )
+                        updated_rows = []
+                        seen_urls = set()
+                        existing_by_url = {
+                            _ensure_abs_url(row.get("url_fiche", "")): self._normalize_row(row)
+                            for row in existing_rows
+                            if row.get("url_fiche")
+                        }
+                        page_num = 0
+                        accessible_listing_pages = 0
+                        successful_listing_pages = 0
+                        counters = {"new": 0, "changed": 0, "parutions": 0, "reused": 0, "removed": 0}
+                        resumed_from_checkpoint = False
+                        listing_complete = False
                 print(
-                    f"  Reprise lettre {label}: page {page_num + 1}, "
-                    f"{len(updated_rows)} serie(s) deja traitee(s)."
+                    f"  Reprise lettre {label}: "
+                    + (
+                        f"listing complet, {len(updated_rows)} serie(s) deja traitee(s)."
+                        if listing_complete
+                        else f"page {page_num + 1}, {len(updated_rows)} serie(s) deja traitee(s)."
+                    )
                 )
             elif checkpoint:
                 self._archive_letter_progress(tag, checkpoint_path, "checkpoint_non_reutilisable")
@@ -2625,12 +2764,13 @@ class NautiljonScraper:
                 "accessible_listing_pages": accessible_listing_pages,
                 "successful_listing_pages": successful_listing_pages,
                 "counters": counters,
+                "listing_complete": listing_complete,
             }
             if self.backend == "flaresolverr":
                 payload["next_listing_url"] = self._flaresolverr_listing_urls.get((tag, next_page), "")
             self._write_json_atomic(checkpoint_path, payload)
 
-        if resumed_from_checkpoint:
+        if resumed_from_checkpoint and not listing_complete:
             candidates = [
                 (index, row)
                 for index, row in enumerate(updated_rows)
@@ -2668,7 +2808,7 @@ class NautiljonScraper:
                         break
             save_checkpoint(page_num)
 
-        while True:
+        while not listing_complete:
             if access_blocked or detail_abort:
                 break
             if max_pages is not None and page_num >= max_pages:
@@ -2800,6 +2940,8 @@ class NautiljonScraper:
                         save_checkpoint(page_num)
                     else:
                         print(f"  Fin de pagination explicite apres la page {page_num + 1}.")
+                        listing_complete = True
+                        save_checkpoint(page_num + 1)
                     break
 
             if not page_series:
@@ -2841,12 +2983,26 @@ class NautiljonScraper:
         limited = max_pages is not None or max_series is not None
         missing_count = len(existing_by_url)
         missing_ratio = (missing_count / initial_existing_count) if initial_existing_count else 0.0
-        coverage_failed = bool(
+        coverage_exceeded = bool(
             not limited
             and initial_existing_count >= 20
             and max_missing_ratio >= 0
             and missing_ratio > max_missing_ratio
         )
+        if coverage_exceeded and not coverage_confirmed:
+            coverage_confirmed = self._coverage_gap_confirmed_by_archive(
+                tag,
+                initial_existing_urls,
+                set(existing_by_url),
+                len(updated_rows),
+                self._load_json_dict(checkpoint_path) or {},
+            )
+        coverage_failed = coverage_exceeded and not coverage_confirmed
+        if coverage_exceeded and coverage_confirmed:
+            print(
+                f"  Couverture atypique mais stable: {missing_count}/{initial_existing_count} fiches "
+                "historiques absentes sur deux listings complets; mise a jour acceptee."
+            )
         if coverage_failed:
             print(
                 f"  Couverture invalide: {missing_count}/{initial_existing_count} fiches historiques absentes "
