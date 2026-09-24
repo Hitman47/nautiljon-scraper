@@ -52,7 +52,8 @@ DEFAULT_HEADERS = {
 }
 BANNED_TYPE_KEYWORDS = ["yaoi", "yuri"]
 DATA_SCHEMA_VERSION = 2
-LETTER_CHECKPOINT_VERSION = 2
+LETTER_CHECKPOINT_VERSION = 3
+DETAIL_QUEUE_VERSION = 1
 VF_RELEASE_FIELDS = [
     "dernier_tome_vf_numero", "dernier_tome_vf_date",
     "dernier_tome_vf_url", "dernier_tome_vf_couverture",
@@ -202,6 +203,7 @@ class NautiljonScraper:
         delay_max: Optional[float] = None,
         backend: str = "selenium",
         browser_headless: bool = False,
+        detail_mode: str = "immediate",
     ):
         self.out_dir = out_dir
         self.delay = delay
@@ -209,6 +211,10 @@ class NautiljonScraper:
         self.delay_max = delay_max
         self.backend = backend.strip().lower()
         self.browser_headless = browser_headless
+        self.detail_mode = detail_mode.strip().lower()
+        if self.detail_mode not in {"immediate", "deferred"}:
+            raise ValueError("detail_mode doit valoir immediate ou deferred")
+        self.queue_release_refresh = _env_bool("NAUTILJON_QUEUE_RELEASE_REFRESH", False)
         self.driver: Optional[webdriver.Chrome] = None
         self.browser_process: Optional[subprocess.Popen] = None
         self._browser_log_handle = None
@@ -319,6 +325,8 @@ class NautiljonScraper:
                 "block_recovery_pause_min": self.block_recovery_pause_min,
                 "block_recovery_pause_max": self.block_recovery_pause_max,
                 "block_cooldown_hours": self.block_cooldown_hours,
+                "detail_mode": self.detail_mode,
+                "queue_release_refresh": self.queue_release_refresh,
             },
         }
 
@@ -517,6 +525,118 @@ class NautiljonScraper:
         safe_name = re.sub(r"[^a-z0-9_.-]+", "_", name.lower()).strip("_") or "run"
         return os.path.join(state_dir, f"{safe_name}.json")
 
+    def _detail_queue_path(self) -> str:
+        return self._state_path("detail_queue")
+
+    def _load_detail_queue(self) -> Dict[str, Dict[str, object]]:
+        payload = self._load_json_dict(self._detail_queue_path())
+        if not payload or payload.get("version") != DETAIL_QUEUE_VERSION:
+            return {}
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list):
+            return {}
+        queue: Dict[str, Dict[str, object]] = {}
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            url = _ensure_abs_url(str(raw.get("url_fiche", "") or ""))
+            if not url:
+                continue
+            item = dict(raw)
+            item["url_fiche"] = url
+            queue[url] = item
+        return queue
+
+    def _save_detail_queue(self, queue: Dict[str, Dict[str, object]]) -> None:
+        items = sorted(
+            queue.values(),
+            key=lambda item: (
+                not bool(item.get("ready")),
+                str(item.get("queued_at", "")),
+                _norm(str(item.get("title", ""))),
+            ),
+        )
+        self._write_json_atomic(
+            self._detail_queue_path(),
+            {
+                "version": DETAIL_QUEUE_VERSION,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "pending": len(items),
+                "ready": sum(1 for item in items if item.get("ready")),
+                "items": items,
+            },
+        )
+
+    def _queue_detail(
+        self,
+        queue: Dict[str, Dict[str, object]],
+        letter_tag: str,
+        series: Dict[str, str],
+        reason: str,
+        ready: bool = False,
+    ) -> bool:
+        url = _ensure_abs_url(series.get("url_fiche", ""))
+        if not url:
+            return False
+        now = datetime.now().isoformat(timespec="seconds")
+        existing = queue.get(url)
+        reasons: List[str] = []
+        if isinstance(existing, dict) and isinstance(existing.get("reasons"), list):
+            reasons = [str(value) for value in existing["reasons"] if value]
+        if reason not in reasons:
+            reasons.append(reason)
+        queue[url] = {
+            "url_fiche": url,
+            "letter": letter_tag,
+            "title": series.get("titre", "N/A"),
+            "reasons": reasons,
+            "queued_at": str(existing.get("queued_at", now)) if isinstance(existing, dict) else now,
+            "updated_at": now,
+            "ready": bool(ready or (existing and existing.get("ready"))),
+            "attempts": int(existing.get("attempts", 0) or 0) if isinstance(existing, dict) else 0,
+        }
+        return existing is None
+
+    @staticmethod
+    def _mark_detail_queue_letter_ready(
+        queue: Dict[str, Dict[str, object]],
+        letter_tag: str,
+    ) -> int:
+        count = 0
+        now = datetime.now().isoformat(timespec="seconds")
+        for item in queue.values():
+            if item.get("letter") == letter_tag and not item.get("ready"):
+                item["ready"] = True
+                item["updated_at"] = now
+                count += 1
+        return count
+
+    def _promote_finalized_detail_queue(
+        self,
+        queue: Dict[str, Dict[str, object]],
+    ) -> int:
+        promoted = 0
+        urls_by_letter: Dict[str, set] = {}
+        now = datetime.now().isoformat(timespec="seconds")
+        for item in queue.values():
+            if item.get("ready"):
+                continue
+            tag = str(item.get("letter", "") or "")
+            if not tag or os.path.isfile(self._letter_checkpoint_path(tag)):
+                continue
+            if tag not in urls_by_letter:
+                final_json = self._letter_paths(tag)[0]
+                urls_by_letter[tag] = {
+                    _ensure_abs_url(row.get("url_fiche", ""))
+                    for row in self._load_json_list(final_json)
+                    if row.get("url_fiche")
+                }
+            if item.get("url_fiche") in urls_by_letter[tag]:
+                item["ready"] = True
+                item["updated_at"] = now
+                promoted += 1
+        return promoted
+
     def _record_access_cooldown(self, reason: str, blocked_public_ip: str = "") -> str:
         blocked_at = datetime.now()
         resume_after = blocked_at + timedelta(hours=self.block_cooldown_hours)
@@ -703,6 +823,8 @@ class NautiljonScraper:
             "refresh_stale_days": refresh_stale_days,
             "drop_missing": drop_missing,
             "max_missing_ratio": max_missing_ratio,
+            "detail_mode": self.detail_mode,
+            "queue_release_refresh": self.queue_release_refresh,
         }
 
     def _load_diff_run_checkpoint(self, config: Dict[str, object], resume: bool) -> List[str]:
@@ -766,7 +888,7 @@ class NautiljonScraper:
         return (
             bool(saved_letter)
             and self._letter_tag(saved_letter) == letter_tag
-            and checkpoint_version == LETTER_CHECKPOINT_VERSION
+            and checkpoint_version in {2, LETTER_CHECKPOINT_VERSION}
         )
 
     @staticmethod
@@ -2957,7 +3079,14 @@ class NautiljonScraper:
         max_detail_failures = max(1, _env_int("NAUTILJON_ABORT_AFTER_DETAIL_FAILURES", 2))
         max_page_failures = max(1, _env_int("NAUTILJON_PAGE_FAILURE_RETRIES", 1))
         since_flush = 0
-        counters = {"new": 0, "changed": 0, "parutions": 0, "reused": 0, "removed": 0}
+        counters = {
+            "new": 0,
+            "changed": 0,
+            "parutions": 0,
+            "reused": 0,
+            "removed": 0,
+            "queued_details": 0,
+        }
         errors_before_letter = self.session_stats["errors"]
         checkpoint_path = self._letter_checkpoint_path(tag)
         resumed_from_checkpoint = False
@@ -2971,7 +3100,10 @@ class NautiljonScraper:
             "refresh_stale_days": refresh_stale_days,
             "drop_missing": drop_missing,
             "max_missing_ratio": max_missing_ratio,
+            "detail_mode": self.detail_mode,
+            "queue_release_refresh": self.queue_release_refresh,
         }
+        detail_queue = self._load_detail_queue() if self.detail_mode == "deferred" else {}
 
         checkpoint = self._load_json_dict(checkpoint_path)
         partial_rows = self._load_json_list(self._letter_paths(tag)[2])
@@ -3031,7 +3163,14 @@ class NautiljonScraper:
                         page_num = 0
                         accessible_listing_pages = 0
                         successful_listing_pages = 0
-                        counters = {"new": 0, "changed": 0, "parutions": 0, "reused": 0, "removed": 0}
+                        counters = {
+                            "new": 0,
+                            "changed": 0,
+                            "parutions": 0,
+                            "reused": 0,
+                            "removed": 0,
+                            "queued_details": 0,
+                        }
                         resumed_from_checkpoint = False
                         listing_complete = False
                 print(
@@ -3048,6 +3187,8 @@ class NautiljonScraper:
             self._archive_letter_progress(tag, checkpoint_path, "reprise_desactivee")
 
         def save_checkpoint(next_page: int) -> None:
+            if self.detail_mode == "deferred":
+                self._save_detail_queue(detail_queue)
             self.save_letter_files(tag, updated_rows, partial=True)
             payload = {
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -3063,7 +3204,7 @@ class NautiljonScraper:
                 payload["next_listing_url"] = self._flaresolverr_listing_urls.get((tag, next_page), "")
             self._write_json_atomic(checkpoint_path, payload)
 
-        if resumed_from_checkpoint and not listing_complete:
+        if resumed_from_checkpoint and not listing_complete and self.detail_mode == "immediate":
             candidates = [
                 (index, row)
                 for index, row in enumerate(updated_rows)
@@ -3100,6 +3241,18 @@ class NautiljonScraper:
                         )
                         break
             save_checkpoint(page_num)
+
+        if (
+            resumed_from_checkpoint
+            and not listing_complete
+            and self.detail_mode == "deferred"
+            and self.queue_release_refresh
+        ):
+            for row in updated_rows:
+                if self._series_needs_release_refresh(row, refresh_stale_days):
+                    if self._queue_detail(detail_queue, tag, row, "release_refresh"):
+                        counters["queued_details"] += 1
+            self._save_detail_queue(detail_queue)
 
         while not listing_complete:
             if access_blocked or detail_abort:
@@ -3165,7 +3318,9 @@ class NautiljonScraper:
                     elif self._series_changed_on_list(existing, series):
                         action = "changed"
                         needs_detail = self._series_change_requires_detail(existing, series)
-                    elif self._series_needs_release_refresh(existing, refresh_stale_days):
+                    elif (
+                        self.detail_mode == "immediate" or self.queue_release_refresh
+                    ) and self._series_needs_release_refresh(existing, refresh_stale_days):
                         action = "parutions"
                         needs_detail = True
 
@@ -3183,38 +3338,51 @@ class NautiljonScraper:
                             f"    MAJ {action}: {(series.get('titre') or 'N/A')[:60]}"
                             f"{change_suffix}"
                         )
-                        try:
-                            if existing:
-                                self._preserve_known_list_fields(series, existing)
-                            full = self._fetch_full_series_data(series)
-                            if full:
-                                updated_rows.append(full)
-                                counters[action] += 1
-                                consecutive_detail_failures = 0
-                                self._sleep_detail_delay()
-                        except NautiljonAccessBlockedError as exc:
-                            self.session_stats["errors"] += 1
-                            access_blocked = True
-                            listing_failed = True
-                            seen_urls.discard(url)
-                            if existing:
-                                existing_by_url[url] = existing
-                            print(f"    ACCES BLOQUE pendant une fiche detail: {str(exc)[:220]}")
-                            break
-                        except Exception as exc:
-                            self.session_stats["errors"] += 1
-                            consecutive_detail_failures += 1
-                            print(f"    Erreur detail: {str(exc)[:140]}")
-                            if existing:
-                                updated_rows.append(existing)
-                            if consecutive_detail_failures >= max_detail_failures:
-                                detail_abort = True
-                                print(
-                                    "    Trop d'erreurs de fiches consecutives; arret prudent de la lettre "
-                                    f"({consecutive_detail_failures}/{max_detail_failures})."
-                                )
+                        if self.detail_mode == "deferred":
+                            base = existing if existing is not None else self._normalize_row(series)
+                            merged = self._merge_observed_list_fields(base, series)
+                            updated_rows.append(merged)
+                            queue_reason = {
+                                "new": "new_series",
+                                "changed": "volume_changed",
+                                "parutions": "release_refresh",
+                            }[action]
+                            if self._queue_detail(detail_queue, tag, merged, queue_reason):
+                                counters["queued_details"] += 1
+                            counters[action] += 1
+                        else:
+                            try:
+                                if existing:
+                                    self._preserve_known_list_fields(series, existing)
+                                full = self._fetch_full_series_data(series)
+                                if full:
+                                    updated_rows.append(full)
+                                    counters[action] += 1
+                                    consecutive_detail_failures = 0
+                                    self._sleep_detail_delay()
+                            except NautiljonAccessBlockedError as exc:
+                                self.session_stats["errors"] += 1
+                                access_blocked = True
+                                listing_failed = True
+                                seen_urls.discard(url)
+                                if existing:
+                                    existing_by_url[url] = existing
+                                print(f"    ACCES BLOQUE pendant une fiche detail: {str(exc)[:220]}")
                                 break
-                            continue
+                            except Exception as exc:
+                                self.session_stats["errors"] += 1
+                                consecutive_detail_failures += 1
+                                print(f"    Erreur detail: {str(exc)[:140]}")
+                                if existing:
+                                    updated_rows.append(existing)
+                                if consecutive_detail_failures >= max_detail_failures:
+                                    detail_abort = True
+                                    print(
+                                        "    Trop d'erreurs de fiches consecutives; arret prudent de la lettre "
+                                        f"({consecutive_detail_failures}/{max_detail_failures})."
+                                    )
+                                    break
+                                continue
                     else:
                         updated_rows.append(self._merge_observed_list_fields(existing, series))
                         if action == "changed":
@@ -3283,6 +3451,7 @@ class NautiljonScraper:
                 "parutions": 0,
                 "reused": len(existing_kept),
                 "removed": 0,
+                "queued_details": 0,
                 "listing_failed": True,
                 "access_blocked": access_blocked,
                 "coverage_failed": False,
@@ -3366,6 +3535,11 @@ class NautiljonScraper:
             self.save_controlled_letter_files(tag, updated_rows)
         self._remove_partial_files(tag)
         self._remove_checkpoint(checkpoint_path)
+        if self.detail_mode == "deferred" and drop_missing:
+            made_ready = self._mark_detail_queue_letter_ready(detail_queue, tag)
+            self._save_detail_queue(detail_queue)
+            if made_ready:
+                print(f"  File detail: {made_ready} fiche(s) de la lettre {label} pretes a enrichir.")
         counters["listing_failed"] = False
         counters["access_blocked"] = False
         counters["coverage_failed"] = False
@@ -3390,6 +3564,209 @@ class NautiljonScraper:
         suffix = "controle uniquement" if not drop_missing else "fichier final mis a jour"
         print(f"  Lettre {label}: {len(updated_rows)} series, {suffix} ({counters})")
         return updated_rows
+
+    def _refresh_letter_cache_after_enrichment(
+        self,
+        letter_tag: str,
+        rows: List[Dict[str, str]],
+    ) -> None:
+        _, _, marker_path = self._letter_cache_paths(letter_tag)
+        marker = self._load_json_dict(marker_path)
+        if not marker:
+            return
+        stats = marker.get("stats")
+        self._save_letter_cache(
+            letter_tag,
+            rows,
+            dict(stats) if isinstance(stats, dict) else {},
+            source_mode="enriched",
+            completed_at=str(marker.get("completed_at", "")) or None,
+        )
+
+    def enrich_detail_queue(self, max_items: int = 12) -> RunResult:
+        queue = self._load_detail_queue()
+        if self._promote_finalized_detail_queue(queue):
+            self._save_detail_queue(queue)
+        ready_items = [item for item in queue.values() if item.get("ready")]
+        ready_items.sort(key=lambda item: (str(item.get("queued_at", "")), str(item.get("url_fiche", ""))))
+        if not ready_items:
+            result = RunResult(status="skipped", reason="detail_queue_empty")
+            print("File detail vide: aucune navigation Nautiljon necessaire.")
+            self.mark_run_state("enrich", result)
+            return result
+
+        min_interval_minutes = max(
+            0.0,
+            _env_float("NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES", 30.0),
+        )
+        last_run = self._load_json_dict(self._last_success_path("enrich"))
+        if last_run and last_run.get("status") == "success" and min_interval_minutes > 0:
+            try:
+                last_completed = datetime.fromisoformat(str(last_run.get("completed_at", "")))
+                next_run = last_completed + timedelta(minutes=min_interval_minutes)
+            except ValueError:
+                next_run = datetime.min
+            if datetime.now() < next_run:
+                result = RunResult(status="skipped", reason="enrich_interval_active")
+                print(
+                    "Enrichissement differe pour proteger l'IP; prochain lot autorise apres "
+                    f"{next_run.isoformat(timespec='seconds')}."
+                )
+                self.mark_run_state("enrich", result)
+                return result
+
+        cooldown = self._resolve_access_cooldown()
+        if cooldown:
+            result = RunResult(status="failed", reason="access_cooldown_active")
+            print(
+                "Enrichissement refuse pendant la quarantaine anti-ban. Reprise autorisee apres "
+                f"{cooldown.get('resume_after')}."
+            )
+            self.mark_run_state("enrich", result)
+            return result
+
+        if self.backend == "flaresolverr":
+            try:
+                if self._verified_public_ips:
+                    gluetun_ip, flaresolverr_ip = self._verified_public_ips
+                else:
+                    gluetun_ip, flaresolverr_ip = self._flaresolverr_public_ips()
+                print(f"IP Gluetun: {gluetun_ip} | IP FlareSolverr: {flaresolverr_ip}")
+                if gluetun_ip != flaresolverr_ip:
+                    raise RuntimeError("les IP publiques de Gluetun et FlareSolverr sont differentes")
+            except Exception as exc:
+                self.close_flaresolverr()
+                result = RunResult(status="failed", reason="flaresolverr_preflight_failed")
+                print(f"Enrichissement refuse: preflight FlareSolverr en echec ({str(exc)[:300]}).")
+                self.mark_run_state("enrich", result)
+                return result
+
+        hard_limit = max(1, _env_int("NAUTILJON_ENRICH_HARD_LIMIT", 12))
+        requested_limit = hard_limit if max_items <= 0 else max_items
+        limit = min(requested_limit, hard_limit, len(ready_items))
+        print(
+            f"File detail: {len(ready_items)} fiche(s) pretes; "
+            f"lot courant limite a {limit}."
+        )
+        processed = 0
+        discarded = 0
+        consecutive_failures = 0
+        blocked = False
+        touched_letters = set()
+        self.session_stats["start_time"] = datetime.now()
+        try:
+            if self.backend == "selenium":
+                self.setup_browser()
+            for item in ready_items[:limit]:
+                url = _ensure_abs_url(str(item.get("url_fiche", "") or ""))
+                tag = str(item.get("letter", "") or "")
+                final_json = self._letter_paths(tag)[0] if tag else ""
+                rows = [self._normalize_row(row) for row in self._load_json_list(final_json)]
+                row_index = next(
+                    (
+                        index
+                        for index, row in enumerate(rows)
+                        if _ensure_abs_url(row.get("url_fiche", "")) == url
+                    ),
+                    None,
+                )
+                if row_index is None:
+                    print(f"  File detail obsolete, entree retiree: {url}")
+                    queue.pop(url, None)
+                    discarded += 1
+                    self._save_detail_queue(queue)
+                    continue
+
+                source = dict(rows[row_index])
+                try:
+                    enriched = self._fetch_full_series_data(source)
+                except NautiljonAccessBlockedError as exc:
+                    blocked = True
+                    item["attempts"] = int(item.get("attempts", 0) or 0) + 1
+                    item["last_error"] = str(exc)[:500]
+                    item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    self._save_detail_queue(queue)
+                    self._record_access_cooldown(str(exc))
+                    print(
+                        "  ACCES BLOQUE pendant l'enrichissement; lot arrete, "
+                        "fiche conservee dans la file."
+                    )
+                    break
+                except Exception as exc:
+                    self.session_stats["errors"] += 1
+                    consecutive_failures += 1
+                    item["attempts"] = int(item.get("attempts", 0) or 0) + 1
+                    item["last_error"] = str(exc)[:500]
+                    item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    self._save_detail_queue(queue)
+                    print(f"  Erreur detail conservee dans la file: {str(exc)[:180]}")
+                    if consecutive_failures >= max(1, _env_int("NAUTILJON_ABORT_AFTER_DETAIL_FAILURES", 2)):
+                        break
+                    continue
+
+                if enriched is None:
+                    rows.pop(row_index)
+                    discarded += 1
+                    print(f"  Fiche exclue apres lecture du type: {source.get('titre', url)}")
+                else:
+                    rows[row_index] = enriched
+                    processed += 1
+                    consecutive_failures = 0
+                    print(f"  Enrichie: {enriched.get('titre', url)}")
+                self.save_letter_files(tag, rows, partial=False)
+                self._refresh_letter_cache_after_enrichment(tag, rows)
+                touched_letters.add(tag)
+                queue.pop(url, None)
+                self._save_detail_queue(queue)
+                if processed + discarded < limit:
+                    self._sleep_detail_delay()
+        finally:
+            self.close_browser()
+            self.session_stats["end_time"] = datetime.now()
+            if self.session_stats["start_time"]:
+                self.session_stats["duration"] = str(
+                    self.session_stats["end_time"] - self.session_stats["start_time"]
+                )
+
+        export_paths: Dict[str, str] = {}
+        if touched_letters:
+            export_paths = self.export_all_data(
+                self.concat_letters(),
+                base_filename="nautiljon_enriched_latest",
+            )
+        remaining = sum(1 for item in queue.values() if item.get("ready"))
+        if blocked:
+            status, reason = "partial", "access_blocked"
+        elif consecutive_failures:
+            status, reason = "partial", "detail_errors"
+        elif remaining:
+            status, reason = "success", "detail_batch_complete_queue_pending"
+        else:
+            status, reason = "success", "detail_queue_complete"
+            self._clear_access_cooldown()
+        result = RunResult(
+            status=status,
+            reason=reason,
+            rows_count=processed,
+            completed_letters=sorted(touched_letters),
+            export_paths=export_paths,
+        )
+        if status == "success":
+            self._write_json_atomic(
+                self._last_success_path("enrich"),
+                {
+                    "status": "success",
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                    "rows_count": processed,
+                    "remaining": remaining,
+                },
+            )
+        self.mark_run_state("enrich", result)
+        print(
+            f"Enrichissement: {processed} mise(s) a jour, {discarded} entree(s) retiree(s), "
+            f"{remaining} restante(s)."
+        )
+        return result
 
     def _read_existing_csv_for_letter(self, tag: str) -> List[Dict[str, str]]:
         _, csv_path, _, _ = self._letter_paths(tag)
@@ -3428,6 +3805,13 @@ class NautiljonScraper:
             f"pause {pacing['detail_batch_pause_min']:g}-{pacing['detail_batch_pause_max']:g}s "
             f"toutes les {pacing['detail_batch_size']} fiches."
         )
+        if self.detail_mode == "deferred":
+            print(
+                "Mode fiches detail: differe (aucune fiche pendant les listings; "
+                "file persistante pour la commande enrich)."
+            )
+        else:
+            print("Mode fiches detail: immediat (compatibilite).")
         print(
             "Recuperation refus temporaire: "
             f"{pacing['block_recovery_attempts']} nouvel essai apres "
@@ -3751,6 +4135,7 @@ def _new_scraper(args: argparse.Namespace) -> NautiljonScraper:
         delay_max=delay_max,
         backend=backend,
         browser_headless=_env_bool("NAUTILJON_BROWSER_HEADLESS", False),
+        detail_mode=os.environ.get("NAUTILJON_DETAIL_MODE", "deferred"),
     )
 
 
@@ -3788,6 +4173,17 @@ def _build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--resume", dest="resume", action="store_true", default=_env_bool("NAUTILJON_RESUME", True))
     diff.add_argument("--no-resume", dest="resume", action="store_false")
     diff.add_argument("--force", action="store_true", default=_env_bool("NAUTILJON_FORCE_SCRAPE", False))
+
+    enrich = sub.add_parser(
+        "enrich",
+        help="Enrichit un petit lot de fiches depuis la file persistante du diff.",
+    )
+    enrich.add_argument(
+        "--max-items",
+        type=int,
+        default=_env_int("NAUTILJON_ENRICH_MAX_ITEMS", 12),
+        help="Nombre maximal de fiches detail demandees pour ce lancement.",
+    )
 
     rss = sub.add_parser("discover-rss", help="Decouvre des candidats de nouvelles fiches depuis les flux RSS.")
     rss.add_argument("--rss-feeds", default=os.environ.get("NAUTILJON_RSS_FEEDS"))
@@ -3893,6 +4289,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             resume=args.resume,
             force=args.force,
         )
+        raise SystemExit(result.exit_code)
+    elif command == "enrich":
+        result = scraper.enrich_detail_queue(max_items=args.max_items)
         raise SystemExit(result.exit_code)
     elif command == "discover-rss":
         scraper.discover_rss_candidates(

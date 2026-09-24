@@ -59,6 +59,11 @@ NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
 NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
 NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
+NAUTILJON_DETAIL_MODE=deferred
+NAUTILJON_QUEUE_RELEASE_REFRESH=false
+NAUTILJON_ENRICH_MAX_ITEMS=12
+NAUTILJON_ENRICH_HARD_LIMIT=12
+NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES=30
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -154,6 +159,11 @@ NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
 NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
 NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
+NAUTILJON_DETAIL_MODE=deferred
+NAUTILJON_QUEUE_RELEASE_REFRESH=false
+NAUTILJON_ENRICH_MAX_ITEMS=12
+NAUTILJON_ENRICH_HARD_LIMIT=12
+NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES=30
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -179,9 +189,17 @@ le mode controle `DROP_MISSING=false` est reste actif.
 Il refuse aussi un lancement global si `NAUTILJON_FORCE_SCRAPE=true` est reste
 actif ; le mode force est reserve a une liste explicite de lettres.
 
-Le succes exige les 27 lettres, aucune erreur de listing ou de fiche et des
-exports finaux valides. Une interruption conserve la page courante et les lettres
-deja terminees dans `output/checkpoints/`.
+Le succes du diff exige les 27 lettres, aucune erreur de listing et des exports
+finaux valides. Les fiches detail sont traitees separement. Une interruption
+conserve la page courante et les lettres deja terminees dans
+`output/checkpoints/`.
+
+Avec `NAUTILJON_DETAIL_MODE=deferred`, le diff n'ouvre aucune fiche detail. Il
+met immediatement a jour les informations visibles dans les listings et conserve
+les anciennes metadonnees detail. Les nouvelles series et les changements reels
+de volumes alimentent `output/state/detail_queue.json`. Le rafraichissement
+periodique des parutions est desactive par defaut avec
+`NAUTILJON_QUEUE_RELEASE_REFRESH=false`.
 
 Le scraper suit le lien de pagination exact fourni par Nautiljon et enregistre
 ce lien dans le checkpoint. Si plus de 15 % des fiches historiques d'une lettre
@@ -221,8 +239,8 @@ valeur exploitable (par exemple un nombre de tomes different) reste detectee.
 Une variation de note est actualisee depuis le listing sans ouvrir la fiche et
 les champs detail ne peuvent pas ecraser les valeurs fiables du listing.
 Les transitions de presentation `0 -> -` et `7 -> 7 (En cours)` sont ignorees.
-Un champ de listing modifie est sauvegarde directement; seul un vrai changement
-du nombre de tomes impose une nouvelle lecture de la fiche.
+Un champ de listing modifie est sauvegarde directement; un vrai changement du
+nombre de tomes ajoute la fiche a la file d'enrichissement.
 Une page en erreur n'est tentee qu'une fois et deux erreurs de fiches consecutives
 interrompent la lettre.
 
@@ -232,11 +250,57 @@ promue dans `output/letters/`. Une lettre expiree ou dont le cache est invalide
 est automatiquement rescrapee. `NAUTILJON_FORCE_SCRAPE=true` ignore ce cache.
 
 Apres l'ajout des colonnes de parutions VF, les caches crees par une ancienne
-version sont volontairement ignores une fois. Un checkpoint de lettre en cours
-reste reprenable et ne complete que les fiches VF `En cours` deja parcourues.
+version sont volontairement ignores une fois. Les checkpoints v2 existants
+restent reprenables lors du passage au mode differe.
 Les reglages de delai, de couverture et de conservation des fiches absentes ne
 rendent plus un checkpoint incompatible. Tout checkpoint réellement inutilisable
 est copie dans `output/checkpoints/archive/` avant son remplacement.
+
+## 5. Enrichissement detail par petits lots
+
+Une fois des lettres finalisees, changez uniquement la commande :
+
+```text
+NAUTILJON_COMMAND=enrich
+NAUTILJON_ENRICH_MAX_ITEMS=12
+NAUTILJON_ENRICH_HARD_LIMIT=12
+NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES=30
+```
+
+Chaque lancement traite au maximum 12 fiches, sauvegarde la lettre et la file
+apres chaque succes, puis s'arrete. Lancez ce job a intervalle espace (par
+exemple toutes les 30 a 60 minutes), jamais en parallele avec `diff`. Une fiche
+bloquee reste dans la file et n'annule pas les listings deja finalises. Une fois
+la file vide, remettez `NAUTILJON_COMMAND=diff` pour le prochain passage mensuel.
+
+Les champs difficiles sont ceux qui exigent une fiche individuelle : titre
+original/origine, genres/themes, scenariste/dessinateur, editeur/prepublication,
+chapitres/statuts, avertissement/disponibilite et dernier/prochain tome VF avec
+couverture. Le type, les volumes, dates, age et note sont deja disponibles dans
+les listings. Exclure quelques champs detail ne reduirait pas les requetes : une
+fois la fiche ouverte, son HTML contient tous ces champs.
+
+## Gluetun NordVPN reserve au scraper
+
+Le fichier `compose.gluetun-nautiljon.example.yml` cree une seconde instance
+Gluetun, sans torrent, avec son proxy HTTP interne. Deployez-la puis utilisez :
+
+```text
+GLUETUN_CONTAINER=Gluetun-Nautiljon_WG
+NAUTILJON_FLARESOLVERR_PROXY_URL=http://gluetun-nautiljon:8888
+```
+
+Le conteneur FlareSolverr doit rester sur `torrent_vpn_share`. Le nouveau
+Gluetun doit aussi rejoindre ce reseau sous l'alias `gluetun-nautiljon`; son port
+8888 n'a pas besoin d'etre publie sur le LAN. Renseignez la cle WireGuard dans
+`NAUTILJON_NORDVPN_WIREGUARD_PRIVATE_KEY`. `SERVER_COUNTRIES` ou
+`SERVER_CITIES` suffit pour une sortie NordVPN partagee. `SERVER_HOSTNAMES` peut
+fixer un serveur precis mais rend le deploiement moins robuste si ce serveur
+disparait de la liste Gluetun.
+
+Ce conteneur reserve isole le scraper du trafic torrent, mais ne transforme pas
+une sortie NordVPN partagee en IP dediee. Une IP NordVPN reellement dediee est
+un produit distinct rattache au compte NordVPN.
 
 ## Import initial
 

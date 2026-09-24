@@ -32,6 +32,8 @@ jobs:
           python scraper_nautiljon.py selftest
           bash -n docker-entrypoint.sh
           docker compose -f portainer-stack.yml config --quiet
+          NAUTILJON_NORDVPN_WIREGUARD_PRIVATE_KEY=dummy \
+            docker compose -f compose.gluetun-nautiljon.example.yml config --quiet
 
       - name: Run tests
         run: python -m unittest -v

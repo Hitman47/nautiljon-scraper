@@ -16,6 +16,7 @@ python scraper_nautiljon.py browser-test
 python scraper_nautiljon.py flaresolverr-test
 python scraper_nautiljon.py diagnose
 python scraper_nautiljon.py diff
+python scraper_nautiljon.py enrich
 python scraper_nautiljon.py discover-rss
 python scraper_nautiljon.py concat
 ```
@@ -40,7 +41,7 @@ output/
 |-- letter-cache/  lettres validees reutilisables pendant 30 jours
 |-- exports/       exports consolides finalises
 |-- discovery/     candidats RSS non exhaustifs
-`-- state/         dernier run et dernier succes complet
+`-- state/         dernier run, succes complet et file detail persistante
 ```
 
 Le scraper reutilise le conteneur `flaresolverr` du stack de recherche. Gluetun
@@ -78,6 +79,11 @@ NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
 NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
 NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
+NAUTILJON_DETAIL_MODE=deferred
+NAUTILJON_QUEUE_RELEASE_REFRESH=false
+NAUTILJON_ENRICH_MAX_ITEMS=12
+NAUTILJON_ENRICH_HARD_LIMIT=12
+NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES=30
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -129,6 +135,17 @@ NAUTILJON_SHM_SIZE=256m
   comparee normalement, notamment pour detecter un changement du nombre de tomes.
 - Une variation de note est copiee directement depuis le listing sans recharger
   la fiche. Les valeurs du listing ne sont jamais ecrasees par les champs detail.
+- Avec `NAUTILJON_DETAIL_MODE=deferred`, le diff termine les listings sans ouvrir
+  de fiche. Les nouvelles series et les changements de volumes sont places dans
+  `output/state/detail_queue.json`. Les champs detail deja connus sont conserves.
+- `NAUTILJON_COMMAND=enrich` traite au plus `NAUTILJON_ENRICH_MAX_ITEMS` fiches,
+  sauvegarde chaque succes et laisse toute fiche interrompue dans la file. Il
+  produit aussi l'export stable `nautiljon_enriched_latest.*`.
+- La limite dure de 12 fiches et l'intervalle minimal de 30 minutes empechent
+  deux lots rapproches de reproduire la rafale observee avant les blocages.
+- `NAUTILJON_QUEUE_RELEASE_REFRESH=false` desactive les visites periodiques des
+  anciennes fiches. Le mettre a `true` reactive le rafraichissement des prochaines
+  parutions VF selon `NAUTILJON_REFRESH_STALE_DAYS`.
 - Les changements de presentation tels que `0 -> -` ou `7 -> 7 (En cours)` ne
   provoquent plus de visite. Les autres champs de listing sont actualises directement.
 - Une page inaccessible n'est pas rechargee en boucle. Deux echecs de fiches
@@ -137,7 +154,8 @@ NAUTILJON_SHM_SIZE=256m
 - Les CSV utilisent `;` et `utf-8-sig`.
 - Seuls `yaoi` et `yuri` sont exclus.
 - Les ecritures finales utilisent des fichiers temporaires puis un remplacement.
-- Une erreur de listing ou de detail ne remplace pas le fichier final de la lettre.
+- Une erreur de listing ne remplace pas le fichier final de la lettre. Une erreur
+  d'enrichissement ne revient pas sur le listing finalise et conserve la fiche en file.
 - Le lien de pagination exact est suivi et conserve dans le checkpoint.
 - Une progression reste reprenable si le delai de rafraichissement, le seuil de
   couverture ou le mode controle/final change. Un checkpoint inutilisable est

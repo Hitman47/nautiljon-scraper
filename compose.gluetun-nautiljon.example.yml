@@ -1,0 +1,33 @@
+services:
+  gluetun-nautiljon:
+    image: qmcgaw/gluetun:latest
+    container_name: Gluetun-Nautiljon_WG
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: nordvpn
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: "${NAUTILJON_NORDVPN_WIREGUARD_PRIVATE_KEY}"
+      SERVER_COUNTRIES: "${NAUTILJON_NORDVPN_COUNTRIES:-France}"
+      SERVER_CITIES: "${NAUTILJON_NORDVPN_CITIES:-}"
+      SERVER_HOSTNAMES: "${NAUTILJON_NORDVPN_HOSTNAMES:-}"
+      HTTPPROXY: "on"
+      HTTPPROXY_STEALTH: "on"
+      HTTPPROXY_LOG: "off"
+      TZ: "${TZ:-Europe/Paris}"
+    volumes:
+      - "${APPDATA_ROOT:-/media/nvme0n1p1/AppData}/Gluetun-Nautiljon:/gluetun"
+    networks:
+      torrent_vpn_share:
+        aliases:
+          - gluetun-nautiljon
+    cpus: 0.25
+    mem_limit: 256m
+    memswap_limit: 256m
+    restart: unless-stopped
+
+networks:
+  torrent_vpn_share:
+    external: true

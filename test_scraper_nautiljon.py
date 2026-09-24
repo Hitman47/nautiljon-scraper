@@ -1509,6 +1509,133 @@ class DiffStateTests(unittest.TestCase):
             self.assertTrue(report["ready_for_diff"])
             self.assertFalse(os.path.exists(os.path.join(out_dir, "exports")))
 
+    def test_deferred_diff_finishes_listing_without_opening_details(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(
+                out_dir=out_dir,
+                delay=0,
+                backend="flaresolverr",
+                detail_mode="deferred",
+            )
+            row = make_row("A")
+
+            def fetch(this, letter, page_num):
+                this._flaresolverr_page_has_next[(this._letter_tag(letter), page_num)] = False
+                return "https://example.test/a", [dict(row)]
+
+            scraper.fetch_listing_page = types.MethodType(fetch, scraper)
+            scraper._fetch_full_series_data = mock.Mock(
+                side_effect=AssertionError("deferred diff must not fetch details")
+            )
+
+            result = scraper.scrape_letter_diff("a", drop_missing=True, resume=False)
+
+            self.assertEqual(len(result), 1)
+            scraper._fetch_full_series_data.assert_not_called()
+            queue = scraper._load_detail_queue()
+            self.assertEqual(len(queue), 1)
+            item = next(iter(queue.values()))
+            self.assertTrue(item["ready"])
+            self.assertEqual(item["reasons"], ["new_series"])
+            self.assertEqual(result[0]["titre_original"], "N/A")
+
+    def test_deferred_volume_change_preserves_details_and_queues_refresh(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(
+                out_dir=out_dir,
+                delay=0,
+                backend="flaresolverr",
+                detail_mode="deferred",
+            )
+            existing = scraper._normalize_row(make_row("F"))
+            existing["nb_vol_vf_liste"] = "4"
+            existing["genres"] = "Aventure"
+            scraper.save_letter_files("F", [existing], partial=False)
+            current = dict(existing)
+            current["nb_vol_vf_liste"] = "5"
+
+            def fetch(this, letter, page_num):
+                this._flaresolverr_page_has_next[(this._letter_tag(letter), page_num)] = False
+                return "https://example.test/f", [current]
+
+            scraper.fetch_listing_page = types.MethodType(fetch, scraper)
+            result = scraper.scrape_letter_diff("f", drop_missing=True, resume=False)
+
+            self.assertEqual(result[0]["nb_vol_vf_liste"], "5")
+            self.assertEqual(result[0]["genres"], "Aventure")
+            item = next(iter(scraper._load_detail_queue().values()))
+            self.assertEqual(item["reasons"], ["volume_changed"])
+            self.assertTrue(item["ready"])
+
+    def test_enrich_queue_updates_letter_and_removes_successful_item(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http")
+            row = scraper._normalize_row(make_row("A"))
+            scraper.save_letter_files("A", [row], partial=False)
+            queue = {}
+            scraper._queue_detail(queue, "A", row, "new_series", ready=True)
+            scraper._save_detail_queue(queue)
+
+            enriched = dict(row)
+            enriched["genres"] = "Action"
+            scraper._fetch_full_series_data = mock.Mock(return_value=enriched)
+
+            result = scraper.enrich_detail_queue(max_items=1)
+
+            self.assertEqual(result.status, "success")
+            self.assertEqual(result.reason, "detail_queue_complete")
+            self.assertEqual(scraper._load_detail_queue(), {})
+            saved = scraper._load_json_list(scraper._letter_paths("A")[0])
+            self.assertEqual(saved[0]["genres"], "Action")
+            self.assertTrue(os.path.isfile(result.export_paths["json_path"]))
+
+    def test_enrich_block_keeps_item_in_queue(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http")
+            scraper._verified_public_ips = ("198.51.100.10", "198.51.100.10")
+            row = scraper._normalize_row(make_row("A"))
+            scraper.save_letter_files("A", [row], partial=False)
+            queue = {}
+            scraper._queue_detail(queue, "A", row, "new_series", ready=True)
+            scraper._save_detail_queue(queue)
+            scraper._fetch_full_series_data = mock.Mock(
+                side_effect=NautiljonAccessBlockedError("refus confirme")
+            )
+
+            result = scraper.enrich_detail_queue(max_items=1)
+
+            self.assertEqual(result.status, "partial")
+            self.assertEqual(result.reason, "access_blocked")
+            kept = scraper._load_detail_queue()
+            self.assertIn(row["url_fiche"], kept)
+            self.assertEqual(kept[row["url_fiche"]]["attempts"], 1)
+
+    def test_enrich_respects_minimum_interval_without_fetching(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http")
+            row = scraper._normalize_row(make_row("A"))
+            scraper.save_letter_files("A", [row], partial=False)
+            queue = {}
+            scraper._queue_detail(queue, "A", row, "new_series", ready=True)
+            scraper._save_detail_queue(queue)
+            scraper._write_json_atomic(
+                scraper._last_success_path("enrich"),
+                {
+                    "status": "success",
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                },
+            )
+            scraper._fetch_full_series_data = mock.Mock(
+                side_effect=AssertionError("minimum interval must skip network access")
+            )
+
+            result = scraper.enrich_detail_queue(max_items=12)
+
+            self.assertEqual(result.status, "skipped")
+            self.assertEqual(result.reason, "enrich_interval_active")
+            scraper._fetch_full_series_data.assert_not_called()
+            self.assertEqual(len(scraper._load_detail_queue()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
