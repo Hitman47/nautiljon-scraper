@@ -250,6 +250,14 @@ class NautiljonScraper:
             self.detail_batch_pause_min,
             _env_float("NAUTILJON_DETAIL_BATCH_PAUSE_MAX", 75.0 if conservative_defaults else 0.0),
         )
+        self.detail_window_size = max(
+            0,
+            _env_int("NAUTILJON_DETAIL_WINDOW_SIZE", 5 if conservative_defaults else 0),
+        )
+        self.detail_window_seconds = max(
+            0.0,
+            _env_float("NAUTILJON_DETAIL_WINDOW_SECONDS", 900.0 if conservative_defaults else 0.0),
+        )
         self.letter_pause_min = max(
             0.0,
             _env_float("NAUTILJON_LETTER_PAUSE_MIN", 20.0 if conservative_defaults else 0.0),
@@ -296,6 +304,8 @@ class NautiljonScraper:
                 "detail_batch_size": self.detail_batch_size,
                 "detail_batch_pause_min": self.detail_batch_pause_min,
                 "detail_batch_pause_max": self.detail_batch_pause_max,
+                "detail_window_size": self.detail_window_size,
+                "detail_window_seconds": self.detail_window_seconds,
                 "letter_pause_min": self.letter_pause_min,
                 "letter_pause_max": self.letter_pause_max,
                 "failure_pause_min": self.failure_pause_min,
@@ -340,6 +350,7 @@ class NautiljonScraper:
         return delay
 
     def _pace_detail_request(self) -> None:
+        self._pace_detail_window()
         if (
             self.detail_batch_size > 0
             and self._detail_request_count > 0
@@ -353,6 +364,60 @@ class NautiljonScraper:
             )
         self._detail_request_count += 1
         self.session_stats["detail_requests"] = self._detail_request_count
+
+    def _pace_detail_window(self) -> None:
+        """Apply a restart-safe rolling limit to expensive browser detail pages."""
+        if self.detail_window_size <= 0 or self.detail_window_seconds <= 0:
+            return
+
+        path = self._state_path("detail_rate_limit")
+        payload = self._load_json_dict(path)
+        now = time.time()
+        raw_requests = payload.get("requests", []) if payload else []
+        requests_in_window: List[float] = []
+        if isinstance(raw_requests, list):
+            for value in raw_requests:
+                try:
+                    timestamp = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= now - timestamp < self.detail_window_seconds:
+                    requests_in_window.append(timestamp)
+
+        requests_in_window.sort()
+        if len(requests_in_window) >= self.detail_window_size:
+            wait_seconds = max(
+                0.0,
+                requests_in_window[-self.detail_window_size]
+                + self.detail_window_seconds
+                - now,
+            )
+            if wait_seconds > 0:
+                self._sleep_for(
+                    wait_seconds,
+                    (
+                        f"limite glissante: {self.detail_window_size} fiches detail "
+                        f"par {self.detail_window_seconds / 60:g} min"
+                    ),
+                    announce=True,
+                )
+                now = time.time()
+                requests_in_window = [
+                    timestamp
+                    for timestamp in requests_in_window
+                    if 0 <= now - timestamp < self.detail_window_seconds
+                ]
+
+        requests_in_window.append(now)
+        self._write_json_atomic(
+            path,
+            {
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "window_size": self.detail_window_size,
+                "window_seconds": self.detail_window_seconds,
+                "requests": requests_in_window,
+            },
+        )
 
     @staticmethod
     def _is_nautiljon_url(url: str) -> bool:
@@ -2781,9 +2846,39 @@ class NautiljonScraper:
             # rafales de consultations des fiches detail.
             if _is_na(observed):
                 continue
-            if previous != observed:
+            if self._listing_comparison_value(field, previous) != self._listing_comparison_value(
+                field,
+                observed,
+            ):
                 reasons[field] = (previous, observed)
         return reasons
+
+    @staticmethod
+    def _listing_comparison_value(field: str, value: str) -> str:
+        cleaned = _clean_spaces(value)
+        normalized = _norm(cleaned)
+        if field in {"date_vf_liste", "date_vo_liste"} and normalized in {
+            "0",
+            "-",
+            "–",
+            "—",
+            "n/a",
+            "na",
+        }:
+            return ""
+        if field in {"nb_vol_vo_liste", "nb_vol_vf_liste"}:
+            match = re.search(r"\d+", cleaned)
+            if match:
+                return str(int(match.group(0)))
+        return normalized
+
+    def _series_change_requires_detail(
+        self,
+        existing: Dict[str, str],
+        current: Dict[str, str],
+    ) -> bool:
+        reasons = self._series_change_reasons(existing, current)
+        return any(field in {"nb_vol_vo_liste", "nb_vol_vf_liste"} for field in reasons)
 
     def _series_changed_on_list(self, existing: Dict[str, str], current: Dict[str, str]) -> bool:
         return bool(self._series_change_reasons(existing, current))
@@ -3053,7 +3148,7 @@ class NautiljonScraper:
                         needs_detail = True
                     elif self._series_changed_on_list(existing, series):
                         action = "changed"
-                        needs_detail = True
+                        needs_detail = self._series_change_requires_detail(existing, series)
                     elif self._series_needs_release_refresh(existing, refresh_stale_days):
                         action = "parutions"
                         needs_detail = True
@@ -3106,7 +3201,19 @@ class NautiljonScraper:
                             continue
                     else:
                         updated_rows.append(self._merge_observed_list_fields(existing, series))
-                        counters["reused"] += 1
+                        if action == "changed":
+                            reasons = self._series_change_reasons(existing, series)
+                            summary = ", ".join(
+                                f"{field}: {before} -> {after}"
+                                for field, (before, after) in reasons.items()
+                            )
+                            print(
+                                f"    MAJ listing: {(series.get('titre') or 'N/A')[:60]}"
+                                + (f" [{summary[:180]}]" if summary else "")
+                            )
+                            counters["changed"] += 1
+                        else:
+                            counters["reused"] += 1
 
                     since_flush += 1
                     if flush_every and since_flush >= flush_every:
@@ -3303,7 +3410,9 @@ class NautiljonScraper:
             "Cadence fiches detail: "
             f"{pacing['detail_delay_min']:g}-{pacing['detail_delay_max']:g}s apres chaque fiche, "
             f"pause {pacing['detail_batch_pause_min']:g}-{pacing['detail_batch_pause_max']:g}s "
-            f"toutes les {pacing['detail_batch_size']} fiches."
+            f"toutes les {pacing['detail_batch_size']} fiches, "
+            f"limite persistante {pacing['detail_window_size']} fiches par "
+            f"{pacing['detail_window_seconds'] / 60:g} min."
         )
         cooldown = self._resolve_access_cooldown()
         if cooldown:

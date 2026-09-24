@@ -59,6 +59,8 @@ NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
 NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
 NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
+NAUTILJON_DETAIL_WINDOW_SIZE=5
+NAUTILJON_DETAIL_WINDOW_SECONDS=900
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -151,6 +153,8 @@ NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
 NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
 NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
+NAUTILJON_DETAIL_WINDOW_SIZE=5
+NAUTILJON_DETAIL_WINDOW_SECONDS=900
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -205,11 +209,17 @@ La cadence par defaut reste prudente sans pauses disproportionnees. Les
 navigations sont sequentielles, 4 a 7 secondes les separent, une pause de 45 a
 90 secondes intervient toutes les 80 requetes et 20 a 45 secondes separent les
 lettres. Les fiches detail attendent 10 a 15 secondes apres chaque lecture et
-font une pause de 45 a 75 secondes toutes les 15 fiches. Une valeur `N/A` issue
+font une pause de 45 a 75 secondes toutes les 15 fiches. Elles sont en plus
+limitees a 5 visites par fenetre glissante de 15 minutes; cette fenetre est
+persistee dans `output/state/detail_rate_limit.json` et survit aux redemarrages.
+Une valeur `N/A` issue
 du listing n'est jamais consideree comme un changement, tandis qu'une nouvelle
 valeur exploitable (par exemple un nombre de tomes different) reste detectee.
 Une variation de note est actualisee depuis le listing sans ouvrir la fiche et
 les champs detail ne peuvent pas ecraser les valeurs fiables du listing.
+Les transitions de presentation `0 -> -` et `7 -> 7 (En cours)` sont ignorees.
+Un champ de listing modifie est sauvegarde directement; seul un vrai changement
+du nombre de tomes impose une nouvelle lecture de la fiche.
 Une page en erreur n'est tentee qu'une fois et deux erreurs de fiches consecutives
 interrompent la lettre.
 

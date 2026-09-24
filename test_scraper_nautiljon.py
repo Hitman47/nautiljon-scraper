@@ -42,6 +42,8 @@ class DiffStateTests(unittest.TestCase):
             "NAUTILJON_DETAIL_BATCH_SIZE",
             "NAUTILJON_DETAIL_BATCH_PAUSE_MIN",
             "NAUTILJON_DETAIL_BATCH_PAUSE_MAX",
+            "NAUTILJON_DETAIL_WINDOW_SIZE",
+            "NAUTILJON_DETAIL_WINDOW_SECONDS",
             "NAUTILJON_LETTER_PAUSE_MIN",
             "NAUTILJON_LETTER_PAUSE_MAX",
             "NAUTILJON_FAILURE_PAUSE_MIN",
@@ -56,6 +58,7 @@ class DiffStateTests(unittest.TestCase):
         self.assertEqual((scraper.detail_delay_min, scraper.detail_delay_max), (10.0, 15.0))
         self.assertEqual(scraper.detail_batch_size, 15)
         self.assertEqual((scraper.detail_batch_pause_min, scraper.detail_batch_pause_max), (45.0, 75.0))
+        self.assertEqual((scraper.detail_window_size, scraper.detail_window_seconds), (5, 900.0))
         self.assertEqual((scraper.letter_pause_min, scraper.letter_pause_max), (20.0, 45.0))
         self.assertEqual((scraper.failure_pause_min, scraper.failure_pause_max), (120.0, 300.0))
 
@@ -99,6 +102,26 @@ class DiffStateTests(unittest.TestCase):
         sleep.assert_called_once_with(45.0)
         self.assertEqual(scraper.session_stats["detail_requests"], 16)
 
+    def test_detail_rolling_limit_survives_process_restarts(self):
+        env = {
+            "NAUTILJON_DETAIL_WINDOW_SIZE": "2",
+            "NAUTILJON_DETAIL_WINDOW_SECONDS": "100",
+            "NAUTILJON_DETAIL_BATCH_SIZE": "0",
+        }
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.dict(os.environ, env), mock.patch(
+            "scraper_nautiljon.time.time",
+            side_effect=[1000.0, 1001.0, 1002.0, 1100.0],
+        ), mock.patch("scraper_nautiljon.time.sleep") as sleep:
+            first = NautiljonScraper(out_dir=out_dir, delay=1, backend="http")
+            first._pace_detail_request()
+            first._pace_detail_request()
+
+            restarted = NautiljonScraper(out_dir=out_dir, delay=1, backend="http")
+            restarted._pace_detail_request()
+
+        sleep.assert_called_once_with(98.0)
+        self.assertEqual(restarted.session_stats["detail_requests"], 1)
+
     def test_missing_listing_values_do_not_trigger_detail_refresh(self):
         scraper = self.make_scraper("unused")
         existing = {
@@ -130,6 +153,27 @@ class DiffStateTests(unittest.TestCase):
             scraper._series_change_reasons(existing, current),
             {"nb_vol_vf_liste": ("20", "21")},
         )
+        self.assertTrue(scraper._series_change_requires_detail(existing, current))
+
+    def test_listing_format_changes_do_not_trigger_detail_refresh(self):
+        scraper = self.make_scraper("unused")
+        existing = make_row("F")
+        existing.update({"nb_vol_vo_liste": "7", "date_vo_liste": "0"})
+        current = dict(existing)
+        current.update({"nb_vol_vo_liste": "7 (En cours)", "date_vo_liste": "-"})
+
+        self.assertFalse(scraper._series_changed_on_list(existing, current))
+        self.assertFalse(scraper._series_change_requires_detail(existing, current))
+
+    def test_non_volume_listing_change_is_saved_without_detail_refresh(self):
+        scraper = self.make_scraper("unused")
+        existing = make_row("F")
+        existing["titre_alternatif"] = "Ancien titre"
+        current = dict(existing)
+        current["titre_alternatif"] = "Nouveau titre"
+
+        self.assertTrue(scraper._series_changed_on_list(existing, current))
+        self.assertFalse(scraper._series_change_requires_detail(existing, current))
 
     def test_note_only_change_is_merged_without_detail_refresh(self):
         scraper = self.make_scraper("unused")

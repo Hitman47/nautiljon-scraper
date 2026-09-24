@@ -78,6 +78,8 @@ NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
 NAUTILJON_DETAIL_BATCH_PAUSE_MIN=45
 NAUTILJON_DETAIL_BATCH_PAUSE_MAX=75
+NAUTILJON_DETAIL_WINDOW_SIZE=5
+NAUTILJON_DETAIL_WINDOW_SECONDS=900
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -117,12 +119,15 @@ NAUTILJON_SHM_SIZE=256m
 - Les acces Nautiljon sont strictement sequentiels : 4 a 7 secondes entre deux
   navigations, 45 a 90 secondes toutes les 80 requetes et 20 a 45 secondes entre lettres.
   Les fiches detail, plus sensibles, attendent 10 a 15 secondes et font une pause
-  de 45 a 75 secondes toutes les 15 fiches.
+  de 45 a 75 secondes toutes les 15 fiches. Une limite glissante, conservee sur
+  disque entre les redemarrages, autorise au plus 5 fiches toutes les 15 minutes.
 - Une valeur absente (`N/A`) dans un listing ne remplace jamais une valeur connue
   et ne declenche pas de consultation de fiche. Une vraie nouvelle valeur reste
   comparee normalement, notamment pour detecter un changement du nombre de tomes.
 - Une variation de note est copiee directement depuis le listing sans recharger
   la fiche. Les valeurs du listing ne sont jamais ecrasees par les champs detail.
+- Les changements de presentation tels que `0 -> -` ou `7 -> 7 (En cours)` ne
+  provoquent plus de visite. Les autres champs de listing sont actualises directement.
 - Une page inaccessible n'est pas rechargee en boucle. Deux echecs de fiches
   consecutifs interrompent la lettre en conservant son checkpoint.
 - Selenium reste disponible avec `browser-test` pour le diagnostic.
