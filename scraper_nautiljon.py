@@ -3431,6 +3431,9 @@ class NautiljonScraper:
         accessible_listing_pages = 0
         successful_listing_pages = 0
         listing_failed = False
+        pagination_stalled = False
+        pagination_probe = False
+        pagination_debug_saved = False
         access_blocked = False
         detail_abort = False
         consecutive_detail_failures = 0
@@ -3484,6 +3487,7 @@ class NautiljonScraper:
                 for url in seen_urls:
                     existing_by_url.pop(url, None)
                 page_num = int(checkpoint.get("page_num", 0) or 0)
+                pagination_probe = bool(checkpoint.get("pagination_probe", False))
                 accessible_listing_pages = int(checkpoint.get("accessible_listing_pages", 0) or 0)
                 successful_listing_pages = int(checkpoint.get("successful_listing_pages", 0) or 0)
                 next_listing_url = str(checkpoint.get("next_listing_url", "") or "")
@@ -3559,6 +3563,7 @@ class NautiljonScraper:
                 "successful_listing_pages": successful_listing_pages,
                 "counters": counters,
                 "listing_complete": listing_complete,
+                "pagination_probe": pagination_probe,
             }
             if self.backend == "flaresolverr":
                 payload["next_listing_url"] = self._flaresolverr_listing_urls.get((tag, next_page), "")
@@ -3642,6 +3647,16 @@ class NautiljonScraper:
                     break
                 self._sleep_failure_pause()
                 continue
+
+            if pagination_probe:
+                candidate_urls = {_ensure_abs_url(row.get("url_fiche", "")) for row in page_series if row.get("url_fiche")}
+                if not candidate_urls or not (candidate_urls - seen_urls):
+                    listing_failed = pagination_stalled = True
+                    print("  Pagination bloquee: la page de verification est vide ou repete des fiches deja vues; aucune fin validee.")
+                    self._save_flaresolverr_debug(f"pagination_stalled_{tag}", self._last_flaresolverr_html, page_url)
+                    save_checkpoint(page_num)
+                    break
+                pagination_probe = False
 
             if not page_series:
                 if self.backend == "flaresolverr":
@@ -3801,17 +3816,23 @@ class NautiljonScraper:
                     break
                 if self.backend == "flaresolverr" and not self._flaresolverr_listing_has_next(letter, page_num):
                     if len(page_series) >= 50:
-                        listing_failed = True
-                        print(
-                            f"  Pagination incoherente: page {page_num + 1} pleine "
-                            "mais aucun lien vers la page suivante."
-                        )
-                        save_checkpoint(page_num)
+                        # One paced next-offset check, not an endless replay of
+                        # this full page. A repeated/empty probe is never success.
+                        if not pagination_debug_saved:
+                            self._save_flaresolverr_debug(f"pagination_missing_{tag}", self._last_flaresolverr_html, page_url)
+                            pagination_debug_saved = True
+                        candidate = self._url_with_dbt(page_url, page_num + 1)
+                        probe_html = self._last_flaresolverr_html + '<a href="' + html_lib.escape(candidate, quote=True) + '">probe</a>'
+                        next_url = self._extract_next_listing_url(probe_html, page_url, page_num)
+                        self._set_flaresolverr_listing_url(letter, page_num + 1, next_url or candidate)
+                        pagination_probe = True
+                        print(f"  Lien suivant absent: verification cadencee de la page {page_num + 2}.")
+                        save_checkpoint(page_num + 1)
                     else:
                         print(f"  Fin de pagination explicite apres la page {page_num + 1}.")
                         listing_complete = True
                         save_checkpoint(page_num + 1)
-                    break
+                        break
 
             if not page_series:
                 save_checkpoint(page_num + 1)
@@ -3888,6 +3909,7 @@ class NautiljonScraper:
                 key=lambda row: _norm(row.get("titre", "")),
             )
             counters["listing_failed"] = listing_failed
+            counters["pagination_stalled"] = pagination_stalled
             counters["access_blocked"] = access_blocked
             counters["coverage_failed"] = coverage_failed
             counters["missing_count"] = missing_count
@@ -4351,6 +4373,7 @@ class NautiljonScraper:
         incomplete_reason = ""
         consecutive_listing_failures = 0
         deferred_coverage = []
+        stalled_letters = []
         try:
             if self.backend == "selenium":
                 self.setup_browser()
@@ -4433,6 +4456,13 @@ class NautiljonScraper:
                         "Les donnees et le checkpoint sont conserves."
                     )
                     break
+                if diff_stats.get("pagination_stalled"):
+                    stalled_letters.append(label)
+                    consecutive_listing_failures = 0
+                    print(f"Lettre {label} suspendue: pagination sans progression; poursuite des autres lettres.")
+                    if index < len(letters_to_scrape):
+                        self._sleep_letter_pause()
+                    continue
                 if diff_stats.get("listing_failed"):
                     incomplete_reason = "listing_inaccessible"
                     consecutive_listing_failures += 1
@@ -4481,7 +4511,7 @@ class NautiljonScraper:
         all_requested_completed = set(completed_letters) == set(requested_labels)
         export_paths: Dict[str, str] = {}
         status = "failed"
-        reason = incomplete_reason or ("coverage_incomplete" if deferred_coverage else "incomplete_run")
+        reason = incomplete_reason or ("pagination_stalled" if stalled_letters else "coverage_incomplete" if deferred_coverage else "incomplete_run")
 
         if all_requested_completed and full_catalog_requested and not fatal_error and self.session_stats.get("errors", 0) == 0:
             if not self._validate_final_letter_files(letters_to_scrape):

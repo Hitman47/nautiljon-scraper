@@ -26,6 +26,63 @@ def make_row(label: str):
 
 
 class DiffStateTests(unittest.TestCase):
+    def test_full_page_without_next_link_probes_next_offset(self):
+        for repeated in (False, True):
+            with self.subTest(repeated=repeated), tempfile.TemporaryDirectory() as out_dir:
+                scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr", detail_mode="deferred")
+                rows = [dict(make_row("S"), titre=f"Series {i}", url_fiche=f"https://www.nautiljon.com/mangas/s{i}.html") for i in range(50)]
+                tail = [dict(make_row("S"), titre="Series tail")]
+                scraper._last_flaresolverr_html = '<input name="st" value="token">'
+                def fetch(letter, page):
+                    if page == 0:
+                        return "https://www.nautiljon.com/mangas/?q=s&st=token", rows
+                    self.assertEqual(page, 1)
+                    self.assertIn("dbt=50", scraper._flaresolverr_listing_urls[("S", 1)])
+                    self.assertIn("st=token", scraper._flaresolverr_listing_urls[("S", 1)])
+                    return "https://www.nautiljon.com/mangas/?q=s&st=token&dbt=50", rows if repeated else tail
+                scraper.fetch_listing_page = mock.Mock(side_effect=fetch)
+                scraper._sleep_delay = mock.Mock()
+                scraper.scrape_letter_diff("s", drop_missing=True)
+                self.assertEqual(scraper.fetch_listing_page.call_count, 2)
+                stats = scraper.session_stats["diff_by_letter"]["S"]
+                self.assertEqual(bool(stats.get("pagination_stalled")), repeated)
+                self.assertEqual(stats["listing_failed"], repeated)
+                if repeated:
+                    checkpoint = scraper._load_json_dict(scraper._letter_checkpoint_path("S"))
+                    self.assertEqual(checkpoint["page_num"], 1)
+                    self.assertTrue(checkpoint["pagination_probe"])
+                    self.assertFalse(checkpoint["listing_complete"])
+                else:
+                    self.assertFalse(os.path.exists(scraper._letter_checkpoint_path("S")))
+
+    def test_resumed_empty_probe_is_not_a_successful_end(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr", detail_mode="deferred")
+            scraper.save_letter_files("S", [make_row("S")], partial=True)
+            scraper._write_json_atomic(scraper._letter_checkpoint_path("S"), {
+                "settings": {"checkpoint_version": LETTER_CHECKPOINT_VERSION, "letter": "s"},
+                "page_num": 50, "pagination_probe": True, "listing_complete": False,
+                "next_listing_url": "https://www.nautiljon.com/mangas/?q=s&st=token&dbt=2500"})
+            scraper.fetch_listing_page = mock.Mock(return_value=("https://www.nautiljon.com/mangas/?q=s&dbt=2500", []))
+            scraper.scrape_letter_diff("s")
+            scraper.fetch_listing_page.assert_called_once_with("s", 50)
+            self.assertTrue(scraper.session_stats["diff_by_letter"]["S"]["pagination_stalled"])
+            self.assertTrue(os.path.exists(scraper._letter_checkpoint_path("S")))
+
+    def test_stalled_pagination_continues_letters_but_monthly_does_not_retry(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http", detail_mode="deferred")
+            calls = []
+            self.install_fake_letter_scrape(scraper, {"S": "pagination_stalled"}, calls)
+            scraper._sleep_letter_pause = mock.Mock()
+            scraper._monthly_wait = mock.Mock()
+            result = scraper.run_monthly(letters=["s", "t"], min_days_between_diff_exports=0)
+            self.assertEqual(calls, ["S", "T"])
+            self.assertEqual(result.reason, "monthly_diff_pagination_stalled")
+            self.assertEqual(result.completed_letters, ["T"])
+            self.assertFalse(result.export_paths)
+            scraper._monthly_wait.assert_not_called()
+
     def test_coverage_failure_continues_other_letters_and_never_exports(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = self.make_scraper(out_dir)
@@ -645,7 +702,8 @@ class DiffStateTests(unittest.TestCase):
                 calls.append(label)
             outcome = outcomes.get(label, "success")
             flags = {
-                "listing_failed": outcome == "listing_failed",
+                "listing_failed": outcome in {"listing_failed", "pagination_stalled"},
+                "pagination_stalled": outcome == "pagination_stalled",
                 "access_blocked": outcome == "access_blocked",
                 "detail_failed": outcome == "detail_failed",
                 "limited": outcome == "limited",
