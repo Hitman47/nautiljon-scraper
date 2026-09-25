@@ -2121,13 +2121,8 @@ class NautiljonScraper:
             "session": self.setup_flaresolverr(),
             "maxTimeout": timeout_ms,
         }
-        if (urlsplit(target_url).hostname or "").endswith("nautiljon.com"):
-            payload["cookies"] = [{
-                "name": "cookieconsent_status",
-                "value": "dismiss",
-                "domain": ".nautiljon.com",
-                "path": "/",
-            }]
+        # Let the persistent browser session manage cookies. Sending cookies here
+        # makes FlareSolverr load the URL twice, bypassing our pacing on the reload.
         data = self._flaresolverr_post(payload)
         solution = data.get("solution")
         if not isinstance(solution, dict):

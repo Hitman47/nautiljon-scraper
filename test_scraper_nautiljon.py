@@ -1400,7 +1400,9 @@ class DiffStateTests(unittest.TestCase):
         self.assertIn("OK", second)
         self.assertEqual([call["cmd"] for call in calls], ["sessions.create", "request.get", "request.get", "sessions.destroy"])
         self.assertEqual(calls[1]["session"], calls[2]["session"])
-        self.assertIn("cookies", calls[1])
+        # Cookie injection causes an extra, unpaced navigation in FlareSolverr.
+        self.assertNotIn("cookies", calls[1])
+        self.assertNotIn("cookies", calls[2])
 
     def test_flaresolverr_session_waits_for_service_startup(self):
         scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
