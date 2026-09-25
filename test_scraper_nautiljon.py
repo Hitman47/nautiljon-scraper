@@ -26,6 +26,61 @@ def make_row(label: str):
 
 
 class DiffStateTests(unittest.TestCase):
+    def test_coverage_failure_continues_other_letters_and_never_exports(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            calls = []
+            for letter in scraper.get_all_letters():
+                self.seed_letter(scraper, letter)
+            self.install_fake_letter_scrape(scraper, {"Q": "coverage_failed"}, calls)
+            scraper._sleep_letter_pause = mock.Mock()
+            scraper.export_all_data = mock.Mock(side_effect=AssertionError("premature export"))
+            result = scraper.scrape_all_letters_diff(min_days_between_diff_exports=0)
+            self.assertIn("R", calls)
+            self.assertIn("#", calls)
+            self.assertNotIn("Q", result.completed_letters)
+            self.assertEqual(len(result.completed_letters), 26)
+            self.assertEqual(result.reason, "coverage_incomplete")
+            self.assertIsNone(scraper._load_last_success("diff"))
+            scraper.export_all_data.assert_not_called()
+
+    def test_coverage_deadline_survives_restart_and_skips_only_pending_letter(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            checkpoint = {"listing_complete": True, "coverage_pending": True,
+                          "updated_at": (datetime.now() - timedelta(minutes=40)).isoformat()}
+            scraper._write_json_atomic(scraper._letter_checkpoint_path("Q"), checkpoint)
+            restarted = self.make_scraper(out_dir)
+            calls = []
+            self.install_fake_letter_scrape(restarted, {}, calls)
+            restarted._sleep_letter_pause = mock.Mock()
+            with mock.patch.dict(os.environ, {"NAUTILJON_COVERAGE_CONFIRMATION_MIN_SECONDS": "3600"}):
+                remaining = restarted._coverage_retry_remaining("q")
+                self.assertTrue(1190 < remaining <= 1200)
+                result = restarted.scrape_all_letters_diff(letters=["q", "r"], min_days_between_diff_exports=0)
+                self.assertEqual(calls, ["R"])
+                self.assertEqual(result.reason, "coverage_incomplete")
+                self.assertEqual(restarted._load_json_dict(restarted._letter_checkpoint_path("Q")), checkpoint)
+                checkpoint["updated_at"] = (datetime.now() - timedelta(hours=2)).isoformat()
+                restarted._write_json_atomic(restarted._letter_checkpoint_path("Q"), checkpoint)
+                self.assertEqual(restarted._coverage_retry_remaining("Q"), 0)
+                restarted.scrape_all_letters_diff(letters=["q", "r"], min_days_between_diff_exports=0)
+                self.assertEqual(calls, ["R", "Q"])
+
+    def test_monthly_waits_only_until_earliest_coverage_deadline(self):
+        for remaining, expected in [([1200, 2000], 1200), ([0, 2000], 0)]:
+            with self.subTest(remaining=remaining), tempfile.TemporaryDirectory() as out_dir:
+                scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http", detail_mode="deferred")
+                scraper.scrape_all_letters_diff = mock.Mock(side_effect=[
+                    RunResult(status="partial", reason="coverage_incomplete", requested_letters=["Q", "R"]),
+                    RunResult(status="success", reason="complete_catalog_exported")])
+                scraper._coverage_retry_remaining = mock.Mock(side_effect=remaining)
+                scraper.enrich_detail_queue = mock.Mock(return_value=RunResult(status="success", reason="detail_queue_empty"))
+                scraper._monthly_wait = mock.Mock()
+                self.assertEqual(scraper.run_monthly().reason, "monthly_complete")
+                self.assertEqual(scraper._monthly_wait.call_count, 1)
+                self.assertEqual(scraper._monthly_wait.call_args.args[0], expected)
+
     def test_recent_monthly_export_skips_network_without_moving_success_date(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http", detail_mode="deferred")
@@ -594,6 +649,7 @@ class DiffStateTests(unittest.TestCase):
                 "access_blocked": outcome == "access_blocked",
                 "detail_failed": outcome == "detail_failed",
                 "limited": outcome == "limited",
+                "coverage_failed": outcome == "coverage_failed",
             }
             if outcome in {"listing_failed", "access_blocked", "detail_failed"}:
                 this.session_stats["errors"] += 1

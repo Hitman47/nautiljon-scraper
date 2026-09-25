@@ -1213,6 +1213,24 @@ class NautiljonScraper:
             and not counters.get("limited")
         )
 
+    def _coverage_retry_remaining(self, letter: str) -> Optional[float]:
+        """Persisted deadline: time spent processing other letters counts too."""
+        tag = self._letter_tag("%23" if letter == "#" else letter)
+        checkpoint = self._load_json_dict(self._letter_checkpoint_path(tag)) or {}
+        if not self._coverage_checkpoint_is_complete(tag, checkpoint):
+            return None
+        if not checkpoint.get("coverage_pending"):
+            report = self._load_json_dict(self._state_path("last_diff_run")) or {}
+            stats = report.get("session_stats", {}).get("diff_by_letter", {}).get(self._letter_label("%23" if letter == "#" else letter), {})
+            if not stats.get("coverage_failed") or stats.get("listing_failed") or stats.get("detail_failed"):
+                return None
+        try:
+            captured = datetime.fromisoformat(str(checkpoint.get("updated_at", "")))
+            elapsed = (datetime.now() - captured).total_seconds()
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, _env_float("NAUTILJON_COVERAGE_CONFIRMATION_MIN_SECONDS", 3600.0) - elapsed)
+
     def _coverage_gap_confirmed_by_archive(
         self,
         letter_tag: str,
@@ -3856,6 +3874,10 @@ class NautiljonScraper:
                 "historiques absentes sur deux listings complets; mise a jour acceptee."
             )
         if coverage_failed:
+            if listing_complete and not listing_failed and not detail_failed and not limited:
+                checkpoint = self._load_json_dict(checkpoint_path) or {}
+                checkpoint["coverage_pending"] = True
+                self._write_json_atomic(checkpoint_path, checkpoint)
             print(
                 f"  Couverture invalide: {missing_count}/{initial_existing_count} fiches historiques absentes "
                 f"({missing_ratio:.1%}), seuil autorise {max_missing_ratio:.1%}."
@@ -4328,6 +4350,7 @@ class NautiljonScraper:
         aborted_listing_failures = False
         incomplete_reason = ""
         consecutive_listing_failures = 0
+        deferred_coverage = []
         try:
             if self.backend == "selenium":
                 self.setup_browser()
@@ -4338,6 +4361,11 @@ class NautiljonScraper:
                     print(f"\nProgression: {index}/{len(letters_to_scrape)} - lettre {label} deja finalisee, ignoree")
                     continue
                 print(f"\nProgression: {index}/{len(letters_to_scrape)}")
+                remaining = self._coverage_retry_remaining(letter) if resume and not force else None
+                if remaining is not None and remaining > 0:
+                    deferred_coverage.append(label)
+                    print(f"  Lettre {label} en attente de confirmation ({remaining / 60:.1f} min restantes); poursuite des autres lettres.")
+                    continue
                 if full_catalog_requested and not force:
                     cached = self._load_reusable_letter_cache(
                         tag,
@@ -4420,9 +4448,9 @@ class NautiljonScraper:
                 else:
                     consecutive_listing_failures = 0
                 if diff_stats.get("coverage_failed"):
-                    incomplete_reason = "coverage_incomplete"
-                    print("Diff interrompu: couverture du listing incoherente avec la base existante.")
-                    break
+                    if not diff_stats.get("listing_failed") and not diff_stats.get("detail_failed") and not diff_stats.get("limited"):
+                        deferred_coverage.append(label)
+                        print(f"Lettre {label} a reconfirmer: checkpoint conserve, poursuite des autres lettres.")
                 if diff_stats.get("detail_failed"):
                     incomplete_reason = "detail_inaccessible"
                     print("Diff interrompu: au moins une fiche detail est inaccessible.")
@@ -4453,7 +4481,7 @@ class NautiljonScraper:
         all_requested_completed = set(completed_letters) == set(requested_labels)
         export_paths: Dict[str, str] = {}
         status = "failed"
-        reason = incomplete_reason or "incomplete_run"
+        reason = incomplete_reason or ("coverage_incomplete" if deferred_coverage else "incomplete_run")
 
         if all_requested_completed and full_catalog_requested and not fatal_error and self.session_stats.get("errors", 0) == 0:
             if not self._validate_final_letter_files(letters_to_scrape):
@@ -4619,9 +4647,16 @@ class NautiljonScraper:
                 continue
             wait_seconds = retry_minutes * 60
             if diff_result.reason == "coverage_incomplete":
-                wait_seconds = max(
-                    wait_seconds,
-                    _env_float("NAUTILJON_COVERAGE_CONFIRMATION_MIN_SECONDS", 3600.0),
+                remaining = [
+                    self._coverage_retry_remaining(letter)
+                    for letter in diff_result.requested_letters
+                    if letter not in diff_result.completed_letters
+                ]
+                deadlines = [value for value in remaining if value is not None]
+                # Retry the earliest eligible letter; later deadlines are skipped
+                # by the next diff pass. Do not restart a full hour of waiting.
+                wait_seconds = min(deadlines) if deadlines else max(
+                    wait_seconds, _env_float("NAUTILJON_COVERAGE_CONFIRMATION_MIN_SECONDS", 3600.0)
                 )
             self._monthly_wait(
                 wait_seconds,
