@@ -15,6 +15,7 @@ python scraper_nautiljon.py browser-smoke
 python scraper_nautiljon.py browser-test
 python scraper_nautiljon.py flaresolverr-test
 python scraper_nautiljon.py diagnose
+python scraper_nautiljon.py monthly
 python scraper_nautiljon.py diff
 python scraper_nautiljon.py enrich
 python scraper_nautiljon.py discover-rss
@@ -60,7 +61,7 @@ interrompu ecrit `state/last_diff_run.json` avec l'etat `PARTIAL` ou `FAILED`.
 GLUETUN_CONTAINER=GlueTun-Nord_WG
 NAUTILJON_HOST_OUTPUT=/media/nvme0n1p1/AppData/NautiljonScraper/output
 NAUTILJON_HOST_BROWSER_PROFILE=/media/nvme0n1p1/AppData/NautiljonScraper/browser-profile
-NAUTILJON_COMMAND=flaresolverr-test
+NAUTILJON_COMMAND=monthly
 NAUTILJON_BACKEND=flaresolverr
 NAUTILJON_FLARESOLVERR_URL=http://flaresolverr:8191/v1
 NAUTILJON_FLARESOLVERR_PROXY_URL=http://gluetun-nord:8888
@@ -74,6 +75,9 @@ NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
 NAUTILJON_BATCH_PAUSE_MIN=45
 NAUTILJON_BATCH_PAUSE_MAX=90
+NAUTILJON_REQUEST_BURST_SIZE=15
+NAUTILJON_REQUEST_BURST_PAUSE_MIN=600
+NAUTILJON_REQUEST_BURST_PAUSE_MAX=1200
 NAUTILJON_DETAIL_DELAY_MIN=10
 NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
@@ -84,6 +88,9 @@ NAUTILJON_QUEUE_RELEASE_REFRESH=false
 NAUTILJON_ENRICH_MAX_ITEMS=12
 NAUTILJON_ENRICH_HARD_LIMIT=12
 NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES=30
+NAUTILJON_MONTHLY_RETRY_MINUTES=15
+NAUTILJON_MONTHLY_PHASE_PAUSE_MINUTES=10
+NAUTILJON_MONTHLY_MAX_HOURS=72
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -126,7 +133,8 @@ NAUTILJON_SHM_SIZE=256m
   le scraper ne tente ni de la cliquer ni de contourner un CAPTCHA. Changez
   d'IP de sortie ou attendez la fin de la quarantaine avant un nouveau canari.
 - Les acces Nautiljon sont strictement sequentiels : 4 a 7 secondes entre deux
-  navigations, 45 a 90 secondes toutes les 80 requetes et 20 a 45 secondes entre lettres.
+  navigations, une pause longue de 10 a 20 minutes toutes les 15 navigations,
+  45 a 90 secondes toutes les 80 requetes et 20 a 45 secondes entre lettres.
   Les fiches detail, plus sensibles, attendent 10 a 15 secondes et font une pause
   de 45 a 75 secondes toutes les 15 fiches. Il n'existe plus de limite glissante
   persistante qui ralentirait artificiellement les reprises.
@@ -136,18 +144,23 @@ NAUTILJON_SHM_SIZE=256m
 - Une variation de note est copiee directement depuis le listing sans recharger
   la fiche. Les valeurs du listing ne sont jamais ecrasees par les champs detail.
 - Avec `NAUTILJON_DETAIL_MODE=deferred`, le diff termine les listings sans ouvrir
-  de fiche. Les nouvelles series et les changements de volumes sont places dans
+  de fiche. Apres le premier inventaire complet, les nouvelles series et les
+  changements de volumes ou de statuts des anciennes series sont places dans
   `output/state/detail_queue.json`. Les champs detail deja connus sont conserves.
-- `NAUTILJON_COMMAND=enrich` traite au plus `NAUTILJON_ENRICH_MAX_ITEMS` fiches,
-  sauvegarde chaque succes et laisse toute fiche interrompue dans la file. Il
-  produit aussi l'export stable `nautiljon_enriched_latest.*`.
+- Le mode `monthly` traite automatiquement au plus `NAUTILJON_ENRICH_MAX_ITEMS`
+  fiches par lot, sauvegarde chaque succes et laisse toute fiche interrompue dans
+  la file. La commande `enrich` reste disponible pour un diagnostic manuel.
 - La limite dure de 12 fiches et l'intervalle minimal de 30 minutes empechent
   deux lots rapproches de reproduire la rafale observee avant les blocages.
 - `NAUTILJON_QUEUE_RELEASE_REFRESH=false` desactive les visites periodiques des
   anciennes fiches. Le mettre a `true` reactive le rafraichissement des prochaines
   parutions VF selon `NAUTILJON_REFRESH_STALE_DAYS`.
-- Les changements de presentation tels que `0 -> -` ou `7 -> 7 (En cours)` ne
-  provoquent plus de visite. Les autres champs de listing sont actualises directement.
+- Les changements de presentation tels que `0 -> -` ne provoquent plus de visite.
+  Le nombre de tomes et le statut du listing sont stockes separement : une vraie
+  transition `En cours -> Termine` est donc detectee meme sans changement de nombre.
+- `NAUTILJON_COMMAND=monthly` enchaine sans intervention le diff reprenable et les
+  petits lots d'enrichissement. Il ferme FlareSolverr pendant les longues pauses,
+  recontrole automatiquement une nouvelle IP et reprend pendant 72 heures au maximum.
 - Une page inaccessible n'est pas rechargee en boucle. Deux echecs de fiches
   consecutifs interrompent la lettre en conservant son checkpoint.
 - Selenium reste disponible avec `browser-test` pour le diagnostic.

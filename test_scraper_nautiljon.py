@@ -12,6 +12,7 @@ from scraper_nautiljon import (
     LETTER_CHECKPOINT_VERSION,
     NautiljonAccessBlockedError,
     NautiljonScraper,
+    RunResult,
 )
 
 
@@ -37,6 +38,9 @@ class DiffStateTests(unittest.TestCase):
             "NAUTILJON_BATCH_SIZE",
             "NAUTILJON_BATCH_PAUSE_MIN",
             "NAUTILJON_BATCH_PAUSE_MAX",
+            "NAUTILJON_REQUEST_BURST_SIZE",
+            "NAUTILJON_REQUEST_BURST_PAUSE_MIN",
+            "NAUTILJON_REQUEST_BURST_PAUSE_MAX",
             "NAUTILJON_DETAIL_DELAY_MIN",
             "NAUTILJON_DETAIL_DELAY_MAX",
             "NAUTILJON_DETAIL_BATCH_SIZE",
@@ -56,6 +60,11 @@ class DiffStateTests(unittest.TestCase):
 
         self.assertEqual(scraper.batch_size, 80)
         self.assertEqual((scraper.batch_pause_min, scraper.batch_pause_max), (45.0, 90.0))
+        self.assertEqual(scraper.request_burst_size, 15)
+        self.assertEqual(
+            (scraper.request_burst_pause_min, scraper.request_burst_pause_max),
+            (600.0, 1200.0),
+        )
         self.assertEqual((scraper.detail_delay_min, scraper.detail_delay_max), (10.0, 15.0))
         self.assertEqual(scraper.detail_batch_size, 15)
         self.assertEqual((scraper.detail_batch_pause_min, scraper.detail_batch_pause_max), (45.0, 75.0))
@@ -92,6 +101,22 @@ class DiffStateTests(unittest.TestCase):
 
         sleep.assert_not_called()
         self.assertEqual(scraper.session_stats["remote_requests"], 0)
+
+    def test_pacer_adds_long_pause_after_configured_navigation_burst(self):
+        env = {
+            "NAUTILJON_REQUEST_BURST_SIZE": "2",
+            "NAUTILJON_REQUEST_BURST_PAUSE_MIN": "600",
+            "NAUTILJON_REQUEST_BURST_PAUSE_MAX": "600",
+            "NAUTILJON_BATCH_SIZE": "0",
+        }
+        with mock.patch.dict(os.environ, env), mock.patch(
+            "scraper_nautiljon.time.monotonic", return_value=100.0
+        ), mock.patch("scraper_nautiljon.time.sleep") as sleep:
+            scraper = NautiljonScraper(delay=1, delay_min=1, delay_max=1, backend="http")
+            for _ in range(3):
+                scraper._pace_remote_request("https://www.nautiljon.com/mangas/", "test")
+
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 600.0])
 
     def test_detail_pacer_adds_a_break_before_sixteenth_detail(self):
         env = {
@@ -235,15 +260,32 @@ class DiffStateTests(unittest.TestCase):
         )
         self.assertTrue(scraper._series_change_requires_detail(existing, current))
 
-    def test_listing_format_changes_do_not_trigger_detail_refresh(self):
+    def test_first_observed_listing_status_establishes_baseline_without_refresh(self):
         scraper = self.make_scraper("unused")
         existing = make_row("F")
-        existing.update({"nb_vol_vo_liste": "7", "date_vo_liste": "0"})
+        existing.update({"nb_vol_vo_liste": "7", "statut_vo_liste": "N/A", "date_vo_liste": "0"})
         current = dict(existing)
-        current.update({"nb_vol_vo_liste": "7 (En cours)", "date_vo_liste": "-"})
+        current.update({
+            "nb_vol_vo_liste": "7 (En cours)",
+            "statut_vo_liste": "En cours",
+            "date_vo_liste": "-",
+        })
 
         self.assertFalse(scraper._series_changed_on_list(existing, current))
         self.assertFalse(scraper._series_change_requires_detail(existing, current))
+
+    def test_existing_listing_status_transition_triggers_detail_refresh(self):
+        scraper = self.make_scraper("unused")
+        existing = scraper._normalize_row(make_row("F"))
+        existing.update({"nb_vol_vo_liste": "7", "statut_vo_liste": "En cours"})
+        current = dict(existing)
+        current.update({"nb_vol_vo_liste": "7 (Terminé)", "statut_vo_liste": "Terminé"})
+
+        self.assertEqual(
+            scraper._series_change_reasons(existing, current),
+            {"statut_vo_liste": ("En cours", "Terminé")},
+        )
+        self.assertTrue(scraper._series_change_requires_detail(existing, current))
 
     def test_non_volume_listing_change_is_saved_without_detail_refresh(self):
         scraper = self.make_scraper("unused")
@@ -1517,6 +1559,7 @@ class DiffStateTests(unittest.TestCase):
                 backend="flaresolverr",
                 detail_mode="deferred",
             )
+            scraper._mark_detail_baseline_established(1000)
             row = make_row("A")
 
             def fetch(this, letter, page_num):
@@ -1538,6 +1581,60 @@ class DiffStateTests(unittest.TestCase):
             self.assertTrue(item["ready"])
             self.assertEqual(item["reasons"], ["new_series"])
             self.assertEqual(result[0]["titre_original"], "N/A")
+
+    def test_initial_deferred_baseline_does_not_queue_historical_catalogue(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(
+                out_dir=out_dir,
+                delay=0,
+                backend="flaresolverr",
+                detail_mode="deferred",
+            )
+            row = make_row("A")
+
+            def fetch(this, letter, page_num):
+                this._flaresolverr_page_has_next[(this._letter_tag(letter), page_num)] = False
+                return "https://example.test/a", [dict(row)]
+
+            scraper.fetch_listing_page = types.MethodType(fetch, scraper)
+            result = scraper.scrape_letter_diff("a", drop_missing=True, resume=False)
+
+            self.assertEqual(len(result), 1)
+            self.assertEqual(scraper._load_detail_queue(), {})
+
+    def test_deferred_status_change_preserves_details_and_queues_refresh(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(
+                out_dir=out_dir,
+                delay=0,
+                backend="flaresolverr",
+                detail_mode="deferred",
+            )
+            existing = scraper._normalize_row(make_row("F"))
+            existing.update({
+                "nb_vol_vo_liste": "7 (En cours)",
+                "statut_vo_liste": "En cours",
+                "genres": "Aventure",
+            })
+            scraper.save_letter_files("F", [existing], partial=False)
+            current = dict(existing)
+            current.update({
+                "nb_vol_vo_liste": "7 (Terminé)",
+                "statut_vo_liste": "Terminé",
+            })
+
+            def fetch(this, letter, page_num):
+                this._flaresolverr_page_has_next[(this._letter_tag(letter), page_num)] = False
+                return "https://example.test/f", [current]
+
+            scraper.fetch_listing_page = types.MethodType(fetch, scraper)
+            result = scraper.scrape_letter_diff("f", drop_missing=True, resume=False)
+
+            self.assertEqual(result[0]["statut_vo_liste"], "Terminé")
+            self.assertEqual(result[0]["genres"], "Aventure")
+            item = next(iter(scraper._load_detail_queue().values()))
+            self.assertEqual(item["reasons"], ["status_changed"])
+            self.assertTrue(item["ready"])
 
     def test_deferred_volume_change_preserves_details_and_queues_refresh(self):
         with tempfile.TemporaryDirectory() as out_dir:
@@ -1569,7 +1666,12 @@ class DiffStateTests(unittest.TestCase):
 
     def test_enrich_queue_updates_letter_and_removes_successful_item(self):
         with tempfile.TemporaryDirectory() as out_dir:
-            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http")
+            scraper = NautiljonScraper(
+                out_dir=out_dir,
+                delay=0,
+                backend="http",
+                detail_mode="deferred",
+            )
             row = scraper._normalize_row(make_row("A"))
             scraper.save_letter_files("A", [row], partial=False)
             queue = {}
@@ -1591,7 +1693,12 @@ class DiffStateTests(unittest.TestCase):
 
     def test_enrich_block_keeps_item_in_queue(self):
         with tempfile.TemporaryDirectory() as out_dir:
-            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http")
+            scraper = NautiljonScraper(
+                out_dir=out_dir,
+                delay=0,
+                backend="http",
+                detail_mode="deferred",
+            )
             scraper._verified_public_ips = ("198.51.100.10", "198.51.100.10")
             row = scraper._normalize_row(make_row("A"))
             scraper.save_letter_files("A", [row], partial=False)
@@ -1635,6 +1742,76 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(result.reason, "enrich_interval_active")
             scraper._fetch_full_series_data.assert_not_called()
             self.assertEqual(len(scraper._load_detail_queue()), 1)
+
+    def test_monthly_retries_diff_then_drains_detail_queue_automatically(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(
+                out_dir=out_dir,
+                delay=0,
+                backend="http",
+                detail_mode="deferred",
+            )
+            scraper.scrape_all_letters_diff = mock.Mock(
+                side_effect=[
+                    RunResult(status="partial", reason="listing_inaccessible"),
+                    RunResult(
+                        status="success",
+                        reason="complete_catalog_exported",
+                        rows_count=1234,
+                        requested_letters=["A"],
+                        completed_letters=["A"],
+                        export_paths={"json_path": "catalogue.json"},
+                    ),
+                ]
+            )
+            scraper._ready_detail_queue_count = mock.Mock(return_value=2)
+            scraper.enrich_detail_queue = mock.Mock(
+                side_effect=[
+                    RunResult(status="success", reason="detail_batch_complete_queue_pending"),
+                    RunResult(
+                        status="success",
+                        reason="detail_queue_complete",
+                        export_paths={"json_path": "enriched.json"},
+                    ),
+                ]
+            )
+            scraper._monthly_wait = mock.Mock()
+
+            result = scraper.run_monthly(enrich_max_items=12)
+
+            self.assertEqual(result.status, "success")
+            self.assertEqual(result.reason, "monthly_complete")
+            self.assertEqual(result.rows_count, 1234)
+            self.assertEqual(scraper.scrape_all_letters_diff.call_count, 2)
+            self.assertEqual(scraper.enrich_detail_queue.call_count, 2)
+            self.assertEqual(scraper._monthly_wait.call_count, 3)
+            monthly_state = scraper._load_json_dict(scraper._state_path("last_monthly_run"))
+            self.assertEqual(monthly_state["status"], "success")
+
+    def test_monthly_stops_on_nonrecoverable_configuration_error(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(
+                out_dir=out_dir,
+                delay=0,
+                backend="http",
+                detail_mode="deferred",
+            )
+            scraper.scrape_all_letters_diff = mock.Mock(
+                return_value=RunResult(
+                    status="failed",
+                    reason="full_catalog_requires_drop_missing",
+                )
+            )
+            scraper._monthly_wait = mock.Mock()
+
+            result = scraper.run_monthly(drop_missing=False)
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(
+                result.reason,
+                "monthly_diff_full_catalog_requires_drop_missing",
+            )
+            scraper._monthly_wait.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -67,7 +67,8 @@ PREFERRED_FIELDS = [
     "genres", "themes",
     "scenariste", "dessinateur",
     "editeur_vo", "prepublication",
-    "nb_vol_vo_liste", "nb_vol_vf_liste", "nb_vol_vo_detail", "nb_vol_vf_detail",
+    "nb_vol_vo_liste", "nb_vol_vf_liste", "statut_vo_liste", "statut_vf_liste",
+    "nb_vol_vo_detail", "nb_vol_vf_detail",
     "date_vo_liste", "date_vf_liste", "date_vo_detail", "date_vf_detail",
     *VF_RELEASE_FIELDS, "parutions_vf_verifiees_le",
     "note_liste", "note_detail",
@@ -161,6 +162,23 @@ def _first_non_empty(values: Iterable[str]) -> str:
     return "N/A"
 
 
+def _extract_listing_status(value: str) -> str:
+    """Extract a stable publication status from a listing volume cell."""
+    normalized = _norm(value)
+    statuses = (
+        (r"\b(en cours|ongoing)\b", "En cours"),
+        (r"\b(termin(?:e|ee)|complete)\b", "Terminé"),
+        (r"\b(a venir|upcoming)\b", "À venir"),
+        (r"\b(abandonne|discontinued)\b", "Abandonné"),
+        (r"\b(en pause|pause|hiatus)\b", "En pause"),
+        (r"\b(one[ -]?shot)\b", "One-shot"),
+    )
+    for pattern, label in statuses:
+        if re.search(pattern, normalized):
+            return label
+    return "N/A"
+
+
 @dataclass
 class ListRow:
     titre: str = "N/A"
@@ -169,6 +187,8 @@ class ListRow:
     type_liste: str = "N/A"
     nb_vol_vo_liste: str = "N/A"
     nb_vol_vf_liste: str = "N/A"
+    statut_vo_liste: str = "N/A"
+    statut_vf_liste: str = "N/A"
     age_liste: str = "N/A"
     date_vf_liste: str = "N/A"
     date_vo_liste: str = "N/A"
@@ -235,6 +255,24 @@ class NautiljonScraper:
         self.batch_pause_max = max(
             self.batch_pause_min,
             _env_float("NAUTILJON_BATCH_PAUSE_MAX", 90.0 if conservative_defaults else 0.0),
+        )
+        self.request_burst_size = max(
+            0,
+            _env_int("NAUTILJON_REQUEST_BURST_SIZE", 15 if conservative_defaults else 0),
+        )
+        self.request_burst_pause_min = max(
+            0.0,
+            _env_float(
+                "NAUTILJON_REQUEST_BURST_PAUSE_MIN",
+                600.0 if conservative_defaults else 0.0,
+            ),
+        )
+        self.request_burst_pause_max = max(
+            self.request_burst_pause_min,
+            _env_float(
+                "NAUTILJON_REQUEST_BURST_PAUSE_MAX",
+                1200.0 if conservative_defaults else 0.0,
+            ),
         )
         self.detail_delay_min = max(
             0.0,
@@ -312,6 +350,9 @@ class NautiljonScraper:
                 "batch_size": self.batch_size,
                 "batch_pause_min": self.batch_pause_min,
                 "batch_pause_max": self.batch_pause_max,
+                "request_burst_size": self.request_burst_size,
+                "request_burst_pause_min": self.request_burst_pause_min,
+                "request_burst_pause_max": self.request_burst_pause_max,
                 "detail_delay_min": self.detail_delay_min,
                 "detail_delay_max": self.detail_delay_max,
                 "detail_batch_size": self.detail_batch_size,
@@ -418,6 +459,21 @@ class NautiljonScraper:
             if batch_pause > wait_seconds:
                 wait_seconds = batch_pause
                 wait_reason = f"repos apres {self._remote_request_count} requetes"
+
+        if (
+            self.request_burst_size > 0
+            and self._remote_request_count > 0
+            and self._remote_request_count % self.request_burst_size == 0
+        ):
+            burst_pause = random.uniform(
+                self.request_burst_pause_min,
+                self.request_burst_pause_max,
+            )
+            if burst_pause > wait_seconds:
+                wait_seconds = burst_pause
+                wait_reason = (
+                    f"repos long apres {self._remote_request_count} navigations Nautiljon"
+                )
 
         self._sleep_for(wait_seconds, wait_reason, announce=wait_seconds >= 5)
         self._last_remote_request_at = time.monotonic()
@@ -527,6 +583,23 @@ class NautiljonScraper:
 
     def _detail_queue_path(self) -> str:
         return self._state_path("detail_queue")
+
+    def _detail_baseline_path(self) -> str:
+        return self._state_path("detail_baseline")
+
+    def _detail_baseline_established(self) -> bool:
+        marker = self._load_json_dict(self._detail_baseline_path())
+        return bool(marker and marker.get("complete_catalog"))
+
+    def _mark_detail_baseline_established(self, rows_count: int) -> None:
+        self._write_json_atomic(
+            self._detail_baseline_path(),
+            {
+                "complete_catalog": True,
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "rows_count": rows_count,
+            },
+        )
 
     def _load_detail_queue(self) -> Dict[str, Dict[str, object]]:
         payload = self._load_json_dict(self._detail_queue_path())
@@ -1527,6 +1600,14 @@ class NautiljonScraper:
         if _is_na(normalized.get("extraction_time")):
             normalized["extraction_time"] = _now_str()
         normalized["url_fiche"] = _ensure_abs_url(normalized.get("url_fiche", ""))
+        for volume_field, status_field in (
+            ("nb_vol_vo_liste", "statut_vo_liste"),
+            ("nb_vol_vf_liste", "statut_vf_liste"),
+        ):
+            if _is_na(normalized.get(status_field)):
+                normalized[status_field] = _extract_listing_status(
+                    normalized.get(volume_field, "")
+                )
         return normalized
 
     def setup_browser(self) -> webdriver.Chrome:
@@ -2542,6 +2623,13 @@ class NautiljonScraper:
                     "note_liste": tds_text[8],
                 }
 
+            mapped["statut_vo_liste"] = _extract_listing_status(
+                mapped.get("nb_vol_vo_liste", "")
+            )
+            mapped["statut_vf_liste"] = _extract_listing_status(
+                mapped.get("nb_vol_vf_liste", "")
+            )
+
             row_obj = ListRow(
                 titre=title,
                 titre_alternatif=alt_title,
@@ -2971,6 +3059,8 @@ class NautiljonScraper:
             "type_liste",
             "nb_vol_vo_liste",
             "nb_vol_vf_liste",
+            "statut_vo_liste",
+            "statut_vf_liste",
             "age_liste",
             "date_vf_liste",
             "date_vo_liste",
@@ -2983,6 +3073,10 @@ class NautiljonScraper:
             # La traiter comme un changement transformait les erreurs de parsing en
             # rafales de consultations des fiches detail.
             if _is_na(observed):
+                continue
+            # The first run after adding explicit listing statuses only establishes
+            # a baseline. It must not enqueue the whole historical catalogue.
+            if field in {"statut_vo_liste", "statut_vf_liste"} and _is_na(previous):
                 continue
             if self._listing_comparison_value(field, previous) != self._listing_comparison_value(
                 field,
@@ -3016,7 +3110,15 @@ class NautiljonScraper:
         current: Dict[str, str],
     ) -> bool:
         reasons = self._series_change_reasons(existing, current)
-        return any(field in {"nb_vol_vo_liste", "nb_vol_vf_liste"} for field in reasons)
+        return any(
+            field in {
+                "nb_vol_vo_liste",
+                "nb_vol_vf_liste",
+                "statut_vo_liste",
+                "statut_vf_liste",
+            }
+            for field in reasons
+        )
 
     def _series_changed_on_list(self, existing: Dict[str, str], current: Dict[str, str]) -> bool:
         return bool(self._series_change_reasons(existing, current))
@@ -3104,6 +3206,7 @@ class NautiljonScraper:
             "queue_release_refresh": self.queue_release_refresh,
         }
         detail_queue = self._load_detail_queue() if self.detail_mode == "deferred" else {}
+        detail_baseline_established = self._detail_baseline_established()
 
         checkpoint = self._load_json_dict(checkpoint_path)
         partial_rows = self._load_json_list(self._letter_paths(tag)[2])
@@ -3342,13 +3445,35 @@ class NautiljonScraper:
                             base = existing if existing is not None else self._normalize_row(series)
                             merged = self._merge_observed_list_fields(base, series)
                             updated_rows.append(merged)
-                            queue_reason = {
-                                "new": "new_series",
-                                "changed": "volume_changed",
-                                "parutions": "release_refresh",
-                            }[action]
-                            if self._queue_detail(detail_queue, tag, merged, queue_reason):
+                            reasons = (
+                                self._series_change_reasons(existing, series)
+                                if action == "changed" and existing
+                                else {}
+                            )
+                            if action == "changed" and any(
+                                field in {"statut_vo_liste", "statut_vf_liste"}
+                                for field in reasons
+                            ):
+                                queue_reason = "status_changed"
+                            else:
+                                queue_reason = {
+                                    "new": "new_series",
+                                    "changed": "volume_changed",
+                                    "parutions": "release_refresh",
+                                }[action]
+                            should_queue = action != "new" or detail_baseline_established
+                            if should_queue and self._queue_detail(
+                                detail_queue,
+                                tag,
+                                merged,
+                                queue_reason,
+                            ):
                                 counters["queued_details"] += 1
+                            elif action == "new" and not detail_baseline_established:
+                                print(
+                                    "      Fiche detail non planifiee pendant "
+                                    "l'etablissement du premier inventaire complet."
+                                )
                             counters[action] += 1
                         else:
                             try:
@@ -3697,7 +3822,11 @@ class NautiljonScraper:
                     consecutive_failures += 1
                     item["attempts"] = int(item.get("attempts", 0) or 0) + 1
                     item["last_error"] = str(exc)[:500]
-                    item["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    retry_at = datetime.now().isoformat(timespec="seconds")
+                    item["updated_at"] = retry_at
+                    # Move a broken fiche behind the other ready items so one
+                    # permanent parser/network error cannot starve the queue.
+                    item["queued_at"] = retry_at
                     self._save_detail_queue(queue)
                     print(f"  Erreur detail conservee dans la file: {str(exc)[:180]}")
                     if consecutive_failures >= max(1, _env_int("NAUTILJON_ABORT_AFTER_DETAIL_FAILURES", 2)):
@@ -3799,6 +3928,13 @@ class NautiljonScraper:
             f"toutes les {pacing['batch_size']} requetes, "
             f"{pacing['letter_pause_min']:g}-{pacing['letter_pause_max']:g}s entre lettres."
         )
+        if pacing["request_burst_size"] > 0:
+            print(
+                "Protection longue: pause "
+                f"{pacing['request_burst_pause_min'] / 60:g}-"
+                f"{pacing['request_burst_pause_max'] / 60:g} min toutes les "
+                f"{pacing['request_burst_size']} navigations Nautiljon."
+            )
         print(
             "Cadence fiches detail: "
             f"{pacing['detail_delay_min']:g}-{pacing['detail_delay_max']:g}s apres chaque fiche, "
@@ -4078,12 +4214,195 @@ class NautiljonScraper:
         )
         if status == "success":
             self.mark_success("diff", len(combined), export_paths)
+            self._mark_detail_baseline_established(len(combined))
             self._remove_checkpoint(self._state_path("diff_checkpoint"))
             self._clear_access_cooldown()
         elif all_requested_completed:
             self._remove_checkpoint(self._state_path("diff_checkpoint"))
         self.mark_run_state("diff", result)
         return result
+
+    def _monthly_wait(self, seconds: float, reason: str) -> None:
+        """Wait without keeping a browser session or stale IP verification alive."""
+        seconds = max(0.0, float(seconds))
+        self.close_browser()
+        self._verified_public_ips = None
+        self._remote_request_count = 0
+        self._detail_request_count = 0
+        self._last_remote_request_at = 0.0
+        if seconds <= 0:
+            return
+        print(f"Attente automatique {seconds / 60:.1f} min: {reason}.")
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(60.0, remaining))
+
+    def _ready_detail_queue_count(self) -> int:
+        queue = self._load_detail_queue()
+        if self._promote_finalized_detail_queue(queue):
+            self._save_detail_queue(queue)
+        return sum(1 for item in queue.values() if item.get("ready"))
+
+    def run_monthly(
+        self,
+        letters: Optional[List[str]] = None,
+        max_pages_per_letter: Optional[int] = None,
+        max_series_per_letter: Optional[int] = None,
+        refresh_stale_days: Optional[int] = None,
+        drop_missing: bool = True,
+        max_missing_ratio: float = 0.15,
+        min_days_between_diff_exports: int = 30,
+        abort_after_listing_failures: int = 1,
+        flush_every: int = 25,
+        resume: bool = True,
+        force: bool = False,
+        enrich_max_items: int = 12,
+    ) -> RunResult:
+        """Run listings then deferred details, resuming automatically after pauses."""
+        if self.detail_mode != "deferred":
+            result = RunResult(status="failed", reason="monthly_requires_deferred_detail_mode")
+            print(
+                "Mode mensuel refuse: NAUTILJON_DETAIL_MODE doit rester sur deferred "
+                "pour separer les listings des fiches detail."
+            )
+            self.mark_run_state("monthly", result)
+            return result
+        retry_minutes = max(0.0, _env_float("NAUTILJON_MONTHLY_RETRY_MINUTES", 15.0))
+        phase_pause_minutes = max(
+            0.0,
+            _env_float("NAUTILJON_MONTHLY_PHASE_PAUSE_MINUTES", 10.0),
+        )
+        enrich_interval_minutes = max(
+            0.0,
+            _env_float("NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES", 30.0),
+        )
+        max_hours = max(0.0, _env_float("NAUTILJON_MONTHLY_MAX_HOURS", 72.0))
+        started = time.monotonic()
+        diff_result: Optional[RunResult] = None
+        recoverable_diff_reasons = {
+            "access_cooldown_active",
+            "access_blocked",
+            "listing_inaccessible",
+            "coverage_incomplete",
+            "detail_inaccessible",
+            "flaresolverr_preflight_failed",
+            "fatal_error",
+            "incomplete_run",
+        }
+
+        print(
+            "Mode mensuel automatique: listings, puis enrichissement des nouvelles "
+            "series et des anciennes series modifiees."
+        )
+        while True:
+            if max_hours and time.monotonic() - started >= max_hours * 3600:
+                result = RunResult(status="partial", reason="monthly_time_budget_exhausted")
+                self.mark_run_state("monthly", result)
+                return result
+            self.session_stats["errors"] = 0
+            self._verified_public_ips = None
+            diff_result = self.scrape_all_letters_diff(
+                letters=letters,
+                max_pages_per_letter=max_pages_per_letter,
+                max_series_per_letter=max_series_per_letter,
+                refresh_stale_days=refresh_stale_days,
+                drop_missing=drop_missing,
+                max_missing_ratio=max_missing_ratio,
+                min_days_between_diff_exports=min_days_between_diff_exports,
+                abort_after_listing_failures=abort_after_listing_failures,
+                flush_every=flush_every,
+                resume=resume,
+                force=force,
+            )
+            if diff_result.status in {"success", "skipped"}:
+                if (
+                    diff_result.reason == "recent_complete_export"
+                    and not self._detail_baseline_established()
+                ):
+                    self._mark_detail_baseline_established(diff_result.rows_count)
+                break
+            if diff_result.reason not in recoverable_diff_reasons:
+                result = RunResult(
+                    status=diff_result.status,
+                    reason=f"monthly_diff_{diff_result.reason}",
+                    rows_count=diff_result.rows_count,
+                    requested_letters=diff_result.requested_letters,
+                    completed_letters=diff_result.completed_letters,
+                    export_paths=diff_result.export_paths,
+                )
+                self.mark_run_state("monthly", result)
+                return result
+            wait_seconds = retry_minutes * 60
+            if diff_result.reason == "coverage_incomplete":
+                wait_seconds = max(
+                    wait_seconds,
+                    _env_float("NAUTILJON_COVERAGE_CONFIRMATION_MIN_SECONDS", 3600.0),
+                )
+            self._monthly_wait(
+                wait_seconds,
+                f"reprise du diff apres {diff_result.reason}",
+            )
+
+        ready = self._ready_detail_queue_count()
+        if ready and phase_pause_minutes > 0:
+            self._monthly_wait(
+                phase_pause_minutes * 60,
+                f"separation listings/fiches ({ready} fiche(s) en attente)",
+            )
+
+        while True:
+            if max_hours and time.monotonic() - started >= max_hours * 3600:
+                result = RunResult(
+                    status="partial",
+                    reason="monthly_time_budget_exhausted",
+                    rows_count=diff_result.rows_count if diff_result else 0,
+                )
+                self.mark_run_state("monthly", result)
+                return result
+            self.session_stats["errors"] = 0
+            self._verified_public_ips = None
+            enrich_result = self.enrich_detail_queue(max_items=enrich_max_items)
+            if enrich_result.reason in {"detail_queue_empty", "detail_queue_complete"}:
+                result = RunResult(
+                    status="success",
+                    reason="monthly_complete",
+                    rows_count=diff_result.rows_count if diff_result else 0,
+                    requested_letters=diff_result.requested_letters if diff_result else [],
+                    completed_letters=diff_result.completed_letters if diff_result else [],
+                    export_paths=(
+                        enrich_result.export_paths
+                        or (diff_result.export_paths if diff_result else {})
+                    ),
+                )
+                self.mark_success("monthly", result.rows_count, result.export_paths)
+                self.mark_run_state("monthly", result)
+                return result
+            if enrich_result.reason in {
+                "detail_batch_complete_queue_pending",
+                "enrich_interval_active",
+            }:
+                wait_minutes = enrich_interval_minutes
+                wait_reason = "prochain petit lot de fiches detail"
+            elif enrich_result.reason in {
+                "access_blocked",
+                "access_cooldown_active",
+                "detail_errors",
+                "flaresolverr_preflight_failed",
+            }:
+                wait_minutes = retry_minutes
+                wait_reason = f"reprise de l'enrichissement apres {enrich_result.reason}"
+            else:
+                result = RunResult(
+                    status=enrich_result.status,
+                    reason=f"monthly_enrich_{enrich_result.reason}",
+                    rows_count=diff_result.rows_count if diff_result else 0,
+                )
+                self.mark_run_state("monthly", result)
+                return result
+            self._monthly_wait(wait_minutes * 60, wait_reason)
 
     def probe_discovery(self, letters: Optional[List[str]] = None, max_pages: int = 1) -> None:
         for letter in letters or ["a"]:
@@ -4150,29 +4469,44 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("import-csv", help="Importe les CSV presents dans output/letters et genere les JSON.")
     sub.add_parser("concat", help="Concatene les lettres deja importees/scrapees.")
 
-    diff = sub.add_parser("diff", help="Diff mensuel avec decouverte des nouvelles fiches.")
-    diff.add_argument("--letters", default=os.environ.get("NAUTILJON_LETTERS"))
-    diff.add_argument("--max-pages-per-letter", type=int, default=_env_optional_int("NAUTILJON_MAX_PAGES_PER_LETTER"))
-    diff.add_argument("--max-series-per-letter", type=int, default=_env_optional_int("NAUTILJON_MAX_SERIES_PER_LETTER"))
-    diff.add_argument(
-        "--refresh-stale-days",
+    def add_diff_arguments(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--letters", default=os.environ.get("NAUTILJON_LETTERS"))
+        command_parser.add_argument("--max-pages-per-letter", type=int, default=_env_optional_int("NAUTILJON_MAX_PAGES_PER_LETTER"))
+        command_parser.add_argument("--max-series-per-letter", type=int, default=_env_optional_int("NAUTILJON_MAX_SERIES_PER_LETTER"))
+        command_parser.add_argument(
+            "--refresh-stale-days",
+            type=int,
+            default=_env_optional_int("NAUTILJON_REFRESH_STALE_DAYS"),
+            help="Rafraichit uniquement les parutions des series dont la VF est en cours.",
+        )
+        command_parser.add_argument("--keep-missing", action="store_true", default=not _env_bool("NAUTILJON_DROP_MISSING", True))
+        command_parser.add_argument(
+            "--max-missing-ratio",
+            type=float,
+            default=_env_float("NAUTILJON_MAX_MISSING_RATIO", 0.15),
+            help="Refuse la finalisation si la part de fiches historiques absentes depasse ce seuil.",
+        )
+        command_parser.add_argument("--min-days-between-diff-exports", type=int, default=_env_int("NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS", 30))
+        command_parser.add_argument("--abort-after-listing-failures", type=int, default=_env_int("NAUTILJON_ABORT_AFTER_LISTING_FAILURES", 1))
+        command_parser.add_argument("--flush-every", type=int, default=_env_int("NAUTILJON_FLUSH_EVERY", 25))
+        command_parser.add_argument("--resume", dest="resume", action="store_true", default=_env_bool("NAUTILJON_RESUME", True))
+        command_parser.add_argument("--no-resume", dest="resume", action="store_false")
+        command_parser.add_argument("--force", action="store_true", default=_env_bool("NAUTILJON_FORCE_SCRAPE", False))
+
+    diff = sub.add_parser("diff", help="Diff des listings avec reprise securisee.")
+    add_diff_arguments(diff)
+
+    monthly = sub.add_parser(
+        "monthly",
+        help="Cycle mensuel automatique: listings puis petits lots de fiches detail.",
+    )
+    add_diff_arguments(monthly)
+    monthly.add_argument(
+        "--enrich-max-items",
         type=int,
-        default=_env_optional_int("NAUTILJON_REFRESH_STALE_DAYS"),
-        help="Rafraichit uniquement les parutions des series dont la VF est en cours.",
+        default=_env_int("NAUTILJON_ENRICH_MAX_ITEMS", 12),
+        help="Taille maximale de chaque petit lot de fiches detail.",
     )
-    diff.add_argument("--keep-missing", action="store_true", default=not _env_bool("NAUTILJON_DROP_MISSING", True))
-    diff.add_argument(
-        "--max-missing-ratio",
-        type=float,
-        default=_env_float("NAUTILJON_MAX_MISSING_RATIO", 0.15),
-        help="Refuse la finalisation si la part de fiches historiques absentes depasse ce seuil.",
-    )
-    diff.add_argument("--min-days-between-diff-exports", type=int, default=_env_int("NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS", 30))
-    diff.add_argument("--abort-after-listing-failures", type=int, default=_env_int("NAUTILJON_ABORT_AFTER_LISTING_FAILURES", 1))
-    diff.add_argument("--flush-every", type=int, default=_env_int("NAUTILJON_FLUSH_EVERY", 25))
-    diff.add_argument("--resume", dest="resume", action="store_true", default=_env_bool("NAUTILJON_RESUME", True))
-    diff.add_argument("--no-resume", dest="resume", action="store_false")
-    diff.add_argument("--force", action="store_true", default=_env_bool("NAUTILJON_FORCE_SCRAPE", False))
 
     enrich = sub.add_parser(
         "enrich",
@@ -4288,6 +4622,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             flush_every=args.flush_every,
             resume=args.resume,
             force=args.force,
+        )
+        raise SystemExit(result.exit_code)
+    elif command == "monthly":
+        result = scraper.run_monthly(
+            letters=_parse_letters(args.letters),
+            max_pages_per_letter=args.max_pages_per_letter,
+            max_series_per_letter=args.max_series_per_letter,
+            refresh_stale_days=args.refresh_stale_days,
+            drop_missing=not args.keep_missing,
+            max_missing_ratio=args.max_missing_ratio,
+            min_days_between_diff_exports=args.min_days_between_diff_exports,
+            abort_after_listing_failures=args.abort_after_listing_failures,
+            flush_every=args.flush_every,
+            resume=args.resume,
+            force=args.force,
+            enrich_max_items=args.enrich_max_items,
         )
         raise SystemExit(result.exit_code)
     elif command == "enrich":

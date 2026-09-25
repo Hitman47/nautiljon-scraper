@@ -1,8 +1,8 @@
 # Protocole Portainer FlareSolverr
 
-Le conteneur execute une commande puis s'arrete. Les listings et les fiches sont
-charges dans une session FlareSolverr unique, sans fenetre ni intervention
-manuelle sur le NAS.
+Le conteneur execute le cycle mensuel puis s'arrete. Les listings et les petits
+lots de fiches utilisent des sessions FlareSolverr distinctes, fermees pendant
+les longues pauses, sans fenetre ni intervention manuelle sur le NAS.
 
 Le scraper reutilise le conteneur `flaresolverr` existant dans `search-stack`.
 Il ne lance aucune seconde instance. Sa session FlareSolverr recoit un proxy
@@ -54,6 +54,9 @@ NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
 NAUTILJON_BATCH_PAUSE_MIN=45
 NAUTILJON_BATCH_PAUSE_MAX=90
+NAUTILJON_REQUEST_BURST_SIZE=15
+NAUTILJON_REQUEST_BURST_PAUSE_MIN=600
+NAUTILJON_REQUEST_BURST_PAUSE_MAX=1200
 NAUTILJON_DETAIL_DELAY_MIN=10
 NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
@@ -64,6 +67,9 @@ NAUTILJON_QUEUE_RELEASE_REFRESH=false
 NAUTILJON_ENRICH_MAX_ITEMS=12
 NAUTILJON_ENRICH_HARD_LIMIT=12
 NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES=30
+NAUTILJON_MONTHLY_RETRY_MINUTES=15
+NAUTILJON_MONTHLY_PHASE_PAUSE_MINUTES=10
+NAUTILJON_MONTHLY_MAX_HOURS=72
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -144,7 +150,7 @@ dans `output/letter-cache/` avec un marqueur date.
 Retirez `NAUTILJON_LETTERS` ou laissez cette variable vide :
 
 ```text
-NAUTILJON_COMMAND=diff
+NAUTILJON_COMMAND=monthly
 NAUTILJON_FORCE_SCRAPE=false
 NAUTILJON_DROP_MISSING=true
 NAUTILJON_RESUME=true
@@ -154,6 +160,9 @@ NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
 NAUTILJON_BATCH_PAUSE_MIN=45
 NAUTILJON_BATCH_PAUSE_MAX=90
+NAUTILJON_REQUEST_BURST_SIZE=15
+NAUTILJON_REQUEST_BURST_PAUSE_MIN=600
+NAUTILJON_REQUEST_BURST_PAUSE_MAX=1200
 NAUTILJON_DETAIL_DELAY_MIN=10
 NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
@@ -164,6 +173,9 @@ NAUTILJON_QUEUE_RELEASE_REFRESH=false
 NAUTILJON_ENRICH_MAX_ITEMS=12
 NAUTILJON_ENRICH_HARD_LIMIT=12
 NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES=30
+NAUTILJON_MONTHLY_RETRY_MINUTES=15
+NAUTILJON_MONTHLY_PHASE_PAUSE_MINUTES=10
+NAUTILJON_MONTHLY_MAX_HOURS=72
 NAUTILJON_LETTER_PAUSE_MIN=20
 NAUTILJON_LETTER_PAUSE_MAX=45
 NAUTILJON_FAILURE_PAUSE_MIN=120
@@ -196,8 +208,9 @@ conserve la page courante et les lettres deja terminees dans
 
 Avec `NAUTILJON_DETAIL_MODE=deferred`, le diff n'ouvre aucune fiche detail. Il
 met immediatement a jour les informations visibles dans les listings et conserve
-les anciennes metadonnees detail. Les nouvelles series et les changements reels
-de volumes alimentent `output/state/detail_queue.json`. Le rafraichissement
+les anciennes metadonnees detail. Apres le premier inventaire complet, les
+nouvelles series ainsi que les changements reels de volumes ou de statuts des
+anciennes series alimentent `output/state/detail_queue.json`. Le rafraichissement
 periodique des parutions est desactive par defaut avec
 `NAUTILJON_QUEUE_RELEASE_REFRESH=false`.
 
@@ -226,9 +239,10 @@ supprimez pas les exports : l'URL exacte d'une page en cours reste dans le
 checkpoint et est prioritaire lors de la reprise.
 
 La cadence par defaut reste prudente sans pauses disproportionnees. Les
-navigations sont sequentielles, 4 a 7 secondes les separent, une pause de 45 a
-90 secondes intervient toutes les 80 requetes et 20 a 45 secondes separent les
-lettres. Les fiches detail attendent 10 a 15 secondes apres chaque lecture et
+navigations sont sequentielles, 4 a 7 secondes les separent, une pause de 10 a
+20 minutes intervient toutes les 15 navigations, une pause de 45 a 90 secondes
+reste configuree toutes les 80 requetes et 20 a 45 secondes separent les lettres.
+Les fiches detail attendent 10 a 15 secondes apres chaque lecture et
 font une pause de 45 a 75 secondes toutes les 15 fiches. Un refus Nautiljon
 ferme la session FlareSolverr, attend 60 a 120 secondes, puis controle une seule
 fois la meme navigation dans une session neuve. La quarantaine longue n'est
@@ -238,9 +252,9 @@ du listing n'est jamais consideree comme un changement, tandis qu'une nouvelle
 valeur exploitable (par exemple un nombre de tomes different) reste detectee.
 Une variation de note est actualisee depuis le listing sans ouvrir la fiche et
 les champs detail ne peuvent pas ecraser les valeurs fiables du listing.
-Les transitions de presentation `0 -> -` et `7 -> 7 (En cours)` sont ignorees.
-Un champ de listing modifie est sauvegarde directement; un vrai changement du
-nombre de tomes ajoute la fiche a la file d'enrichissement.
+La transition de presentation `0 -> -` est ignoree. Le nombre de tomes et le
+statut du listing sont stockes separement : `7 (En cours) -> 7 (Termine)` est
+une vraie mise a jour et ajoute la fiche a la file d'enrichissement.
 Une page en erreur n'est tentee qu'une fois et deux erreurs de fiches consecutives
 interrompent la lettre.
 
@@ -256,29 +270,25 @@ Les reglages de delai, de couverture et de conservation des fiches absentes ne
 rendent plus un checkpoint incompatible. Tout checkpoint réellement inutilisable
 est copie dans `output/checkpoints/archive/` avant son remplacement.
 
-## 5. Enrichissement detail par petits lots
+## 5. Enrichissement detail automatique par petits lots
 
-Une fois des lettres finalisees, changez uniquement la commande :
+Conservez `NAUTILJON_COMMAND=monthly`. Une seule execution enchaine le diff,
+ferme la session FlareSolverr, attend 10 minutes, puis traite au maximum 12
+fiches toutes les 30 minutes. Une fiche bloquee reste dans la file et n'annule
+pas les listings deja finalises. Le processus recontrole periodiquement l'IP,
+reprend seul apres un blocage ou un redemarrage de Gluetun et s'arrete au bout
+de 72 heures si le site reste indisponible. Le lancement mensuel suivant reprend
+les memes checkpoints et la meme file sans intervention.
 
-```text
-NAUTILJON_COMMAND=enrich
-NAUTILJON_ENRICH_MAX_ITEMS=12
-NAUTILJON_ENRICH_HARD_LIMIT=12
-NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES=30
-```
-
-Chaque lancement traite au maximum 12 fiches, sauvegarde la lettre et la file
-apres chaque succes, puis s'arrete. Lancez ce job a intervalle espace (par
-exemple toutes les 30 a 60 minutes), jamais en parallele avec `diff`. Une fiche
-bloquee reste dans la file et n'annule pas les listings deja finalises. Une fois
-la file vide, remettez `NAUTILJON_COMMAND=diff` pour le prochain passage mensuel.
+La commande `enrich` reste disponible uniquement pour un diagnostic manuel.
 
 Les champs difficiles sont ceux qui exigent une fiche individuelle : titre
 original/origine, genres/themes, scenariste/dessinateur, editeur/prepublication,
-chapitres/statuts, avertissement/disponibilite et dernier/prochain tome VF avec
-couverture. Le type, les volumes, dates, age et note sont deja disponibles dans
-les listings. Exclure quelques champs detail ne reduirait pas les requetes : une
-fois la fiche ouverte, son HTML contient tous ces champs.
+nombre et statut des chapitres, avertissement/disponibilite et dernier/prochain
+tome VF avec couverture. Le type, les volumes, le statut de publication, les
+dates, l'age et la note sont deja disponibles dans les listings. Exclure quelques
+champs detail ne reduirait pas les requetes : une fois la fiche ouverte, son HTML
+contient tous ces champs.
 
 ## Gluetun NordVPN reserve au scraper
 

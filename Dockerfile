@@ -33,4 +33,4 @@ RUN chmod +x /usr/local/bin/nautiljon-entrypoint
 VOLUME ["/data/output", "/data/browser-profile"]
 
 ENTRYPOINT ["/usr/local/bin/nautiljon-entrypoint"]
-CMD ["diff"]
+CMD ["monthly"]
