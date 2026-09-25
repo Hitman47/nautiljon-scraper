@@ -26,6 +26,65 @@ def make_row(label: str):
 
 
 class DiffStateTests(unittest.TestCase):
+    def test_recent_monthly_export_skips_network_without_moving_success_date(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http", detail_mode="deferred")
+            for letter in scraper.get_all_letters():
+                self.seed_letter(scraper, letter)
+            self.install_fake_letter_scrape(scraper, {})
+            exported = scraper.scrape_all_letters_diff(min_days_between_diff_exports=0)
+            scraper.mark_success("monthly", exported.rows_count, exported.export_paths)
+            before = {mode: scraper._load_last_success(mode) for mode in ("diff", "monthly")}
+            scraper.backend = "flaresolverr"
+            scraper._resolve_access_cooldown = mock.Mock(side_effect=AssertionError("network check"))
+            scraper._flaresolverr_public_ips = mock.Mock(side_effect=AssertionError("IP check"))
+            scraper.enrich_detail_queue = mock.Mock(side_effect=AssertionError("empty enrichment"))
+            for _ in range(2):
+                result = scraper.run_monthly()
+                self.assertEqual((result.status, result.reason), ("skipped", "recent_complete_export"))
+            self.assertEqual(before, {mode: scraper._load_last_success(mode) for mode in before})
+            scraper._resolve_access_cooldown.assert_not_called()
+            scraper._flaresolverr_public_ips.assert_not_called()
+
+    def test_recent_monthly_export_still_resumes_pending_details_without_phase_pause(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http", detail_mode="deferred")
+            scraper.scrape_all_letters_diff = mock.Mock(return_value=RunResult(
+                status="skipped", reason="recent_complete_export"
+            ))
+            scraper._ready_detail_queue_count = mock.Mock(return_value=1)
+            scraper._load_detail_queue = mock.Mock(return_value={"url": {"ready": True}})
+            scraper.enrich_detail_queue = mock.Mock(return_value=RunResult(
+                status="success", reason="detail_queue_complete"
+            ))
+            scraper._monthly_wait = mock.Mock()
+            self.assertEqual(scraper.run_monthly().reason, "monthly_complete")
+            scraper.enrich_detail_queue.assert_called_once()
+            scraper._monthly_wait.assert_not_called()
+
+    def test_expired_search_captures_failed_response_once_before_recovery(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            expired = "<html><title>Expiration</title>Votre session de recherche a expiré</html>"
+            def load_index():
+                scraper._flaresolverr_letter_urls["A"] = "https://www.nautiljon.com/mangas/?q=a&st=fresh"
+            def fetch(url):
+                scraper._last_flaresolverr_url = url
+                return expired if "st=fresh" not in url else "<html></html>"
+            scraper._load_flaresolverr_letter_urls = mock.Mock(side_effect=load_index)
+            scraper._fetch_html_flaresolverr = mock.Mock(side_effect=fetch)
+            scraper.extract_series_list_from_html = mock.Mock(return_value=[])
+            for page in (1, 2):
+                scraper._flaresolverr_listing_urls[("A", page)] = f"https://www.nautiljon.com/mangas/?q=a&dbt={page * 50}"
+                scraper._fetch_listing_page_flaresolverr("a", page)
+            self.assertEqual(scraper.session_stats["search_session_expirations"], 2)
+            files = os.listdir(os.path.join(out_dir, "debug"))
+            self.assertEqual(len(files), 2)
+            metadata = scraper._load_json_dict(scraper._last_flaresolverr_debug["metadata"])
+            self.assertNotIn("st=fresh", metadata["final_url"])
+            with open(scraper._last_flaresolverr_debug["html"], encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), expired)
+
     def make_scraper(self, out_dir: str) -> NautiljonScraper:
         return NautiljonScraper(out_dir=out_dir, delay=0, backend="http")
 

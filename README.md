@@ -208,6 +208,8 @@ NAUTILJON_SHM_SIZE=256m
   anciennete. Les colonnes `dernier_tome_vf_*` et `prochain_tome_vf_*` viennent
   directement de la fiche serie, sans ouvrir les fiches des tomes.
 - Un diff complet reutilise les lettres validees depuis moins de 30 jours si `FORCE=false`.
+- Un export complet valide de moins de `NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS` jours bloque un nouvel inventaire avant tout controle reseau ou de quarantaine. La date du prochain inventaire est affichee. En mode `monthly`, une file de details restante peut toutefois reprendre ; une file vide termine en `skipped` sans repousser les dates de succes. Un export absent/invalide ou un inventaire incomplet ne declenche pas cette protection.
+- Les recherches expirees sont comptees (`search_session_expirations`) et annoncees avec lettre/page. Le premier cas de chaque processus produit un couple `debug/flaresolverr_search_expired_*.html/.json`, capture avant reinitialisation de l'index, pour analyser la reponse et les URL demandees/finales. Cela n'ajoute aucune navigation ni tentative.
 - Le RSS reste separe du diff et ne peut pas valider un export mensuel.
 - Le conteneur est limite par le compose a 0,5 CPU, 768 Mio de RAM, 256 Mio de
   memoire partagee et 256 processus. Le navigateur reste mono-session.

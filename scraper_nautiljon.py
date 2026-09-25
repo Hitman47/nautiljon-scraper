@@ -246,6 +246,7 @@ class NautiljonScraper:
         self._flaresolverr_listing_urls: Dict[Tuple[str, int], str] = {}
         self._flaresolverr_page_has_next: Dict[Tuple[str, int], bool] = {}
         self._last_flaresolverr_debug: Dict[str, str] = {}
+        self._search_expiry_debug_saved = False
         conservative_defaults = delay > 0 or delay_min is not None or delay_max is not None
         self.batch_size = max(0, _env_int("NAUTILJON_BATCH_SIZE", 80 if conservative_defaults else 0))
         self.batch_pause_min = max(
@@ -1824,7 +1825,10 @@ class NautiljonScraper:
             return self.driver
 
         debug_dir = os.path.join(self.out_dir, "debug")
-        os.makedirs(debug_dir, exist_ok=True)
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+        except OSError:
+            return {}
         log_path = os.path.join(debug_dir, f"chromedriver_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
         profile_dir = os.environ.get(
             "NAUTILJON_BROWSER_PROFILE",
@@ -2548,6 +2552,18 @@ class NautiljonScraper:
             page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
         html = self._fetch_html_flaresolverr(page_url)
         if self._search_session_expired(html):
+            self.session_stats["search_session_expirations"] = (
+                self.session_stats.get("search_session_expirations", 0) + 1
+            )
+            print(f"Recherche expiree: lettre {label}, page {page_num + 1}; reinitialisation de l'index.")
+            # Capture the failed response BEFORE the recovery overwrites its URL/HTML.
+            # One sample per process bounds disk usage during automatic retries.
+            if not self._search_expiry_debug_saved:
+                debug = self._save_flaresolverr_debug(
+                    f"search_expired_{self._letter_tag(letter)}_page_{page_num + 1}", html, page_url
+                )
+                self._search_expiry_debug_saved = True
+                print(f"Diagnostic recherche expiree: {debug}")
             self._flaresolverr_letter_urls.clear()
             self._load_flaresolverr_letter_urls()
             page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
@@ -4192,19 +4208,6 @@ class NautiljonScraper:
             f"{pacing['block_recovery_pause_min']:g}-{pacing['block_recovery_pause_max']:g}s "
             "et renouvellement de session."
         )
-        cooldown = self._resolve_access_cooldown()
-        if cooldown:
-            print(
-                "Diff refuse pendant la quarantaine anti-ban. Reprise autorisee apres "
-                f"{cooldown.get('resume_after')}."
-            )
-            result = RunResult(
-                status="failed",
-                reason="access_cooldown_active",
-                requested_letters=requested_labels,
-            )
-            self.mark_run_state("diff", result)
-            return result
         all_catalog_requested = (
             set(letters_to_scrape) == set(all_catalog_letters)
             and len(letters_to_scrape) == len(all_catalog_letters)
@@ -4240,9 +4243,13 @@ class NautiljonScraper:
             return result
         should_skip, last_success, age = self.should_skip_recent_success("diff", min_days_between_diff_exports)
         if full_catalog_requested and should_skip and not force and last_success and age is not None:
+            next_allowed = datetime.fromisoformat(last_success["completed_at"]) + timedelta(
+                days=min_days_between_diff_exports
+            )
             print(
                 "Diff ignore: dernier diff finalise le "
-                f"{last_success.get('completed_at')} ({age.days} jours)."
+                f"{last_success.get('completed_at')} ({age.days} jours). "
+                f"Prochain inventaire autorise apres {next_allowed.isoformat(timespec='seconds')}."
             )
             result = RunResult(
                 status="skipped",
@@ -4251,6 +4258,20 @@ class NautiljonScraper:
                 requested_letters=requested_labels,
                 completed_letters=requested_labels,
                 export_paths=dict(last_success.get("export_paths", {})),
+            )
+            self.mark_run_state("diff", result)
+            return result
+
+        cooldown = self._resolve_access_cooldown()
+        if cooldown:
+            print(
+                "Diff refuse pendant la quarantaine anti-ban. Reprise autorisee apres "
+                f"{cooldown.get('resume_after')}."
+            )
+            result = RunResult(
+                status="failed",
+                reason="access_cooldown_active",
+                requested_letters=requested_labels,
             )
             self.mark_run_state("diff", result)
             return result
@@ -4590,7 +4611,21 @@ class NautiljonScraper:
             )
 
         ready = self._ready_detail_queue_count()
-        if ready and phase_pause_minutes > 0:
+        recent_inventory = diff_result.reason == "recent_complete_export"
+        if recent_inventory and not self._load_detail_queue():
+            print("Mode mensuel ignore: inventaire recent et aucune fiche detail en attente.")
+            result = RunResult(
+                status="skipped",
+                reason="recent_complete_export",
+                rows_count=diff_result.rows_count,
+                requested_letters=diff_result.requested_letters,
+                completed_letters=diff_result.completed_letters,
+                export_paths=diff_result.export_paths,
+            )
+            # A no-op must never move the last successful completion date forward.
+            self.mark_run_state("monthly", result)
+            return result
+        if ready and phase_pause_minutes > 0 and not recent_inventory:
             self._monthly_wait(
                 phase_pause_minutes * 60,
                 f"separation listings/fiches ({ready} fiche(s) en attente)",
