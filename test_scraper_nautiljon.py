@@ -60,10 +60,10 @@ class DiffStateTests(unittest.TestCase):
 
         self.assertEqual(scraper.batch_size, 80)
         self.assertEqual((scraper.batch_pause_min, scraper.batch_pause_max), (45.0, 90.0))
-        self.assertEqual(scraper.request_burst_size, 15)
+        self.assertEqual(scraper.request_burst_size, 20)
         self.assertEqual(
             (scraper.request_burst_pause_min, scraper.request_burst_pause_max),
-            (600.0, 1200.0),
+            (120.0, 240.0),
         )
         self.assertEqual((scraper.detail_delay_min, scraper.detail_delay_max), (10.0, 15.0))
         self.assertEqual(scraper.detail_batch_size, 15)
@@ -259,6 +259,20 @@ class DiffStateTests(unittest.TestCase):
             {"nb_vol_vf_liste": ("20", "21")},
         )
         self.assertTrue(scraper._series_change_requires_detail(existing, current))
+
+    def test_first_known_volume_value_does_not_trigger_detail_refresh(self):
+        scraper = self.make_scraper("unused")
+        existing = make_row("F")
+        existing["nb_vol_vf_liste"] = "N/A"
+        current = dict(existing)
+        current["nb_vol_vf_liste"] = "21"
+
+        self.assertTrue(scraper._series_changed_on_list(existing, current))
+        self.assertEqual(
+            scraper._series_change_reasons(existing, current),
+            {"nb_vol_vf_liste": ("N/A", "21")},
+        )
+        self.assertFalse(scraper._series_change_requires_detail(existing, current))
 
     def test_first_observed_listing_status_establishes_baseline_without_refresh(self):
         scraper = self.make_scraper("unused")
@@ -1661,7 +1675,7 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(result[0]["nb_vol_vf_liste"], "5")
             self.assertEqual(result[0]["genres"], "Aventure")
             item = next(iter(scraper._load_detail_queue().values()))
-            self.assertEqual(item["reasons"], ["volume_changed"])
+            self.assertEqual(item["reasons"], ["volume_changed_verified"])
             self.assertTrue(item["ready"])
 
     def test_enrich_queue_updates_letter_and_removes_successful_item(self):
@@ -1690,6 +1704,35 @@ class DiffStateTests(unittest.TestCase):
             saved = scraper._load_json_list(scraper._letter_paths("A")[0])
             self.assertEqual(saved[0]["genres"], "Action")
             self.assertTrue(os.path.isfile(result.export_paths["json_path"]))
+
+    def test_legacy_volume_queue_is_pruned_when_detail_is_already_current(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http")
+            row = scraper._normalize_row(make_row("A"))
+            row["nb_vol_vo_liste"] = "18"
+            row["nb_vol_vo_detail"] = "18 (Terminé)"
+            scraper.save_letter_files("A", [row], partial=False)
+            queue = {}
+            scraper._queue_detail(queue, "A", row, "volume_changed", ready=True)
+            scraper._save_detail_queue(queue)
+            scraper._fetch_full_series_data = mock.Mock(
+                side_effect=AssertionError("already current detail must not be fetched")
+            )
+
+            result = scraper.enrich_detail_queue(max_items=1)
+
+            self.assertEqual(result.status, "success")
+            self.assertEqual(result.reason, "detail_queue_complete")
+            self.assertEqual(scraper._load_detail_queue(), {})
+            scraper._fetch_full_series_data.assert_not_called()
+
+    def test_legacy_volume_queue_is_kept_when_detail_is_stale(self):
+        scraper = self.make_scraper("unused")
+        row = scraper._normalize_row(make_row("A"))
+        row["nb_vol_vo_liste"] = "18"
+        row["nb_vol_vo_detail"] = "17 (En cours)"
+
+        self.assertTrue(scraper._volume_detail_refresh_still_needed(row))
 
     def test_enrich_block_keeps_item_in_queue(self):
         with tempfile.TemporaryDirectory() as out_dir:

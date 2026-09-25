@@ -258,20 +258,20 @@ class NautiljonScraper:
         )
         self.request_burst_size = max(
             0,
-            _env_int("NAUTILJON_REQUEST_BURST_SIZE", 15 if conservative_defaults else 0),
+            _env_int("NAUTILJON_REQUEST_BURST_SIZE", 20 if conservative_defaults else 0),
         )
         self.request_burst_pause_min = max(
             0.0,
             _env_float(
                 "NAUTILJON_REQUEST_BURST_PAUSE_MIN",
-                600.0 if conservative_defaults else 0.0,
+                120.0 if conservative_defaults else 0.0,
             ),
         )
         self.request_burst_pause_max = max(
             self.request_burst_pause_min,
             _env_float(
                 "NAUTILJON_REQUEST_BURST_PAUSE_MAX",
-                1200.0 if conservative_defaults else 0.0,
+                240.0 if conservative_defaults else 0.0,
             ),
         )
         self.detail_delay_min = max(
@@ -3110,14 +3110,15 @@ class NautiljonScraper:
         current: Dict[str, str],
     ) -> bool:
         reasons = self._series_change_reasons(existing, current)
+        detail_fields = {
+            "nb_vol_vo_liste",
+            "nb_vol_vf_liste",
+            "statut_vo_liste",
+            "statut_vf_liste",
+        }
         return any(
-            field in {
-                "nb_vol_vo_liste",
-                "nb_vol_vf_liste",
-                "statut_vo_liste",
-                "statut_vf_liste",
-            }
-            for field in reasons
+            field in detail_fields and not _is_na(before)
+            for field, (before, _after) in reasons.items()
         )
 
     def _series_changed_on_list(self, existing: Dict[str, str], current: Dict[str, str]) -> bool:
@@ -3458,7 +3459,7 @@ class NautiljonScraper:
                             else:
                                 queue_reason = {
                                     "new": "new_series",
-                                    "changed": "volume_changed",
+                                    "changed": "volume_changed_verified",
                                     "parutions": "release_refresh",
                                 }[action]
                             should_queue = action != "new" or detail_baseline_established
@@ -3708,6 +3709,23 @@ class NautiljonScraper:
             completed_at=str(marker.get("completed_at", "")) or None,
         )
 
+    def _volume_detail_refresh_still_needed(self, row: Dict[str, str]) -> bool:
+        """Keep legacy queued volume updates only when detail data is truly stale."""
+        for listing_field, detail_field in (
+            ("nb_vol_vo_liste", "nb_vol_vo_detail"),
+            ("nb_vol_vf_liste", "nb_vol_vf_detail"),
+        ):
+            listing_value = row.get(listing_field, "N/A")
+            detail_value = row.get(detail_field, "N/A")
+            if _is_na(listing_value) or _is_na(detail_value):
+                continue
+            if self._listing_comparison_value(
+                listing_field,
+                listing_value,
+            ) != self._listing_comparison_value(listing_field, detail_value):
+                return True
+        return False
+
     def enrich_detail_queue(self, max_items: int = 12) -> RunResult:
         queue = self._load_detail_queue()
         if self._promote_finalized_detail_queue(queue):
@@ -3803,6 +3821,22 @@ class NautiljonScraper:
                     continue
 
                 source = dict(rows[row_index])
+                reasons = {
+                    str(reason)
+                    for reason in item.get("reasons", [])
+                    if reason
+                }
+                if reasons == {"volume_changed"} and not self._volume_detail_refresh_still_needed(
+                    source
+                ):
+                    print(
+                        "  File detail nettoyee: remplissage initial de volumes deja "
+                        f"couvert pour {source.get('titre', url)}"
+                    )
+                    queue.pop(url, None)
+                    discarded += 1
+                    self._save_detail_queue(queue)
+                    continue
                 try:
                     enriched = self._fetch_full_series_data(source)
                 except NautiljonAccessBlockedError as exc:

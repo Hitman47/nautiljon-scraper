@@ -75,9 +75,9 @@ NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
 NAUTILJON_BATCH_PAUSE_MIN=45
 NAUTILJON_BATCH_PAUSE_MAX=90
-NAUTILJON_REQUEST_BURST_SIZE=15
-NAUTILJON_REQUEST_BURST_PAUSE_MIN=600
-NAUTILJON_REQUEST_BURST_PAUSE_MAX=1200
+NAUTILJON_REQUEST_BURST_SIZE=20
+NAUTILJON_REQUEST_BURST_PAUSE_MIN=120
+NAUTILJON_REQUEST_BURST_PAUSE_MAX=240
 NAUTILJON_DETAIL_DELAY_MIN=10
 NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
@@ -133,7 +133,7 @@ NAUTILJON_SHM_SIZE=256m
   le scraper ne tente ni de la cliquer ni de contourner un CAPTCHA. Changez
   d'IP de sortie ou attendez la fin de la quarantaine avant un nouveau canari.
 - Les acces Nautiljon sont strictement sequentiels : 4 a 7 secondes entre deux
-  navigations, une pause longue de 10 a 20 minutes toutes les 15 navigations,
+  navigations, une pause de 2 a 4 minutes toutes les 20 navigations,
   45 a 90 secondes toutes les 80 requetes et 20 a 45 secondes entre lettres.
   Les fiches detail, plus sensibles, attendent 10 a 15 secondes et font une pause
   de 45 a 75 secondes toutes les 15 fiches. Il n'existe plus de limite glissante
@@ -141,6 +141,9 @@ NAUTILJON_SHM_SIZE=256m
 - Une valeur absente (`N/A`) dans un listing ne remplace jamais une valeur connue
   et ne declenche pas de consultation de fiche. Une vraie nouvelle valeur reste
   comparee normalement, notamment pour detecter un changement du nombre de tomes.
+- Le premier remplissage `N/A -> valeur` d'une ancienne serie complete le listing
+  sans planifier de fiche detail. Seul un changement entre deux valeurs connues
+  est considere comme une mise a jour a enrichir.
 - Une variation de note est copiee directement depuis le listing sans recharger
   la fiche. Les valeurs du listing ne sont jamais ecrasees par les champs detail.
 - Avec `NAUTILJON_DETAIL_MODE=deferred`, le diff termine les listings sans ouvrir

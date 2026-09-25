@@ -54,9 +54,9 @@ NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
 NAUTILJON_BATCH_PAUSE_MIN=45
 NAUTILJON_BATCH_PAUSE_MAX=90
-NAUTILJON_REQUEST_BURST_SIZE=15
-NAUTILJON_REQUEST_BURST_PAUSE_MIN=600
-NAUTILJON_REQUEST_BURST_PAUSE_MAX=1200
+NAUTILJON_REQUEST_BURST_SIZE=20
+NAUTILJON_REQUEST_BURST_PAUSE_MIN=120
+NAUTILJON_REQUEST_BURST_PAUSE_MAX=240
 NAUTILJON_DETAIL_DELAY_MIN=10
 NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
@@ -160,9 +160,9 @@ NAUTILJON_DELAY_MAX=7.0
 NAUTILJON_BATCH_SIZE=80
 NAUTILJON_BATCH_PAUSE_MIN=45
 NAUTILJON_BATCH_PAUSE_MAX=90
-NAUTILJON_REQUEST_BURST_SIZE=15
-NAUTILJON_REQUEST_BURST_PAUSE_MIN=600
-NAUTILJON_REQUEST_BURST_PAUSE_MAX=1200
+NAUTILJON_REQUEST_BURST_SIZE=20
+NAUTILJON_REQUEST_BURST_PAUSE_MIN=120
+NAUTILJON_REQUEST_BURST_PAUSE_MAX=240
 NAUTILJON_DETAIL_DELAY_MIN=10
 NAUTILJON_DETAIL_DELAY_MAX=15
 NAUTILJON_DETAIL_BATCH_SIZE=15
@@ -239,8 +239,8 @@ supprimez pas les exports : l'URL exacte d'une page en cours reste dans le
 checkpoint et est prioritaire lors de la reprise.
 
 La cadence par defaut reste prudente sans pauses disproportionnees. Les
-navigations sont sequentielles, 4 a 7 secondes les separent, une pause de 10 a
-20 minutes intervient toutes les 15 navigations, une pause de 45 a 90 secondes
+navigations sont sequentielles, 4 a 7 secondes les separent, une pause de 2 a
+4 minutes intervient toutes les 20 navigations, une pause de 45 a 90 secondes
 reste configuree toutes les 80 requetes et 20 a 45 secondes separent les lettres.
 Les fiches detail attendent 10 a 15 secondes apres chaque lecture et
 font une pause de 45 a 75 secondes toutes les 15 fiches. Un refus Nautiljon
@@ -250,6 +250,9 @@ activee que si ce controle espace echoue aussi.
 Une valeur `N/A` issue
 du listing n'est jamais consideree comme un changement, tandis qu'une nouvelle
 valeur exploitable (par exemple un nombre de tomes different) reste detectee.
+Le premier remplissage `N/A -> valeur` d'une ancienne serie est sauvegarde sans
+ouvrir ni mettre en file sa fiche detail. Une mise a jour n'est planifiee que
+lorsque deux valeurs connues sont reellement differentes.
 Une variation de note est actualisee depuis le listing sans ouvrir la fiche et
 les champs detail ne peuvent pas ecraser les valeurs fiables du listing.
 La transition de presentation `0 -> -` est ignoree. Le nombre de tomes et le
