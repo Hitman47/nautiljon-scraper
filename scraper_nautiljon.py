@@ -2522,18 +2522,36 @@ class NautiljonScraper:
     def _extract_next_listing_url(html: str, current_url: str, page_num: int) -> Optional[str]:
         target_offset = (page_num + 1) * 50
         soup = BeautifulSoup(html, "html.parser")
+        current = urlsplit(current_url)
+        current_items = parse_qsl(current.query, keep_blank_values=True)
+        current_query = dict(current_items)
+        token_input = soup.select_one("input[name=st]")
+        # Nautiljon adds st through onclick. FlareSolverr request.get navigates
+        # directly to href, so reproduce that addition without executing scripts.
+        token = str(token_input.get("value", "")) if token_input else ""
+        token = token or current_query.get("st", "")
         for anchor in soup.find_all("a", href=True):
             href = urljoin(current_url, str(anchor.get("href", "")))
             parsed = urlsplit(href)
-            if "/mangas/" not in parsed.path:
+            if parsed.netloc != current.netloc or parsed.scheme != current.scheme or parsed.path != current.path:
                 continue
-            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            items = parse_qsl(parsed.query, keep_blank_values=True)
+            query = dict(items)
+            if "q" in query and query["q"].lower() != current_query.get("q", "").lower():
+                continue
             try:
                 offset = int(query.get("dbt", "-1"))
             except ValueError:
                 continue
             if offset == target_offset:
-                return href
+                # Preserve explicit link values (including a newer st), and
+                # retain search filters when pagination supplies a short URL.
+                items.extend((key, value) for key, value in current_items
+                             if key not in query and key not in {"st", "dbt"})
+                if not query.get("st") and token:
+                    items = [(key, value) for key, value in items if key != "st"]
+                    items.append(("st", token))
+                return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(items), parsed.fragment))
         return None
 
     def _set_flaresolverr_listing_url(self, letter: str, page_num: int, url: str) -> None:

@@ -1638,6 +1638,50 @@ class DiffStateTests(unittest.TestCase):
         self.assertTrue(scraper._flaresolverr_listing_has_next("a", 0))
         self.assertFalse(scraper._flaresolverr_listing_has_next("a", 1))
 
+    def test_pagination_adds_form_token_and_preserves_search_filters(self):
+        current = "https://www.nautiljon.com/mangas/?q=o&st=old&edition_sup=2&webcomic=&dbt=400"
+        for suffix, expected in [("", "form-token"), ("&amp;st=", "form-token"), ("&amp;st=link-token", "link-token")]:
+            with self.subTest(suffix=suffix):
+                html = '<input name="st" value="form-token"><a href="?dbt=450' + suffix + '">10</a>'
+                url = NautiljonScraper._extract_next_listing_url(html, current, 8)
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query, keep_blank_values=True)
+                self.assertEqual(query["st"], [expected])
+                self.assertEqual(query["q"], ["o"])
+                self.assertEqual(query["edition_sup"], ["2"])
+                self.assertEqual(query["webcomic"], [""])
+                self.assertEqual(query["dbt"], ["450"])
+
+    def test_pagination_falls_back_to_current_token_and_rejects_unrelated_links(self):
+        html = '''
+        <a href="https://example.org/mangas/?q=o&dbt=450">Wrong host</a>
+        <a href="/mangas/other.html?q=o&dbt=450">Wrong path</a>
+        <a href="?q=z&dbt=450">Wrong letter</a>
+        <a href="?q=o&dbt=500">Wrong page</a>
+        <a href="?q=o&dbt=450">Next</a>
+        '''
+        url = NautiljonScraper._extract_next_listing_url(
+            html, "https://www.nautiljon.com/mangas/?q=o&st=current", 8
+        )
+        self.assertEqual(url, "https://www.nautiljon.com/mangas/?q=o&dbt=450&st=current")
+
+    def test_unsigned_pagination_needs_no_index_reload(self):
+        scraper = NautiljonScraper(out_dir="unused", delay=0, backend="flaresolverr")
+        scraper._flaresolverr_letter_urls = {"O": "https://www.nautiljon.com/mangas/?q=o&st=initial"}
+        calls = []
+        def fetch(url):
+            calls.append(url)
+            scraper._last_flaresolverr_url = url
+            if len(calls) == 1:
+                return '<input name="st" value="signed"><a href="?q=o&amp;dbt=50" onclick="addToken()">2</a>'
+            self.assertIn("st=signed", url)
+            return "<html></html>"
+        scraper._fetch_html_flaresolverr = mock.Mock(side_effect=fetch)
+        scraper.extract_series_list_from_html = mock.Mock(return_value=[])
+        scraper._fetch_listing_page_flaresolverr("o", 0)
+        scraper._fetch_listing_page_flaresolverr("o", 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(scraper.session_stats.get("search_session_expirations", 0), 0)
+
     def test_diff_rejects_flaresolverr_ip_mismatch(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
