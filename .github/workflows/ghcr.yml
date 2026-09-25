@@ -34,6 +34,8 @@ jobs:
           docker compose -f portainer-stack.yml config --quiet
           NAUTILJON_NORDVPN_WIREGUARD_PRIVATE_KEY=dummy \
             docker compose -f compose.gluetun-nautiljon.example.yml config --quiet
+          NAUTILJON_NORDVPN_WIREGUARD_PRIVATE_KEY=dummy GLUETUN_CONTROL_API_KEY=validation-only \
+            docker compose -f compose.nautiljon-dedicated.yml config --quiet
 
       - name: Run tests
         run: python -m unittest -v

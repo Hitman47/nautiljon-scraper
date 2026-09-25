@@ -55,6 +55,13 @@ Le fichier `state/last_diff_success.json` n'est ecrit qu'apres un passage sans
 erreur sur les 27 lettres et apres validation des exports. Un essai limite ou
 interrompu ecrit `state/last_diff_run.json` avec l'etat `PARTIAL` ou `FAILED`.
 
+## Stack avec VPN dedie
+
+Pour deployer Nautiljon et son propre Gluetun dans le meme stack, en conservant
+FlareSolverr dans son stack separe, utiliser [compose.nautiljon-dedicated.yml](compose.nautiljon-dedicated.yml)
+et [nautiljon-dedicated.env.example](nautiljon-dedicated.env.example).
+La [procedure de migration](DEPLOYMENT-DEDICATED.md) conserve les donnees existantes.
+
 ## Variables principales
 
 ```text
