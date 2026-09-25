@@ -323,6 +323,35 @@ class NautiljonScraper:
             _env_float("NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX", 120.0),
         )
         self.block_cooldown_hours = max(0.0, _env_float("NAUTILJON_BLOCK_COOLDOWN_HOURS", 24.0))
+        self.gluetun_auto_rotate = _env_bool("NAUTILJON_GLUETUN_AUTO_ROTATE", False)
+        self.gluetun_control_url = os.environ.get(
+            "NAUTILJON_GLUETUN_CONTROL_URL",
+            "http://127.0.0.1:8000",
+        ).strip().rstrip("/")
+        self.gluetun_control_api_key = os.environ.get(
+            "NAUTILJON_GLUETUN_CONTROL_API_KEY",
+            "",
+        ).strip()
+        self.gluetun_control_username = os.environ.get(
+            "NAUTILJON_GLUETUN_CONTROL_USERNAME",
+            "",
+        ).strip()
+        self.gluetun_control_password = os.environ.get(
+            "NAUTILJON_GLUETUN_CONTROL_PASSWORD",
+            "",
+        )
+        self.gluetun_rotate_min_interval_minutes = max(
+            0.0,
+            _env_float("NAUTILJON_GLUETUN_ROTATE_MIN_INTERVAL_MINUTES", 60.0),
+        )
+        self.gluetun_rotate_stop_seconds = max(
+            0.0,
+            _env_float("NAUTILJON_GLUETUN_ROTATE_STOP_SECONDS", 3.0),
+        )
+        self.gluetun_rotate_timeout_seconds = max(
+            10.0,
+            _env_float("NAUTILJON_GLUETUN_ROTATE_TIMEOUT_SECONDS", 120.0),
+        )
         self._remote_request_count = 0
         self._detail_request_count = 0
         self._last_remote_request_at = 0.0
@@ -366,6 +395,10 @@ class NautiljonScraper:
                 "block_recovery_pause_min": self.block_recovery_pause_min,
                 "block_recovery_pause_max": self.block_recovery_pause_max,
                 "block_cooldown_hours": self.block_cooldown_hours,
+                "gluetun_auto_rotate": self.gluetun_auto_rotate,
+                "gluetun_rotate_min_interval_minutes": self.gluetun_rotate_min_interval_minutes,
+                "gluetun_rotate_stop_seconds": self.gluetun_rotate_stop_seconds,
+                "gluetun_rotate_timeout_seconds": self.gluetun_rotate_timeout_seconds,
                 "detail_mode": self.detail_mode,
                 "queue_release_refresh": self.queue_release_refresh,
             },
@@ -831,6 +864,182 @@ class NautiljonScraper:
                 os.remove(path)
         except OSError as exc:
             print(f"Avertissement: quarantaine anti-ban non supprimee ({str(exc)[:160]}).")
+
+    def _gluetun_control_json(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, object]:
+        """Call Gluetun's local control server without exposing Docker's socket."""
+        if not self.gluetun_control_url:
+            raise RuntimeError("NAUTILJON_GLUETUN_CONTROL_URL est vide")
+        headers: Dict[str, str] = {}
+        if self.gluetun_control_api_key:
+            headers["X-API-Key"] = self.gluetun_control_api_key
+        auth = None
+        if self.gluetun_control_username:
+            auth = (self.gluetun_control_username, self.gluetun_control_password)
+        try:
+            response = requests.request(
+                method.upper(),
+                f"{self.gluetun_control_url}/{path.lstrip('/')}",
+                json=payload,
+                headers=headers,
+                auth=auth,
+                timeout=(5, 15),
+            )
+            response.raise_for_status()
+            if not response.content:
+                return {}
+            data = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise RuntimeError(
+                f"API de controle Gluetun inaccessible ({method.upper()} {path}): "
+                f"{str(exc)[:180]}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"API de controle Gluetun: reponse JSON invalide pour {method.upper()} {path}"
+            )
+        return data
+
+    def _gluetun_control_public_ip(self) -> str:
+        data = self._gluetun_control_json("GET", "/v1/publicip/ip")
+        raw_ip = str(data.get("public_ip", "") or "").strip()
+        try:
+            return str(ipaddress.ip_address(raw_ip))
+        except ValueError as exc:
+            raise RuntimeError(f"API de controle Gluetun: IP publique invalide ({raw_ip!r})") from exc
+
+    def _gluetun_rotation_wait_remaining(self) -> float:
+        state = self._load_json_dict(self._state_path("gluetun_rotation")) or {}
+        try:
+            attempted_at = datetime.fromisoformat(str(state.get("attempted_at", "")))
+        except ValueError:
+            return 0.0
+        next_attempt = attempted_at + timedelta(minutes=self.gluetun_rotate_min_interval_minutes)
+        return max(0.0, (next_attempt - datetime.now()).total_seconds())
+
+    def _save_gluetun_rotation_state(
+        self,
+        attempted_at: datetime,
+        reason: str,
+        outcome: str,
+        before_ip: str = "",
+        after_ip: str = "",
+        error: str = "",
+    ) -> None:
+        self._write_json_atomic(
+            self._state_path("gluetun_rotation"),
+            {
+                "attempted_at": attempted_at.isoformat(timespec="seconds"),
+                "reason": reason,
+                "outcome": outcome,
+                "before_ip": before_ip,
+                "after_ip": after_ip,
+                "error": error[:300],
+                "min_interval_minutes": self.gluetun_rotate_min_interval_minutes,
+            },
+        )
+
+    def _maybe_rotate_gluetun_for_block(self, reason: str) -> bool:
+        """Rotate the VPN tunnel at most once per configured persistent interval.
+
+        Return True only when Gluetun reports a different public IP. The caller can
+        then retry immediately; otherwise the normal monthly backoff still applies.
+        """
+        if not self.gluetun_auto_rotate:
+            return False
+
+        remaining = self._gluetun_rotation_wait_remaining()
+        if remaining > 0:
+            print(
+                "Rotation Gluetun non repetee: garde-fou actif encore "
+                f"{remaining / 60:.1f} min."
+            )
+            return False
+
+        attempted_at = datetime.now()
+        before_ip = ""
+        vpn_stopped = False
+        self.close_browser()
+        self._verified_public_ips = None
+        # Persist the attempt before mutating the tunnel so a process restart cannot
+        # bypass the rate limit.
+        self._save_gluetun_rotation_state(attempted_at, reason, "started")
+        try:
+            before_ip = self._gluetun_control_public_ip()
+            print(
+                f"Blocage confirme depuis {before_ip}: rotation automatique du tunnel "
+                "Gluetun (tentative unique)."
+            )
+            self._gluetun_control_json("PUT", "/v1/vpn/status", {"status": "stopped"})
+            vpn_stopped = True
+            if self.gluetun_rotate_stop_seconds > 0:
+                time.sleep(self.gluetun_rotate_stop_seconds)
+            self._gluetun_control_json("PUT", "/v1/vpn/status", {"status": "running"})
+            vpn_stopped = False
+
+            deadline = time.monotonic() + self.gluetun_rotate_timeout_seconds
+            after_ip = ""
+            while time.monotonic() < deadline:
+                try:
+                    status = self._gluetun_control_json("GET", "/v1/vpn/status")
+                    if str(status.get("status", "")).lower() == "running":
+                        after_ip = self._gluetun_control_public_ip()
+                        if after_ip != before_ip:
+                            self._save_gluetun_rotation_state(
+                                attempted_at,
+                                reason,
+                                "ip_changed",
+                                before_ip,
+                                after_ip,
+                            )
+                            self._clear_access_cooldown()
+                            self._verified_public_ips = None
+                            print(
+                                f"Rotation Gluetun reussie: IP {before_ip} -> {after_ip}; "
+                                "reprise immediate autorisee."
+                            )
+                            return True
+                except RuntimeError:
+                    # The control server or public IP endpoint can be briefly
+                    # unavailable while WireGuard/OpenVPN reconnects.
+                    pass
+                time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+
+            self._save_gluetun_rotation_state(
+                attempted_at,
+                reason,
+                "ip_unchanged",
+                before_ip,
+                after_ip,
+            )
+            print(
+                f"Rotation Gluetun terminee sans nouvelle IP ({before_ip}); "
+                "quarantaine conservee."
+            )
+            return False
+        except Exception as exc:
+            if vpn_stopped:
+                try:
+                    self._gluetun_control_json(
+                        "PUT",
+                        "/v1/vpn/status",
+                        {"status": "running"},
+                    )
+                except Exception:
+                    pass
+            self._save_gluetun_rotation_state(
+                attempted_at,
+                reason,
+                "failed",
+                before_ip,
+                error=str(exc),
+            )
+            print(f"Rotation Gluetun impossible: {str(exc)[:220]}. Quarantaine conservee.")
+            return False
 
     def mark_run_state(self, mode: str, result: RunResult) -> str:
         payload = {
@@ -4369,6 +4578,11 @@ class NautiljonScraper:
                 )
                 self.mark_run_state("monthly", result)
                 return result
+            if (
+                diff_result.reason in {"access_blocked", "access_cooldown_active"}
+                and self._maybe_rotate_gluetun_for_block(diff_result.reason)
+            ):
+                continue
             wait_seconds = retry_minutes * 60
             if diff_result.reason == "coverage_incomplete":
                 wait_seconds = max(
@@ -4426,6 +4640,11 @@ class NautiljonScraper:
                 "detail_errors",
                 "flaresolverr_preflight_failed",
             }:
+                if (
+                    enrich_result.reason in {"access_blocked", "access_cooldown_active"}
+                    and self._maybe_rotate_gluetun_for_block(enrich_result.reason)
+                ):
+                    continue
                 wait_minutes = retry_minutes
                 wait_reason = f"reprise de l'enrichissement apres {enrich_result.reason}"
             else:

@@ -383,6 +383,60 @@ class DiffStateTests(unittest.TestCase):
             self.assertIsNone(second._resolve_access_cooldown())
             self.assertFalse(os.path.exists(second._state_path("access_cooldown")))
 
+    def test_gluetun_auto_rotation_changes_ip_and_clears_cooldown(self):
+        env = {
+            "NAUTILJON_GLUETUN_AUTO_ROTATE": "true",
+            "NAUTILJON_GLUETUN_ROTATE_MIN_INTERVAL_MINUTES": "60",
+            "NAUTILJON_GLUETUN_ROTATE_STOP_SECONDS": "0",
+            "NAUTILJON_GLUETUN_ROTATE_TIMEOUT_SECONDS": "10",
+        }
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.dict(os.environ, env):
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            scraper._record_access_cooldown("access_blocked", "203.0.113.10")
+            scraper.close_browser = mock.Mock()
+            responses = iter(
+                [
+                    {"public_ip": "203.0.113.10"},
+                    {"status": "stopped"},
+                    {"status": "running"},
+                    {"status": "running"},
+                    {"public_ip": "198.51.100.42"},
+                ]
+            )
+            scraper._gluetun_control_json = mock.Mock(side_effect=lambda *args, **kwargs: next(responses))
+
+            changed = scraper._maybe_rotate_gluetun_for_block("access_blocked")
+
+            self.assertTrue(changed)
+            self.assertFalse(os.path.exists(scraper._state_path("access_cooldown")))
+            rotation = scraper._load_json_dict(scraper._state_path("gluetun_rotation"))
+            self.assertEqual(rotation["outcome"], "ip_changed")
+            self.assertEqual(rotation["before_ip"], "203.0.113.10")
+            self.assertEqual(rotation["after_ip"], "198.51.100.42")
+
+    def test_gluetun_auto_rotation_rate_limit_is_persistent(self):
+        env = {
+            "NAUTILJON_GLUETUN_AUTO_ROTATE": "true",
+            "NAUTILJON_GLUETUN_ROTATE_MIN_INTERVAL_MINUTES": "60",
+        }
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.dict(os.environ, env):
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            scraper._save_gluetun_rotation_state(
+                datetime.now(),
+                "access_blocked",
+                "ip_unchanged",
+                "203.0.113.10",
+                "203.0.113.10",
+            )
+            scraper._gluetun_control_json = mock.Mock(
+                side_effect=AssertionError("rate-limited rotation must not call Gluetun")
+            )
+
+            changed = scraper._maybe_rotate_gluetun_for_block("access_cooldown_active")
+
+            self.assertFalse(changed)
+            scraper._gluetun_control_json.assert_not_called()
+
     def test_legacy_cooldown_uses_one_canary_then_clears(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = self.make_scraper(out_dir)
@@ -1830,6 +1884,34 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(scraper._monthly_wait.call_count, 3)
             monthly_state = scraper._load_json_dict(scraper._state_path("last_monthly_run"))
             self.assertEqual(monthly_state["status"], "success")
+
+    def test_monthly_retries_immediately_after_successful_gluetun_rotation(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(
+                out_dir=out_dir,
+                delay=0,
+                backend="http",
+                detail_mode="deferred",
+            )
+            scraper.scrape_all_letters_diff = mock.Mock(
+                side_effect=[
+                    RunResult(status="partial", reason="access_blocked"),
+                    RunResult(status="success", reason="complete_catalog_exported"),
+                ]
+            )
+            scraper._maybe_rotate_gluetun_for_block = mock.Mock(return_value=True)
+            scraper._ready_detail_queue_count = mock.Mock(return_value=0)
+            scraper.enrich_detail_queue = mock.Mock(
+                return_value=RunResult(status="success", reason="detail_queue_complete")
+            )
+            scraper._monthly_wait = mock.Mock()
+
+            result = scraper.run_monthly()
+
+            self.assertEqual(result.reason, "monthly_complete")
+            self.assertEqual(scraper.scrape_all_letters_diff.call_count, 2)
+            scraper._maybe_rotate_gluetun_for_block.assert_called_once_with("access_blocked")
+            scraper._monthly_wait.assert_not_called()
 
     def test_monthly_stops_on_nonrecoverable_configuration_error(self):
         with tempfile.TemporaryDirectory() as out_dir:

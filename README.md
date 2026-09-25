@@ -99,6 +99,12 @@ NAUTILJON_BLOCK_RECOVERY_ATTEMPTS=1
 NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN=60
 NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX=120
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
+NAUTILJON_GLUETUN_AUTO_ROTATE=false
+NAUTILJON_GLUETUN_CONTROL_URL=http://127.0.0.1:8000
+GLUETUN_CONTROL_API_KEY=
+NAUTILJON_GLUETUN_ROTATE_MIN_INTERVAL_MINUTES=60
+NAUTILJON_GLUETUN_ROTATE_STOP_SECONDS=3
+NAUTILJON_GLUETUN_ROTATE_TIMEOUT_SECONDS=120
 NAUTILJON_PAGE_FAILURE_RETRIES=1
 NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
 NAUTILJON_RESUME=true
@@ -164,6 +170,11 @@ NAUTILJON_SHM_SIZE=256m
 - `NAUTILJON_COMMAND=monthly` enchaine sans intervention le diff reprenable et les
   petits lots d'enrichissement. Il ferme FlareSolverr pendant les longues pauses,
   recontrole automatiquement une nouvelle IP et reprend pendant 72 heures au maximum.
+- `NAUTILJON_GLUETUN_AUTO_ROTATE=true` autorise le mode mensuel a relancer le
+  tunnel VPN par l'API locale Gluetun apres un blocage confirme. Une tentative est
+  inscrite dans `output/state/gluetun_rotation.json` avant l'action et ne peut pas
+  etre repetee avant `NAUTILJON_GLUETUN_ROTATE_MIN_INTERVAL_MINUTES`, meme apres
+  un redemarrage du scraper. La reprise est immediate uniquement si l'IP change.
 - Une page inaccessible n'est pas rechargee en boucle. Deux echecs de fiches
   consecutifs interrompent la lettre en conservant son checkpoint.
 - Selenium reste disponible avec `browser-test` pour le diagnostic.

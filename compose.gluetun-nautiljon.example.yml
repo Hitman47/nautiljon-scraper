@@ -16,6 +16,8 @@ services:
       HTTPPROXY: "on"
       HTTPPROXY_STEALTH: "on"
       HTTPPROXY_LOG: "off"
+      HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE: >-
+        {"auth":"apikey","apikey":"${GLUETUN_CONTROL_API_KEY:-remplacez-cette-cle}"}
       TZ: "${TZ:-Europe/Paris}"
     volumes:
       - "${APPDATA_ROOT:-/media/nvme0n1p1/AppData}/Gluetun-Nautiljon:/gluetun"

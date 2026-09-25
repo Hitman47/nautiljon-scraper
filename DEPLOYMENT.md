@@ -78,6 +78,12 @@ NAUTILJON_BLOCK_RECOVERY_ATTEMPTS=1
 NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN=60
 NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX=120
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
+NAUTILJON_GLUETUN_AUTO_ROTATE=false
+NAUTILJON_GLUETUN_CONTROL_URL=http://127.0.0.1:8000
+GLUETUN_CONTROL_API_KEY=
+NAUTILJON_GLUETUN_ROTATE_MIN_INTERVAL_MINUTES=60
+NAUTILJON_GLUETUN_ROTATE_STOP_SECONDS=3
+NAUTILJON_GLUETUN_ROTATE_TIMEOUT_SECONDS=120
 NAUTILJON_PAGE_FAILURE_RETRIES=1
 NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
 NAUTILJON_MAX_MISSING_RATIO=0.15
@@ -184,6 +190,12 @@ NAUTILJON_BLOCK_RECOVERY_ATTEMPTS=1
 NAUTILJON_BLOCK_RECOVERY_PAUSE_MIN=60
 NAUTILJON_BLOCK_RECOVERY_PAUSE_MAX=120
 NAUTILJON_BLOCK_COOLDOWN_HOURS=24
+NAUTILJON_GLUETUN_AUTO_ROTATE=false
+NAUTILJON_GLUETUN_CONTROL_URL=http://127.0.0.1:8000
+GLUETUN_CONTROL_API_KEY=
+NAUTILJON_GLUETUN_ROTATE_MIN_INTERVAL_MINUTES=60
+NAUTILJON_GLUETUN_ROTATE_STOP_SECONDS=3
+NAUTILJON_GLUETUN_ROTATE_TIMEOUT_SECONDS=120
 NAUTILJON_PAGE_FAILURE_RETRIES=1
 NAUTILJON_ABORT_AFTER_DETAIL_FAILURES=2
 NAUTILJON_MIN_DAYS_BETWEEN_DIFF_EXPORTS=30
@@ -283,6 +295,13 @@ reprend seul apres un blocage ou un redemarrage de Gluetun et s'arrete au bout
 de 72 heures si le site reste indisponible. Le lancement mensuel suivant reprend
 les memes checkpoints et la meme file sans intervention.
 
+La rotation automatique du tunnel est optionnelle. Avec
+`NAUTILJON_GLUETUN_AUTO_ROTATE=true`, un blocage confirme provoque au plus une
+rotation toutes les `NAUTILJON_GLUETUN_ROTATE_MIN_INTERVAL_MINUTES` minutes. Le
+limiteur est persistant et la reprise du diff est immediate seulement lorsque
+Gluetun annonce une IP publique differente. Sinon, la quarantaine et l'attente
+mensuelle normales restent actives. Aucun socket Docker n'est monte.
+
 La commande `enrich` reste disponible uniquement pour un diagnostic manuel.
 
 Les champs difficiles sont ceux qui exigent une fiche individuelle : titre
@@ -310,6 +329,23 @@ Gluetun doit aussi rejoindre ce reseau sous l'alias `gluetun-nautiljon`; son por
 `SERVER_CITIES` suffit pour une sortie NordVPN partagee. `SERVER_HOSTNAMES` peut
 fixer un serveur precis mais rend le deploiement moins robuste si ce serveur
 disparait de la liste Gluetun.
+
+Pour autoriser la rotation, configurez aussi le serveur de controle Gluetun avec
+une cle API, puis transmettez la meme cle au scraper. Le port 8000 ne doit pas
+etre publie sur le LAN puisque le scraper partage le namespace reseau de Gluetun :
+
+```yaml
+environment:
+  HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE: >-
+    {"auth":"apikey","apikey":"${GLUETUN_CONTROL_API_KEY}"}
+```
+
+```text
+NAUTILJON_GLUETUN_AUTO_ROTATE=true
+NAUTILJON_GLUETUN_CONTROL_URL=http://127.0.0.1:8000
+GLUETUN_CONTROL_API_KEY=une-cle-longue-et-aleatoire
+NAUTILJON_GLUETUN_ROTATE_MIN_INTERVAL_MINUTES=60
+```
 
 Ce conteneur reserve isole le scraper du trafic torrent, mais ne transforme pas
 une sortie NordVPN partagee en IP dediee. Une IP NordVPN reellement dediee est
