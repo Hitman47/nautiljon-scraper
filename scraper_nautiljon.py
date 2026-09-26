@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import copy
 import html as html_lib
 import ipaddress
 import json
@@ -53,6 +54,7 @@ DEFAULT_HEADERS = {
 BANNED_TYPE_KEYWORDS = ["yaoi", "yuri"]
 DATA_SCHEMA_VERSION = 2
 LETTER_CHECKPOINT_VERSION = 3
+LISTING_RESULT_CAP = 2500
 DETAIL_QUEUE_VERSION = 1
 VF_RELEASE_FIELDS = [
     "dernier_tome_vf_numero", "dernier_tome_vf_date",
@@ -210,6 +212,10 @@ class RunResult:
         return 0 if self.status in {"success", "skipped"} else 1
 
 
+class ListingPartitionError(RuntimeError):
+    """A bounded search cannot be proven complete; never retry it forever."""
+
+
 class NautiljonAccessBlockedError(RuntimeError):
     pass
 
@@ -245,6 +251,8 @@ class NautiljonScraper:
         self._flaresolverr_letter_urls: Dict[str, str] = {}
         self._flaresolverr_listing_urls: Dict[Tuple[str, int], str] = {}
         self._flaresolverr_page_has_next: Dict[Tuple[str, int], bool] = {}
+        self._listing_complete_pages = set()
+        self._listing_partition_cursors = {}
         self._last_flaresolverr_debug: Dict[str, str] = {}
         self._search_expiry_debug_saved = False
         conservative_defaults = delay > 0 or delay_min is not None or delay_max is not None
@@ -2579,9 +2587,131 @@ class NautiljonScraper:
     def _flaresolverr_listing_has_next(self, letter: str, page_num: int) -> bool:
         return self._flaresolverr_page_has_next.get((self._letter_tag(letter), page_num), False)
 
+    @staticmethod
+    def _listing_total(html: str) -> Optional[int]:
+        soup = BeautifulSoup(html, "html.parser")
+        for heading in soup.select("h2, title"):
+            match = re.search(r"\(([\d\s]+) resultats?\)", _norm(heading.get_text(" ", strip=True)))
+            if match:
+                return int(re.sub(r"\s", "", match.group(1)))
+        return None
+
+    @staticmethod
+    def _listing_split_dimensions(html: str) -> List[Tuple[str, str]]:
+        # Complementary include/exclude branches also retain entries without a
+        # known type/status. Enumerating countries alone would not prove that.
+        soup = BeautifulSoup(html, "html.parser")
+        dimensions = []
+        for family in ("types", "encours_vos", "encours_vfs"):
+            excluded = {str(x.get("value", "")) for x in soup.find_all("input", attrs={"name": family + "_exclude[]"})}
+            for node in soup.find_all("input", attrs={"name": family + "_include[]"}):
+                value = str(node.get("value", ""))
+                pair = (family, value)
+                if value and value in excluded and pair not in dimensions:
+                    dimensions.append(pair)
+        return dimensions
+
+    def _fetch_signed_listing_html(self, letter: str, page_url: str) -> Tuple[str, str]:
+        html = self._fetch_html_flaresolverr(page_url)
+        if self._search_session_expired(html):
+            self.session_stats["search_session_expirations"] = self.session_stats.get("search_session_expirations", 0) + 1
+            print(f"Recherche expiree: lettre {self._letter_label(letter)}; renouvellement du formulaire.")
+            if not self._search_expiry_debug_saved:
+                debug = self._save_flaresolverr_debug(f"search_expired_{self._letter_tag(letter)}", html, page_url)
+                self._search_expiry_debug_saved = True
+                print(f"Diagnostic recherche expiree: {debug}")
+            self._flaresolverr_letter_urls.clear()
+            self._load_flaresolverr_letter_urls()
+            fresh = self._flaresolverr_letter_urls[self._letter_label(letter)]
+            token = dict(parse_qsl(urlsplit(fresh).query)).get("st", "")
+            parts = urlsplit(page_url)
+            params = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "st"]
+            if token:
+                params.append(("st", token))
+            page_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment))
+            html = self._fetch_html_flaresolverr(page_url)
+            if self._search_session_expired(html):
+                raise ListingPartitionError("Recherche toujours expiree apres renouvellement")
+        return self._last_flaresolverr_url or page_url, html
+
+    def _fetch_partition_listing_page(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
+        key = (self._letter_tag(letter), page_num)
+        # Keep the current cursor intact until all rows of the returned page have
+        # been checkpointed. Restarting midway replays just this logical page.
+        state = copy.deepcopy(self._listing_partition_cursors[key])
+        self._listing_partition_cursors = {cursor: value for cursor, value in self._listing_partition_cursors.items()
+                                           if cursor[0] != key[0] or cursor[1] >= page_num}
+        final_url = ""
+        while state["pending"]:
+            task = state["pending"][0]
+            self._load_flaresolverr_letter_urls()
+            base = urlsplit(self._flaresolverr_letter_urls[self._letter_label(letter)])
+            filters = [tuple(pair) for pair in task["filters"]]
+            names = {k for k, _ in filters}
+            params = [(k, v) for k, v in parse_qsl(base.query, keep_blank_values=True) if k not in names and k not in {"dbt", "tri"}]
+            params += filters + [("tri", "1"), ("dbt", str(task["offset"]))]
+            url = urlunsplit((base.scheme, base.netloc, base.path, urlencode(params), ""))
+            final_url, html = self._fetch_signed_listing_html(letter, url)
+            total = self._listing_total(html)
+            # Verify the server actually retained the requested filters, rather
+            # than trusting a URL that might be ignored by its search handler.
+            soup = BeautifulSoup(html, "html.parser")
+            checked = {(str(x.get("name")), str(x.get("value"))) for x in soup.select("input[checked]")}
+            if total is None or any(pair not in checked for pair in filters):
+                raise ListingPartitionError("Sous-recherche non verifiable: total ou filtres absents")
+            if total >= LISTING_RESULT_CAP:
+                index = task["dimension"]
+                # Include controls of the same family may mean OR on the site.
+                # Never add a second include to an already included family.
+                included = {k.removesuffix("_include[]") for k, _ in filters if k.endswith("_include[]")}
+                while index < len(state["dimensions"]) and state["dimensions"][index][0] in included:
+                    index += 1
+                if index >= len(state["dimensions"]) or state["splits"] >= 128:
+                    raise ListingPartitionError("Sous-recherche encore plafonnee; decoupage disponible epuise")
+                family, value = state["dimensions"][index]
+                children = [{"filters": filters + [(family + suffix, value)], "offset": 0,
+                             "dimension": index + 1, "seen": [], "total": None}
+                            for suffix in ("_include[]", "_exclude[]")]
+                state["pending"][:1] = children
+                state["splits"] += 1
+                print(f"  Recherche plafonnee: subdivision {family}={value} (inclusion / exclusion).")
+                continue
+            if task["total"] is not None and task["total"] != total:
+                raise ListingPartitionError("Total de sous-recherche modifie pendant la pagination")
+            rows = self.extract_series_list_from_html(html)
+            urls = {_ensure_abs_url(row.get("url_fiche", "")) for row in rows if row.get("url_fiche")}
+            expected = min(50, max(0, total - task["offset"]))
+            if len(rows) != expected or len(urls) != expected or urls.intersection(task["seen"]):
+                raise ListingPartitionError("Sous-recherche incomplete ou page repetee")
+            matching = [row for row in rows if self._letter_tag_for_row(row) == self._letter_tag(letter)]
+            if rows and len(matching) < max(1, int(len(rows) * 0.8)):
+                raise ListingPartitionError("Sous-recherche renvoyant une autre lettre")
+            task["total"] = total
+            state["union"] = sorted(set(state["union"]) | urls)
+            task["seen"].extend(sorted(urls))
+            task["offset"] += len(rows)
+            if task["offset"] == total:
+                if len(task["seen"]) != total:
+                    raise ListingPartitionError("Couverture de sous-recherche incomplete")
+                state["pending"].pop(0)
+            print(f"  Sous-recherche: {len(rows)} entrees, {len(state['pending'])} branche(s) restante(s).")
+            if rows or not state["pending"]:
+                if not state["pending"] and (len(state["union"]) < state["minimum_total"] or not set(state["root_sample"]).issubset(state["union"])):
+                    raise ListingPartitionError("Union des sous-recherches incoherente avec le listing initial")
+                self._listing_partition_cursors[(key[0], page_num + 1)] = state
+                self._flaresolverr_page_has_next[key] = bool(state["pending"])
+                if not state["pending"]:
+                    self._listing_complete_pages.add(key)
+                return final_url, matching
+        self._listing_complete_pages.add(key)
+        self._flaresolverr_page_has_next[key] = False
+        return final_url, []
+
     def _fetch_listing_page_flaresolverr(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
         label = self._letter_label(letter)
         key = (self._letter_tag(letter), page_num)
+        if key in self._listing_partition_cursors:
+            return self._fetch_partition_listing_page(letter, page_num)
         page_url = self._flaresolverr_listing_urls.get(key)
         if not page_url:
             self._load_flaresolverr_letter_urls()
@@ -2605,6 +2735,32 @@ class NautiljonScraper:
             page_url = self._url_with_dbt(self._flaresolverr_letter_urls[label], page_num)
             html = self._fetch_html_flaresolverr(page_url)
         final_url = self._last_flaresolverr_url or page_url
+        total = self._listing_total(html)
+        if total is not None and total >= LISTING_RESULT_CAP:
+            dimensions = self._listing_split_dimensions(html)
+            if not dimensions:
+                raise ListingPartitionError("Recherche plafonnee sans filtres de subdivision disponibles")
+            self._listing_partition_cursors[key] = {
+                "version": 1, "dimensions": dimensions, "splits": 0,
+                "union": [], "minimum_total": total,
+                "root_sample": [row["url_fiche"] for row in self.extract_series_list_from_html(html) if row.get("url_fiche")],
+                "pending": [{"filters": [], "offset": 0, "dimension": 0, "seen": [], "total": None}],
+            }
+            print(f"  Lettre {label}: limite de 2500 resultats; inventaire par sous-recherches.")
+            return self._fetch_partition_listing_page(letter, page_num)
+        if total is not None and total < LISTING_RESULT_CAP and page_num * 50 >= total and page_num > 0:
+            # Migration of an old checkpoint that probed beyond the true last
+            # page (e.g. Z: 200 entries). Re-read the announced last page first.
+            last_page = max(0, (total - 1) // 50)
+            final_url, html = self._fetch_signed_listing_html(letter, self._url_with_dbt(page_url, last_page))
+            if self._listing_total(html) != total:
+                raise ListingPartitionError("Total modifie lors de la verification de fin")
+            verified_rows = self.extract_series_list_from_html(html)
+            if len(verified_rows) != total - last_page * 50:
+                raise ListingPartitionError("Derniere page annoncee non verifiable")
+            self._listing_complete_pages.add(key)
+            self._flaresolverr_page_has_next[key] = False
+            return final_url, verified_rows
         rows = self.extract_series_list_from_html(html)
         expected_tag = self._letter_tag(letter)
         matching_rows = [row for row in rows if self._letter_tag_for_row(row) == expected_tag]
@@ -2614,6 +2770,9 @@ class NautiljonScraper:
                 f"{len(matching_rows)}/{len(rows)} titres correspondent"
             )
         next_url = self._extract_next_listing_url(html, final_url, page_num)
+        if total is not None and 0 <= total < LISTING_RESULT_CAP and page_num * 50 + len(rows) == total:
+            self._listing_complete_pages.add(key)
+            next_url = None
         self._flaresolverr_page_has_next[key] = bool(next_url)
         if next_url:
             self._set_flaresolverr_listing_url(letter, page_num + 1, next_url)
@@ -2911,12 +3070,11 @@ class NautiljonScraper:
         return candidates
 
     def _url_with_dbt(self, url: str, page_num: int) -> str:
-        if page_num <= 0:
-            return url
         offset = page_num * 50
         parts = urlsplit(url)
         items = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key.lower() != "dbt"]
-        items.append(("dbt", str(offset)))
+        if page_num > 0:
+            items.append(("dbt", str(offset)))
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(items), parts.fragment))
 
     def fetch_listing_page(self, letter: str, page_num: int) -> Tuple[str, List[Dict[str, str]]]:
@@ -3451,6 +3609,8 @@ class NautiljonScraper:
         }
         errors_before_letter = self.session_stats["errors"]
         checkpoint_path = self._letter_checkpoint_path(tag)
+        self._listing_partition_cursors = {key: value for key, value in self._listing_partition_cursors.items() if key[0] != tag}
+        self._listing_complete_pages = {key for key in self._listing_complete_pages if key[0] != tag}
         resumed_from_checkpoint = False
         listing_complete = False
         coverage_confirmed = False
@@ -3488,6 +3648,9 @@ class NautiljonScraper:
                     existing_by_url.pop(url, None)
                 page_num = int(checkpoint.get("page_num", 0) or 0)
                 pagination_probe = bool(checkpoint.get("pagination_probe", False))
+                partition_cursor = checkpoint.get("partition_cursor")
+                if isinstance(partition_cursor, dict) and partition_cursor.get("version") == 1:
+                    self._listing_partition_cursors[(tag, page_num)] = partition_cursor
                 accessible_listing_pages = int(checkpoint.get("accessible_listing_pages", 0) or 0)
                 successful_listing_pages = int(checkpoint.get("successful_listing_pages", 0) or 0)
                 next_listing_url = str(checkpoint.get("next_listing_url", "") or "")
@@ -3537,6 +3700,8 @@ class NautiljonScraper:
                         }
                         resumed_from_checkpoint = False
                         listing_complete = False
+                        pagination_probe = False
+                        self._listing_partition_cursors = {key: value for key, value in self._listing_partition_cursors.items() if key[0] != tag}
                 print(
                     f"  Reprise lettre {label}: "
                     + (
@@ -3564,6 +3729,7 @@ class NautiljonScraper:
                 "counters": counters,
                 "listing_complete": listing_complete,
                 "pagination_probe": pagination_probe,
+                "partition_cursor": self._listing_partition_cursors.get((tag, next_page)),
             }
             if self.backend == "flaresolverr":
                 payload["next_listing_url"] = self._flaresolverr_listing_urls.get((tag, next_page), "")
@@ -3629,6 +3795,12 @@ class NautiljonScraper:
                 accessible_listing_pages += 1
                 consecutive_page_failures = 0
                 print(f"  Page {page_num + 1}: {len(page_series)} entrees ({page_url})")
+            except ListingPartitionError as exc:
+                listing_failed = pagination_stalled = True
+                print(f"  Sous-recherche suspendue: {exc}")
+                self._save_flaresolverr_debug(f"partition_incomplete_{tag}", self._last_flaresolverr_html, self._last_flaresolverr_url)
+                save_checkpoint(page_num)
+                break
             except NautiljonAccessBlockedError as exc:
                 access_blocked = True
                 listing_failed = True
@@ -3648,6 +3820,11 @@ class NautiljonScraper:
                 self._sleep_failure_pause()
                 continue
 
+            page_key = (tag, page_num)
+            verified_end = page_key in self._listing_complete_pages
+            partitioned = page_key in self._listing_partition_cursors
+            if pagination_probe and (partitioned or verified_end):
+                pagination_probe = False
             if pagination_probe:
                 candidate_urls = {_ensure_abs_url(row.get("url_fiche", "")) for row in page_series if row.get("url_fiche")}
                 if not candidate_urls or not (candidate_urls - seen_urls):
@@ -3659,6 +3836,10 @@ class NautiljonScraper:
                 pagination_probe = False
 
             if not page_series:
+                if verified_end:
+                    listing_complete = True
+                    save_checkpoint(page_num + 1)
+                    break
                 if self.backend == "flaresolverr":
                     listing_failed = True
                     print("  Page vide inattendue via FlareSolverr: fin de listing non validee.")
@@ -3808,14 +3989,14 @@ class NautiljonScraper:
                 if new_on_page == 0:
                     empty_pages += 1
                     print(f"  Page {page_num + 1} sans nouvelle URL ({empty_pages}/3).")
-                    if empty_pages >= 3:
+                    if empty_pages >= 3 and not partitioned and not verified_end:
                         break
                 else:
                     empty_pages = 0
                 if max_series is not None and len(updated_rows) >= max_series:
                     break
                 if self.backend == "flaresolverr" and not self._flaresolverr_listing_has_next(letter, page_num):
-                    if len(page_series) >= 50:
+                    if len(page_series) >= 50 and not verified_end:
                         # One paced next-offset check, not an endless replay of
                         # this full page. A repeated/empty probe is never success.
                         if not pagination_debug_saved:
@@ -3856,6 +4037,7 @@ class NautiljonScraper:
                 "removed": 0,
                 "queued_details": 0,
                 "listing_failed": True,
+                "pagination_stalled": pagination_stalled,
                 "access_blocked": access_blocked,
                 "coverage_failed": False,
                 "detail_failed": False,

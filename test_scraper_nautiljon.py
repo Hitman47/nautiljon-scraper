@@ -10,6 +10,7 @@ from unittest import mock
 from scraper_nautiljon import (
     DATA_SCHEMA_VERSION,
     LETTER_CHECKPOINT_VERSION,
+    ListingPartitionError,
     NautiljonAccessBlockedError,
     NautiljonScraper,
     RunResult,
@@ -26,6 +27,154 @@ def make_row(label: str):
 
 
 class DiffStateTests(unittest.TestCase):
+    def install_partition_fixture(self, scraper, calls, ignored=False, capped=False):
+        scraper._flaresolverr_letter_urls = {"S": "https://www.nautiljon.com/mangas/?q=s&st=signed"}
+        scraper._sleep_delay = mock.Mock()
+        def fetch(url):
+            calls.append(url)
+            scraper._last_flaresolverr_url = url
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            filters = [(k, v) for k, values in query.items() for v in values if k.endswith("[]")]
+            ids = [0, 1] if not filters or "types_include[]" in query else [2, 3, 4]
+            total = 4 if not filters or capped else len(ids)
+            fields = ''.join(f'<input name="{k}" value="{v}" checked>' for k, v in filters) if not ignored else ''
+            html = f'<h2>Mangas ({total} résultats)</h2><input name="types_include[]" value="1"><input name="types_exclude[]" value="1">{fields}<p>{",".join(map(str, ids))}</p>'
+            scraper._last_flaresolverr_html = html
+            return html
+        def parse(html):
+            ids = html.split('<p>')[1].split('</p>')[0].split(',')
+            return [dict(make_row("S"), titre=f"Series {i}", url_fiche=f"https://www.nautiljon.com/mangas/s{i}.html") for i in ids if i]
+        scraper._fetch_html_flaresolverr = mock.Mock(side_effect=fetch)
+        scraper.extract_series_list_from_html = mock.Mock(side_effect=parse)
+
+    def test_capped_search_splits_and_finishes_union_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch("scraper_nautiljon.LISTING_RESULT_CAP", 4):
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr", detail_mode="deferred")
+            calls = []
+            self.install_partition_fixture(scraper, calls)
+            rows = scraper.scrape_letter_diff("s")
+            self.assertEqual(len(rows), 5)
+            self.assertEqual(len({row["url_fiche"] for row in rows}), 5)
+            self.assertFalse(scraper.session_stats["diff_by_letter"]["S"]["listing_failed"])
+            self.assertFalse(os.path.exists(scraper._letter_checkpoint_path("S")))
+            self.assertTrue(any("types_exclude" in url for url in calls))
+
+    def test_partition_cursor_resumes_without_restarting_completed_branch(self):
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch("scraper_nautiljon.LISTING_RESULT_CAP", 4):
+            first = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr", detail_mode="deferred")
+            calls = []
+            self.install_partition_fixture(first, calls)
+            first.scrape_letter_diff("s", max_pages=1)
+            checkpoint = first._load_json_dict(first._letter_checkpoint_path("S"))
+            self.assertEqual(checkpoint["page_num"], 1)
+            self.assertEqual(checkpoint["partition_cursor"]["pending"][0]["filters"], [["types_exclude[]", "1"]])
+            second = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr", detail_mode="deferred")
+            resumed_calls = []
+            self.install_partition_fixture(second, resumed_calls)
+            rows = second.scrape_letter_diff("s")
+            self.assertEqual(len(rows), 5)
+            self.assertEqual(len(resumed_calls), 1)
+            self.assertIn("types_exclude", resumed_calls[0])
+
+    def test_ignored_filters_or_unsplittable_cap_never_finalize(self):
+        for ignored, capped in [(True, False), (False, True)]:
+            with self.subTest(ignored=ignored), tempfile.TemporaryDirectory() as out_dir, mock.patch("scraper_nautiljon.LISTING_RESULT_CAP", 4):
+                scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr", detail_mode="deferred")
+                self.seed_letter(scraper, "s")
+                calls = []
+                self.install_partition_fixture(scraper, calls, ignored=ignored, capped=capped)
+                scraper.scrape_letter_diff("s")
+                self.assertTrue(scraper.session_stats["diff_by_letter"]["S"]["pagination_stalled"])
+                self.assertLessEqual(len(calls), 3)
+                self.assertTrue(os.path.exists(scraper._letter_checkpoint_path("S")))
+                self.assertEqual(len(scraper._load_json_list(scraper._letter_paths("S")[0])), 1)
+
+    def test_exact_multiple_total_finishes_full_page_and_migrates_old_probe(self):
+        for page in (3, 4):
+            with self.subTest(page=page):
+                scraper = NautiljonScraper(delay=0, backend="flaresolverr")
+                scraper._flaresolverr_letter_urls = {"Z": "https://www.nautiljon.com/mangas/?q=z&st=token"}
+                html = '<h2>Mangas commençant par la lettre Z (200 résultats)</h2>'
+                rows = [dict(make_row("Z"), titre=f"Z {i}", url_fiche=f"https://www.nautiljon.com/mangas/z{i}.html") for i in range(50)]
+                def fetch(url):
+                    scraper._last_flaresolverr_url = url
+                    return html
+                scraper._fetch_html_flaresolverr = mock.Mock(side_effect=fetch)
+                scraper.extract_series_list_from_html = mock.Mock(return_value=rows)
+                _, result = scraper._fetch_listing_page_flaresolverr("z", page)
+                self.assertEqual(len(result), 50)
+                self.assertIn(("Z", page), scraper._listing_complete_pages)
+                self.assertFalse(scraper._flaresolverr_listing_has_next("z", page))
+                self.assertIn("dbt=150", scraper._fetch_html_flaresolverr.call_args.args[0])
+
+    def test_listing_total_and_complementary_dimensions(self):
+        self.assertEqual(NautiljonScraper._listing_total('<h2>Mangas (2\u202f500 résultats)</h2>'), 2500)
+        self.assertEqual(NautiljonScraper._listing_total('<title>Mangas (0 résultat)</title>'), 0)
+        self.assertIsNone(NautiljonScraper._listing_total('<h2>Cloudflare</h2>'))
+        html = '<input name="types_include[]" value="1"><input name="types_exclude[]" value="1"><input name="types_include[]" value="2">'
+        self.assertEqual(NautiljonScraper._listing_split_dimensions(html), [("types", "1")])
+
+    def test_partition_multiple_pages_validate_totals_and_reject_repeats(self):
+        for mode in ("valid", "repeated", "changed_total", "missing_total"):
+            with self.subTest(mode=mode):
+                scraper = NautiljonScraper(delay=0, backend="flaresolverr")
+                scraper._flaresolverr_letter_urls = {"S": "https://www.nautiljon.com/mangas/?q=s&st=x"}
+                scraper._listing_partition_cursors[("S", 0)] = {
+                    "version": 1, "dimensions": [], "splits": 0, "union": [], "minimum_total": 51, "root_sample": [],
+                    "pending": [{"filters": [["types_include[]", "1"]], "offset": 0, "dimension": 0, "seen": [], "total": None}]}
+                def fetch(url):
+                    scraper._last_flaresolverr_url = url
+                    second = "dbt=50" in url
+                    total = 52 if second and mode == "changed_total" else 51
+                    heading = "" if second and mode == "missing_total" else f'<h2>Mangas ({total} résultats)</h2>'
+                    return heading + '<input name="types_include[]" value="1" checked>' + ('SECOND' if second else 'FIRST')
+                def parse(html):
+                    indexes = [0 if mode == "repeated" else 50] if 'SECOND' in html else range(50)
+                    return [dict(make_row("S"), titre=f"S {i}", url_fiche=f"https://www.nautiljon.com/mangas/s{i}.html") for i in indexes]
+                scraper._fetch_html_flaresolverr = mock.Mock(side_effect=fetch)
+                scraper.extract_series_list_from_html = mock.Mock(side_effect=parse)
+                scraper._fetch_listing_page_flaresolverr("s", 0)
+                if mode == "valid":
+                    _, rows = scraper._fetch_listing_page_flaresolverr("s", 1)
+                    self.assertEqual(len(rows), 1)
+                    self.assertIn(("S", 1), scraper._listing_complete_pages)
+                else:
+                    with self.assertRaises(ListingPartitionError):
+                        scraper._fetch_listing_page_flaresolverr("s", 1)
+                    self.assertNotIn(("S", 1), scraper._listing_complete_pages)
+
+    def test_empty_partition_with_explicit_zero_can_finish(self):
+        scraper = NautiljonScraper(delay=0, backend="flaresolverr")
+        scraper._flaresolverr_letter_urls = {"S": "https://www.nautiljon.com/mangas/?q=s&st=x"}
+        scraper._listing_partition_cursors[("S", 0)] = {
+            "version": 1, "dimensions": [], "splits": 0, "union": [], "minimum_total": 0, "root_sample": [],
+            "pending": [{"filters": [["types_exclude[]", "1"]], "offset": 0, "dimension": 0, "seen": [], "total": None}]}
+        scraper._fetch_html_flaresolverr = mock.Mock(return_value='<h2>Mangas (0 résultat)</h2><input name="types_exclude[]" value="1" checked>')
+        scraper.extract_series_list_from_html = mock.Mock(return_value=[])
+        _, rows = scraper._fetch_listing_page_flaresolverr("s", 0)
+        self.assertEqual(rows, [])
+        self.assertIn(("S", 0), scraper._listing_complete_pages)
+
+    def test_signed_partition_refresh_preserves_all_filters_and_offset(self):
+        scraper = NautiljonScraper(delay=0, backend="flaresolverr")
+        scraper._fetch_html_flaresolverr = mock.Mock(side_effect=["Votre session de recherche a expiré", "OK"])
+        def reload():
+            scraper._flaresolverr_letter_urls["S"] = "https://www.nautiljon.com/mangas/?q=s&st=fresh"
+        scraper._load_flaresolverr_letter_urls = mock.Mock(side_effect=reload)
+        scraper._save_flaresolverr_debug = mock.Mock(return_value={})
+        url = "https://www.nautiljon.com/mangas/?q=s&st=old&dbt=50&types_exclude%5B%5D=1&types_exclude%5B%5D=2&encours_vos_include%5B%5D=1"
+        scraper._fetch_signed_listing_html("s", url)
+        params = urllib.parse.parse_qs(urllib.parse.urlsplit(scraper._fetch_html_flaresolverr.call_args.args[0]).query)
+        self.assertEqual(params["st"], ["fresh"])
+        self.assertEqual(params["dbt"], ["50"])
+        self.assertEqual(params["types_exclude[]"], ["1", "2"])
+        self.assertEqual(params["encours_vos_include[]"], ["1"])
+
+    def test_reset_listing_offset_removes_old_probe_offset(self):
+        scraper = self.make_scraper("unused")
+        self.assertEqual(scraper._url_with_dbt("https://www.nautiljon.com/mangas/?q=z&dbt=50", 0),
+                         "https://www.nautiljon.com/mangas/?q=z")
+
     def test_full_page_without_next_link_probes_next_offset(self):
         for repeated in (False, True):
             with self.subTest(repeated=repeated), tempfile.TemporaryDirectory() as out_dir:
