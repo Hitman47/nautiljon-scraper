@@ -163,19 +163,28 @@ NAUTILJON_SHM_SIZE=256m
   de fiche. Apres le premier inventaire complet, les nouvelles series et les
   changements de volumes ou de statuts des anciennes series sont places dans
   `output/state/detail_queue.json`. Les champs detail deja connus sont conserves.
-- Le mode `monthly` traite automatiquement au plus `NAUTILJON_ENRICH_MAX_ITEMS`
-  fiches par lot, sauvegarde chaque succes et laisse toute fiche interrompue dans
-  la file. La commande `enrich` reste disponible pour un diagnostic manuel.
-- La limite dure de 12 fiches et l'intervalle minimal de 30 minutes empechent
-  deux lots rapproches de reproduire la rafale observee avant les blocages.
+- Le mode `monthly` enrichit en continu et sequentiellement, sans pause fixe de
+  30 minutes entre lots. Il nettoie d'abord toute la file obsolete localement,
+  sans ouvrir FlareSolverr ni consommer le quota de consultations.
+- `NAUTILJON_ENRICH_MAX_ITEMS` et `NAUTILJON_ENRICH_HARD_LIMIT` bornent les petits
+  lots de sauvegarde (12 par defaut). Les tentatives echouees comptent aussi.
+  Les fichiers et caches de chaque lettre sont ecrits une fois par lot, avant
+  de retirer ses fiches de la file. Un arret brutal peut rejouer le dernier lot,
+  mais ne perd pas de fiche non sauvegardee.
+- La session FlareSolverr, les compteurs de requetes et les temporisations sont
+  conserves entre lots reussis. Les delais entre fiches/requetes et les pauses
+  periodiques restent actifs, y compris aux frontieres des lots. Les erreurs et
+  blocages conservent leurs pauses de recuperation. Aucun nouveau parametre.
+- `NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES` (30 par defaut) reste applicable aux
+  lancements manuels de `enrich`, pas a la phase continue de `monthly`.
 - `NAUTILJON_QUEUE_RELEASE_REFRESH=false` desactive les visites periodiques des
   anciennes fiches. Le mettre a `true` reactive le rafraichissement des prochaines
   parutions VF selon `NAUTILJON_REFRESH_STALE_DAYS`.
 - Les changements de presentation tels que `0 -> -` ne provoquent plus de visite.
   Le nombre de tomes et le statut du listing sont stockes separement : une vraie
   transition `En cours -> Termine` est donc detectee meme sans changement de nombre.
-- `NAUTILJON_COMMAND=monthly` enchaine sans intervention le diff reprenable et les
-  petits lots d'enrichissement. Il ferme FlareSolverr pendant les longues pauses,
+- `NAUTILJON_COMMAND=monthly` enchaine sans intervention le diff reprenable et
+  l'enrichissement continu. Il ferme FlareSolverr pendant les attentes de recuperation,
   recontrole automatiquement une nouvelle IP et reprend pendant 72 heures au maximum.
 - `NAUTILJON_GLUETUN_AUTO_ROTATE=true` autorise le mode mensuel a relancer le
   tunnel VPN par l'API locale Gluetun apres un blocage confirme. Une tentative est

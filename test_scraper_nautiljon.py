@@ -27,6 +27,118 @@ def make_row(label: str):
 
 
 class DiffStateTests(unittest.TestCase):
+    def test_monthly_keeps_latest_export_when_last_batch_only_cleans_queue(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http", detail_mode="deferred")
+            scraper.scrape_all_letters_diff = mock.Mock(return_value=RunResult(
+                status="success", reason="complete_catalog_exported", export_paths={"json_path": "old.json"}))
+            scraper.enrich_detail_queue = mock.Mock(side_effect=[
+                RunResult(status="success", reason="detail_batch_complete_queue_pending", export_paths={"json_path": "enriched.json"}),
+                RunResult(status="success", reason="detail_queue_complete")])
+            scraper._monthly_wait = mock.Mock()
+            result = scraper.run_monthly()
+            self.assertEqual(result.export_paths, {"json_path": "enriched.json"})
+            scraper._monthly_wait.assert_not_called()
+
+    def seed_enrichment_queue(self, scraper, count, cleanup_count=0):
+        rows = [dict(make_row("A"), titre=f"A {i:03d}", url_fiche=f"https://www.nautiljon.com/mangas/a{i:03d}.html") for i in range(count)]
+        scraper.save_letter_files("A", rows, partial=False)
+        queue = {}
+        for i, row in enumerate(rows):
+            scraper._queue_detail(queue, "A", row, "volume_changed" if i < cleanup_count else "new_series", ready=True)
+        scraper._save_detail_queue(queue)
+        return rows
+
+    def test_local_cleanup_does_not_consume_network_budget_and_writes_are_batched(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            self.seed_enrichment_queue(scraper, 22, cleanup_count=20)
+            scraper._fetch_full_series_data = mock.Mock(side_effect=lambda row: dict(row, genres="Action"))
+            scraper._sleep_detail_delay = mock.Mock()
+            with mock.patch.object(scraper, "save_letter_files", wraps=scraper.save_letter_files) as save:
+                result = scraper.enrich_detail_queue(max_items=2, continuous=True)
+            self.assertEqual(result.reason, "detail_queue_complete")
+            self.assertEqual(scraper._fetch_full_series_data.call_count, 2)
+            self.assertEqual(save.call_count, 1)
+            self.assertEqual(scraper._load_detail_queue(), {})
+
+    def test_cleanup_only_never_starts_network_or_moves_success_timer(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            self.seed_enrichment_queue(scraper, 20, cleanup_count=20)
+            scraper._resolve_access_cooldown = mock.Mock(side_effect=AssertionError("network"))
+            scraper._flaresolverr_public_ips = mock.Mock(side_effect=AssertionError("network"))
+            result = scraper.enrich_detail_queue(max_items=1)
+            self.assertEqual(result.reason, "detail_queue_complete")
+            self.assertIsNone(scraper._load_last_success("enrich"))
+            self.assertFalse(scraper._load_detail_queue())
+
+    def test_continuous_batches_keep_session_counters_and_cross_batch_delay(self):
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.dict(os.environ, {
+            "NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES": "30", "NAUTILJON_DETAIL_BATCH_SIZE": "2",
+            "NAUTILJON_DETAIL_BATCH_PAUSE_MIN": "10", "NAUTILJON_DETAIL_BATCH_PAUSE_MAX": "10",
+            "NAUTILJON_REQUEST_BURST_SIZE": "2", "NAUTILJON_REQUEST_BURST_PAUSE_MIN": "20",
+            "NAUTILJON_REQUEST_BURST_PAUSE_MAX": "20"}):
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="flaresolverr")
+            self.seed_enrichment_queue(scraper, 3)
+            scraper._flaresolverr_public_ips = mock.Mock(return_value=("203.0.113.1", "203.0.113.1"))
+            scraper.close_browser = mock.Mock()
+            scraper._sleep_for = mock.Mock(return_value=0)
+            scraper._sleep_detail_delay = mock.Mock()
+            def fetch(row):
+                scraper._pace_detail_request()
+                scraper._pace_remote_request(row["url_fiche"], "test")
+                return dict(row, genres="Action")
+            scraper._fetch_full_series_data = mock.Mock(side_effect=fetch)
+            self.assertEqual(scraper.enrich_detail_queue(2, continuous=True).reason, "detail_batch_complete_queue_pending")
+            self.assertEqual(scraper.enrich_detail_queue(2, continuous=True, cleanup=False).reason, "detail_queue_complete")
+            scraper._flaresolverr_public_ips.assert_called_once()
+            scraper.close_browser.assert_not_called()
+            self.assertEqual(scraper._detail_request_count, 3)
+            self.assertEqual(scraper._remote_request_count, 3)
+            self.assertEqual(scraper._sleep_detail_delay.call_count, 3)
+            reasons = [call.args[1] for call in scraper._sleep_for.call_args_list]
+            self.assertTrue(any("2 fiches" in reason for reason in reasons))
+            self.assertTrue(any("2 navigations" in reason for reason in reasons))
+
+    def test_batch_save_failure_keeps_queue_for_replay(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            self.seed_enrichment_queue(scraper, 2)
+            scraper._fetch_full_series_data = mock.Mock(side_effect=lambda row: dict(row, genres="Action"))
+            scraper._sleep_detail_delay = mock.Mock()
+            scraper.save_letter_files = mock.Mock(side_effect=OSError("disk failure"))
+            scraper.close_browser = mock.Mock()
+            with self.assertRaises(OSError):
+                scraper.enrich_detail_queue(2, continuous=True)
+            self.assertEqual(len(scraper._load_detail_queue()), 2)
+            scraper.close_browser.assert_called()
+
+    def test_block_flushes_prior_success_but_preserves_failed_item(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            rows = self.seed_enrichment_queue(scraper, 2)
+            scraper._fetch_full_series_data = mock.Mock(side_effect=[dict(rows[0], genres="Action"), NautiljonAccessBlockedError("blocked")])
+            scraper._sleep_detail_delay = mock.Mock()
+            scraper.close_browser = mock.Mock()
+            scraper._record_access_cooldown = mock.Mock()
+            result = scraper.enrich_detail_queue(2, continuous=True)
+            self.assertEqual(result.reason, "access_blocked")
+            self.assertEqual(list(scraper._load_detail_queue()), [rows[1]["url_fiche"]])
+            saved = scraper._load_json_list(scraper._letter_paths("A")[0])
+            self.assertEqual(saved[0]["genres"], "Action")
+            scraper.close_browser.assert_called()
+
+    def test_failed_attempts_count_towards_batch_limit(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make_scraper(out_dir)
+            self.seed_enrichment_queue(scraper, 3)
+            scraper._fetch_full_series_data = mock.Mock(side_effect=RuntimeError("network"))
+            result = scraper.enrich_detail_queue(1, continuous=True)
+            scraper._fetch_full_series_data.assert_called_once()
+            self.assertEqual(result.reason, "detail_errors")
+            self.assertEqual(len(scraper._load_detail_queue()), 3)
+
     def install_partition_fixture(self, scraper, calls, ignored=False, capped=False):
         scraper._flaresolverr_letter_urls = {"S": "https://www.nautiljon.com/mangas/?q=s&st=signed"}
         scraper._sleep_delay = mock.Mock()
@@ -2249,7 +2361,8 @@ class DiffStateTests(unittest.TestCase):
             self.assertEqual(result.rows_count, 1234)
             self.assertEqual(scraper.scrape_all_letters_diff.call_count, 2)
             self.assertEqual(scraper.enrich_detail_queue.call_count, 2)
-            self.assertEqual(scraper._monthly_wait.call_count, 3)
+            self.assertEqual(scraper._monthly_wait.call_count, 2)
+            scraper.enrich_detail_queue.assert_called_with(max_items=12, continuous=True, cleanup=False)
             monthly_state = scraper._load_json_dict(scraper._state_path("last_monthly_run"))
             self.assertEqual(monthly_state["status"], "success")
 

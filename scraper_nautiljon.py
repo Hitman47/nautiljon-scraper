@@ -2084,6 +2084,7 @@ class NautiljonScraper:
     def close_flaresolverr(self) -> None:
         session_id = self.flaresolverr_session_id
         self.flaresolverr_session_id = None
+        self._verified_public_ips = None
         self._flaresolverr_letter_urls.clear()
         self._flaresolverr_listing_urls.clear()
         self._flaresolverr_page_has_next.clear()
@@ -4190,14 +4191,47 @@ class NautiljonScraper:
                 return True
         return False
 
-    def enrich_detail_queue(self, max_items: int = 12) -> RunResult:
+    def _prune_detail_queue_locally(self, queue: Dict[str, Dict[str, object]]) -> int:
+        """Clean all ready legacy entries without opening a network session."""
+        removed = 0
+        by_letter: Dict[str, list] = {}
+        for url, item in queue.items():
+            if item.get("ready"):
+                by_letter.setdefault(str(item.get("letter", "")), []).append((url, item))
+        for tag, items in by_letter.items():
+            if not tag:
+                continue
+            # One letter in memory at a time, and no destructive cleanup when
+            # its source file cannot be read/validated.
+            try:
+                with open(self._letter_paths(tag)[0], encoding="utf-8-sig") as handle:
+                    source = json.load(handle)
+                if not isinstance(source, list) or any(not isinstance(row, dict) for row in source):
+                    continue
+            except (OSError, ValueError):
+                continue
+            rows = {_ensure_abs_url(row.get("url_fiche", "")): row for row in source}
+            for url, item in items:
+                row = rows.get(url)
+                reasons = set(item.get("reasons", []))
+                if row is None or (reasons == {"volume_changed"} and not self._volume_detail_refresh_still_needed(self._normalize_row(row))):
+                    queue.pop(url, None)
+                    removed += 1
+        if removed:
+            self._save_detail_queue(queue)
+            print(f"Nettoyage local: {removed} entree(s) obsolete(s) retiree(s), aucune navigation.")
+        return removed
+
+    def enrich_detail_queue(self, max_items: int = 12, *, continuous: bool = False, cleanup: bool = True) -> RunResult:
         queue = self._load_detail_queue()
         if self._promote_finalized_detail_queue(queue):
             self._save_detail_queue(queue)
+        locally_removed = self._prune_detail_queue_locally(queue) if cleanup else 0
         ready_items = [item for item in queue.values() if item.get("ready")]
         ready_items.sort(key=lambda item: (str(item.get("queued_at", "")), str(item.get("url_fiche", ""))))
         if not ready_items:
-            result = RunResult(status="skipped", reason="detail_queue_empty")
+            result = RunResult(status="success" if locally_removed else "skipped",
+                               reason="detail_queue_complete" if locally_removed else "detail_queue_empty")
             print("File detail vide: aucune navigation Nautiljon necessaire.")
             self.mark_run_state("enrich", result)
             return result
@@ -4207,7 +4241,7 @@ class NautiljonScraper:
             _env_float("NAUTILJON_ENRICH_MIN_INTERVAL_MINUTES", 30.0),
         )
         last_run = self._load_json_dict(self._last_success_path("enrich"))
-        if last_run and last_run.get("status") == "success" and min_interval_minutes > 0:
+        if not continuous and last_run and last_run.get("status") == "success" and min_interval_minutes > 0:
             try:
                 last_completed = datetime.fromisoformat(str(last_run.get("completed_at", "")))
                 next_run = last_completed + timedelta(minutes=min_interval_minutes)
@@ -4241,6 +4275,7 @@ class NautiljonScraper:
                 print(f"IP Gluetun: {gluetun_ip} | IP FlareSolverr: {flaresolverr_ip}")
                 if gluetun_ip != flaresolverr_ip:
                     raise RuntimeError("les IP publiques de Gluetun et FlareSolverr sont differentes")
+                self._verified_public_ips = (gluetun_ip, flaresolverr_ip)
             except Exception as exc:
                 self.close_flaresolverr()
                 result = RunResult(status="failed", reason="flaresolverr_preflight_failed")
@@ -4256,19 +4291,27 @@ class NautiljonScraper:
             f"lot courant limite a {limit}."
         )
         processed = 0
-        discarded = 0
+        discarded = locally_removed
+        attempted = 0
         consecutive_failures = 0
         blocked = False
         touched_letters = set()
+        rows_by_letter: Dict[str, list] = {}
+        committed_urls: Dict[str, list] = {}
+        batch_finished = False
         self.session_stats["start_time"] = datetime.now()
         try:
             if self.backend == "selenium":
                 self.setup_browser()
-            for item in ready_items[:limit]:
+            for item in ready_items:
+                if attempted >= limit:
+                    break
                 url = _ensure_abs_url(str(item.get("url_fiche", "") or ""))
                 tag = str(item.get("letter", "") or "")
                 final_json = self._letter_paths(tag)[0] if tag else ""
-                rows = [self._normalize_row(row) for row in self._load_json_list(final_json)]
+                if tag not in rows_by_letter:
+                    rows_by_letter[tag] = [self._normalize_row(row) for row in self._load_json_list(final_json)]
+                rows = rows_by_letter[tag]
                 row_index = next(
                     (
                         index
@@ -4302,6 +4345,7 @@ class NautiljonScraper:
                     self._save_detail_queue(queue)
                     continue
                 try:
+                    before_requests = self._detail_request_count
                     enriched = self._fetch_full_series_data(source)
                 except NautiljonAccessBlockedError as exc:
                     blocked = True
@@ -4330,6 +4374,12 @@ class NautiljonScraper:
                     if consecutive_failures >= max(1, _env_int("NAUTILJON_ABORT_AFTER_DETAIL_FAILURES", 2)):
                         break
                     continue
+                finally:
+                    # Include bounded retries, not just successful fiches. The
+                    # lower bound also accounts for a failed attempt before fetch.
+                    attempted += max(1, self._detail_request_count - before_requests)
+                    if not blocked and (continuous or attempted < limit):
+                        self._sleep_detail_delay()
 
                 if enriched is None:
                     rows.pop(row_index)
@@ -4340,15 +4390,26 @@ class NautiljonScraper:
                     processed += 1
                     consecutive_failures = 0
                     print(f"  Enrichie: {enriched.get('titre', url)}")
-                self.save_letter_files(tag, rows, partial=False)
-                self._refresh_letter_cache_after_enrichment(tag, rows)
                 touched_letters.add(tag)
-                queue.pop(url, None)
-                self._save_detail_queue(queue)
-                if processed + discarded < limit:
-                    self._sleep_detail_delay()
+                committed_urls.setdefault(tag, []).append(url)
+            batch_finished = True
         finally:
-            self.close_browser()
+            try:
+                # Data first, queue acknowledgement second. A crash can replay
+                # at most a small batch, but cannot lose an unfinished fiche.
+                for tag in sorted(touched_letters):
+                    self.save_letter_files(tag, rows_by_letter[tag], partial=False)
+                    self._refresh_letter_cache_after_enrichment(tag, rows_by_letter[tag])
+                    for url in committed_urls[tag]:
+                        queue.pop(url, None)
+                    self._save_detail_queue(queue)
+            except BaseException:
+                self.close_browser()
+                self._verified_public_ips = None
+                raise
+            if not continuous or not batch_finished or blocked or consecutive_failures:
+                self.close_browser()
+                self._verified_public_ips = None
             self.session_stats["end_time"] = datetime.now()
             if self.session_stats["start_time"]:
                 self.session_stats["duration"] = str(
@@ -4876,6 +4937,7 @@ class NautiljonScraper:
             )
 
         ready = self._ready_detail_queue_count()
+        ready = max(0, ready - self._prune_detail_queue_locally(self._load_detail_queue()))
         recent_inventory = diff_result.reason == "recent_complete_export"
         if recent_inventory and not self._load_detail_queue():
             print("Mode mensuel ignore: inventaire recent et aucune fiche detail en attente.")
@@ -4896,6 +4958,8 @@ class NautiljonScraper:
                 f"separation listings/fiches ({ready} fiche(s) en attente)",
             )
 
+        print("Phase detail continue: lots de sauvegarde, sans pause fixe entre lots; cadences reseau conservees.")
+        enriched_export_paths: Dict[str, str] = {}
         while True:
             if max_hours and time.monotonic() - started >= max_hours * 3600:
                 result = RunResult(
@@ -4903,12 +4967,19 @@ class NautiljonScraper:
                     reason="monthly_time_budget_exhausted",
                     rows_count=diff_result.rows_count if diff_result else 0,
                 )
+                self.close_browser()
                 self.mark_run_state("monthly", result)
                 return result
             self.session_stats["errors"] = 0
-            self._verified_public_ips = None
-            enrich_result = self.enrich_detail_queue(max_items=enrich_max_items)
+            try:
+                enrich_result = self.enrich_detail_queue(max_items=enrich_max_items, continuous=True, cleanup=False)
+            except BaseException:
+                self.close_browser()
+                raise
+            if enrich_result.export_paths:
+                enriched_export_paths = enrich_result.export_paths
             if enrich_result.reason in {"detail_queue_empty", "detail_queue_complete"}:
+                self.close_browser()
                 result = RunResult(
                     status="success",
                     reason="monthly_complete",
@@ -4916,17 +4987,18 @@ class NautiljonScraper:
                     requested_letters=diff_result.requested_letters if diff_result else [],
                     completed_letters=diff_result.completed_letters if diff_result else [],
                     export_paths=(
-                        enrich_result.export_paths
+                        enriched_export_paths
                         or (diff_result.export_paths if diff_result else {})
                     ),
                 )
                 self.mark_success("monthly", result.rows_count, result.export_paths)
                 self.mark_run_state("monthly", result)
                 return result
-            if enrich_result.reason in {
-                "detail_batch_complete_queue_pending",
-                "enrich_interval_active",
-            }:
+            if enrich_result.reason == "detail_batch_complete_queue_pending":
+                # No reset of session, navigation counters, or last-request time.
+                # Pacing remains effective across these persistence boundaries.
+                continue
+            if enrich_result.reason == "enrich_interval_active":
                 wait_minutes = enrich_interval_minutes
                 wait_reason = "prochain petit lot de fiches detail"
             elif enrich_result.reason in {
@@ -4943,6 +5015,7 @@ class NautiljonScraper:
                 wait_minutes = retry_minutes
                 wait_reason = f"reprise de l'enrichissement apres {enrich_result.reason}"
             else:
+                self.close_browser()
                 result = RunResult(
                     status=enrich_result.status,
                     reason=f"monthly_enrich_{enrich_result.reason}",
