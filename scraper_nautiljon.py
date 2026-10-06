@@ -4222,11 +4222,91 @@ class NautiljonScraper:
             print(f"Nettoyage local: {removed} entree(s) obsolete(s) retiree(s), aucune navigation.")
         return removed
 
+    @staticmethod
+    def _detail_never_fetched(row: Dict[str, str]) -> bool:
+        """Listed only: no field a detail page fills (a fetched page always
+        stamps « parutions_vf_verifiees_le »; older rows have « origine »)."""
+        return not any(
+            str(row.get(field) or "").strip() not in ("", "N/A")
+            for field in ("parutions_vf_verifiees_le", "origine", "type_detail", "titre_original")
+        )
+
+    @staticmethod
+    def _french_volumes_listed(row: Dict[str, str]) -> int:
+        found = re.match(r"\s*(\d+)", str(row.get("nb_vol_vf_liste") or ""))
+        return int(found.group(1)) if found else 0
+
+    def _backfill_detail_queue(self, queue: Dict[str, Dict[str, object]]) -> int:
+        """Queue the series the first inventory listed without opening.
+
+        While the first complete inventory is built, new series are listed
+        only (``should_queue``); nothing queued them afterwards, so their
+        counts, genres and original titles stayed empty (7 537 rows in the
+        September 2026 export, 1 245 of them published in French). Once the
+        inventory exists and the queue is idle, a batch is queued: series
+        published in French first. They go through the usual paced queue;
+        one tried is not queued again before the retry delay."""
+        if not self._detail_baseline_established():
+            return 0
+        batch = max(0, _env_int("NAUTILJON_DETAIL_BACKFILL_BATCH", 200))
+        if not batch or any(item.get("ready") for item in queue.values()):
+            return 0
+        state_path = self._state_path("detail_backfill")
+        state = self._load_json_dict(state_path) or {}
+        tried = state.get("tried") if isinstance(state.get("tried"), dict) else {}
+        retry_after = timedelta(days=max(1, _env_int("NAUTILJON_DETAIL_BACKFILL_RETRY_DAYS", 30)))
+        now = datetime.now()
+
+        def recently_tried(url: str) -> bool:
+            try:
+                return now - datetime.fromisoformat(str(tried.get(url) or "")) < retry_after
+            except ValueError:
+                return False
+
+        _, _, letters_dir, _ = self._ensure_dirs()
+        candidates = []
+        remaining = 0
+        for name in sorted(os.listdir(letters_dir)):
+            found = re.fullmatch(r"nautiljon_lettre_([A-Z]|HASH)\.json", name)
+            if not found:
+                continue
+            tag = found.group(1)
+            # A letter being rescraped is left alone: its queue items wait for it.
+            if os.path.isfile(self._letter_checkpoint_path(tag)):
+                continue
+            for row in self._load_json_list(os.path.join(letters_dir, name)):
+                url = _ensure_abs_url(row.get("url_fiche", ""))
+                if not url or url in queue or not self._detail_never_fetched(row):
+                    continue
+                if self.is_banned_type(row.get("type_liste", "")):
+                    continue
+                remaining += 1
+                if recently_tried(url):
+                    continue
+                candidates.append((-min(self._french_volumes_listed(row), 1), tag, row))
+        candidates.sort(key=lambda item: (item[0], item[1], _norm(str(item[2].get("titre", "")))))
+        queued = 0
+        for _, tag, row in candidates[:batch]:
+            if self._queue_detail(queue, tag, row, "never_detailed", ready=True):
+                tried[_ensure_abs_url(row.get("url_fiche", ""))] = now.isoformat(timespec="seconds")
+                queued += 1
+        if queued:
+            self._save_detail_queue(queue)
+            self._write_json_atomic(state_path, {
+                "updated_at": now.isoformat(timespec="seconds"),
+                "remaining": remaining - queued,
+                "tried": tried,
+            })
+            print(f"Rattrapage: {queued} fiche(s) jamais ouvertes ajoutee(s) a la file "
+                  f"({remaining - queued} restante(s)).")
+        return queued
+
     def enrich_detail_queue(self, max_items: int = 12, *, continuous: bool = False, cleanup: bool = True) -> RunResult:
         queue = self._load_detail_queue()
         if self._promote_finalized_detail_queue(queue):
             self._save_detail_queue(queue)
         locally_removed = self._prune_detail_queue_locally(queue) if cleanup else 0
+        self._backfill_detail_queue(queue)
         ready_items = [item for item in queue.values() if item.get("ready")]
         ready_items.sort(key=lambda item: (str(item.get("queued_at", "")), str(item.get("url_fiche", ""))))
         if not ready_items:
@@ -4938,6 +5018,7 @@ class NautiljonScraper:
 
         ready = self._ready_detail_queue_count()
         ready = max(0, ready - self._prune_detail_queue_locally(self._load_detail_queue()))
+        ready += self._backfill_detail_queue(self._load_detail_queue())
         recent_inventory = diff_result.reason == "recent_complete_export"
         if recent_inventory and not self._load_detail_queue():
             print("Mode mensuel ignore: inventaire recent et aucune fiche detail en attente.")

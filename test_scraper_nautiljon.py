@@ -400,7 +400,9 @@ class DiffStateTests(unittest.TestCase):
                 self.assertEqual(scraper._monthly_wait.call_args.args[0], expected)
 
     def test_recent_monthly_export_skips_network_without_moving_success_date(self):
-        with tempfile.TemporaryDirectory() as out_dir:
+        # Seeded rows have no detail fields: no backfill here (DetailBackfillTests).
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.dict(
+                os.environ, {"NAUTILJON_DETAIL_BACKFILL_BATCH": "0"}):
             scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http", detail_mode="deferred")
             for letter in scraper.get_all_letters():
                 self.seed_letter(scraper, letter)
@@ -2418,6 +2420,62 @@ class DiffStateTests(unittest.TestCase):
                 "monthly_diff_full_catalog_requires_drop_missing",
             )
             scraper._monthly_wait.assert_not_called()
+
+
+class DetailBackfillTests(unittest.TestCase):
+    """Series listed during the first inventory never had their page opened."""
+
+    def rows(self):
+        base = "https://www.nautiljon.com/mangas/"
+        return [
+            dict(make_row("A"), titre="A listed, no VF", url_fiche=base + "a1.html", nb_vol_vf_liste="0"),
+            dict(make_row("A"), titre="A listed, VF", url_fiche=base + "a2.html", nb_vol_vf_liste="4"),
+            dict(make_row("A"), titre="A fetched", url_fiche=base + "a3.html", nb_vol_vf_liste="2",
+                 origine="Japon - 2012", parutions_vf_verifiees_le="2026-09-26 18:00:00"),
+            dict(make_row("A"), titre="A banned", url_fiche=base + "a4.html", type_liste="Yaoi"),
+        ]
+
+    def make(self, out_dir, baseline=True):
+        scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http", detail_mode="deferred")
+        scraper.save_letter_files("A", self.rows(), partial=False)
+        if baseline:
+            scraper._mark_detail_baseline_established(4)
+        return scraper
+
+    def test_nothing_before_the_first_inventory(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make(out_dir, baseline=False)
+            self.assertEqual(scraper._backfill_detail_queue({}), 0)
+
+    def test_french_first_then_the_rest_never_twice(self):
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.dict(
+                os.environ, {"NAUTILJON_DETAIL_BACKFILL_BATCH": "1"}):
+            scraper = self.make(out_dir)
+            queue = {}
+            self.assertEqual(scraper._backfill_detail_queue(queue), 1)
+            self.assertEqual([item["title"] for item in queue.values()], ["A listed, VF"])
+            self.assertTrue(all(item["ready"] for item in queue.values()))
+            # A busy queue is left alone.
+            self.assertEqual(scraper._backfill_detail_queue(queue), 0)
+            queue = {}
+            self.assertEqual(scraper._backfill_detail_queue(queue), 1)
+            self.assertEqual([item["title"] for item in queue.values()], ["A listed, no VF"])
+            # Both tried: nothing again before the retry delay.
+            self.assertEqual(scraper._backfill_detail_queue({}), 0)
+
+    def test_enrich_opens_the_backfilled_pages(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = self.make(out_dir)
+            scraper._fetch_full_series_data = mock.Mock(
+                side_effect=lambda row: dict(row, origine="Japon", parutions_vf_verifiees_le="2026-10-06 10:00:00"))
+            scraper._sleep_detail_delay = mock.Mock()
+            result = scraper.enrich_detail_queue(max_items=12, continuous=True)
+            self.assertEqual(result.status, "success")
+            self.assertEqual(sorted(call.args[0]["titre"] for call in scraper._fetch_full_series_data.call_args_list),
+                             ["A listed, VF", "A listed, no VF"])
+            rows = {row["titre"]: row for row in scraper._load_json_list(scraper._letter_paths("A")[0])}
+            self.assertEqual(rows["A listed, VF"]["origine"], "Japon")
+            self.assertEqual(scraper._backfill_detail_queue({}), 0)
 
 
 if __name__ == "__main__":
