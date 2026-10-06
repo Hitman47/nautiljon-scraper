@@ -166,6 +166,9 @@ NAUTILJON_SHM_SIZE=256m
 - Le mode `monthly` enrichit en continu et sequentiellement, sans pause fixe de
   30 minutes entre lots. Il nettoie d'abord toute la file obsolete localement,
   sans ouvrir FlareSolverr ni consommer le quota de consultations.
+- Quand la file est videe, `monthly` ajoute le lot suivant du rattrapage des fiches
+  jamais ouvertes (`NAUTILJON_DETAIL_BACKFILL_BATCH`, 200) et continue, au lieu de
+  terminer : le conteneur (`restart: "no"`) ne s'arretait sinon qu'apres 200 fiches.
 - `NAUTILJON_ENRICH_MAX_ITEMS` et `NAUTILJON_ENRICH_HARD_LIMIT` bornent les petits
   lots de sauvegarde (12 par defaut). Les tentatives echouees comptent aussi.
   Les fichiers et caches de chaque lettre sont ecrits une fois par lot, avant

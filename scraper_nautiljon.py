@@ -5060,6 +5060,10 @@ class NautiljonScraper:
             if enrich_result.export_paths:
                 enriched_export_paths = enrich_result.export_paths
             if enrich_result.reason in {"detail_queue_empty", "detail_queue_complete"}:
+                # File videe : lot suivant du rattrapage des fiches jamais ouvertes, sans
+                # arreter le conteneur (restart "no") ; cadences reseau inchangees.
+                if self._backfill_detail_queue(self._load_detail_queue()):
+                    continue
                 self.close_browser()
                 result = RunResult(
                     status="success",

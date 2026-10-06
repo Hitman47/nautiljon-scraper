@@ -2368,6 +2368,27 @@ class DiffStateTests(unittest.TestCase):
             monthly_state = scraper._load_json_dict(scraper._state_path("last_monthly_run"))
             self.assertEqual(monthly_state["status"], "success")
 
+    def test_monthly_chains_backfill_batches_instead_of_stopping(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            scraper = NautiljonScraper(out_dir=out_dir, delay=0, backend="http", detail_mode="deferred")
+            scraper.scrape_all_letters_diff = mock.Mock(
+                return_value=RunResult(status="skipped", reason="recent_complete_export", rows_count=10)
+            )
+            scraper._detail_baseline_established = mock.Mock(return_value=True)
+            scraper._load_detail_queue = mock.Mock(return_value={"u": {"ready": True}})
+            # avant la boucle, puis apres chaque file videe : 1 lot de 200, puis plus rien
+            scraper._backfill_detail_queue = mock.Mock(side_effect=[0, 200, 0])
+            scraper.enrich_detail_queue = mock.Mock(
+                return_value=RunResult(status="success", reason="detail_queue_complete")
+            )
+            scraper._monthly_wait = mock.Mock()
+
+            result = scraper.run_monthly(enrich_max_items=12)
+
+            self.assertEqual(result.reason, "monthly_complete")
+            self.assertEqual(scraper.enrich_detail_queue.call_count, 2)
+            scraper._monthly_wait.assert_not_called()
+
     def test_monthly_retries_immediately_after_successful_gluetun_rotation(self):
         with tempfile.TemporaryDirectory() as out_dir:
             scraper = NautiljonScraper(
